@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Format, Clippy & Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Run deterministic unit tests
+        run: >
+          cargo test --
+          --skip live_fetch_weather_and_radar_manifest
+          --skip simulator_renders_bento_and_split_map_views
+          --skip persistent_renderer_zoom_in_out_repro
+      - name: Verify release build
+        run: cargo build --release

@@ -1,0 +1,61 @@
+[workspace]
+members = ["."]
+exclude = ["vendor/iced_tiny_skia", "vendor/sctk-adwaita"]
+resolver = "2"
+
+[package]
+name = "weather-rs"
+version = "0.2.0"
+edition = "2024"
+description = "Fast, native cross-platform weather and radar map desktop app in pure Rust"
+license = "MIT"
+repository = "https://github.com/pythoncrazy/weather-rs"
+readme = "README.md"
+keywords = ["weather", "radar", "iced", "desktop", "gis"]
+categories = ["gui", "science"]
+
+[dependencies]
+iced = { version = "=0.14.0", default-features = false, features = ["canvas", "svg", "image-without-codecs", "advanced", "linux-theme-detection", "wgpu-bare", "tiny-skia", "tokio", "x11", "wayland", "web-colors", "crisp"] }
+tokio = { version = "=1.40.0", default-features = false, features = ["rt-multi-thread", "macros", "time", "sync"] }
+flate2 = { version = "=1.1.11", default-features = false, features = ["rust_backend"] }
+ureq = { version = "=3.4.2", features = ["json"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.146"
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
+chrono = { version = "=0.4.45", default-features = false, features = ["clock", "std", "serde"] }
+chrono-tz = "=0.10.4"
+dirs = "=6.0.0"
+percent-encoding = "=2.3.2"
+rayon = "=1.12.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wgpu = { version = "=27.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "vulkan"] }
+sctk-adwaita = { version = "=0.10.1", default-features = false, features = ["ab_glyph"] }
+wayland-client = "=0.31.15"
+x11rb = { version = "=0.13.2", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "=27.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "metal"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wgpu = { version = "=27.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "dx12"] }
+
+[dev-dependencies]
+iced_test = "=0.14.0"
+
+[patch.crates-io]
+iced_tiny_skia = { path = "vendor/iced_tiny_skia" }
+sctk-adwaita = { path = "vendor/sctk-adwaita" }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

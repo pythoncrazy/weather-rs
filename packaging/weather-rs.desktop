@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Weather RS
+GenericName=Weather & Radar
+Comment=Fast native weather forecast and live radar map
+Exec=weather-rs
+Icon=org.gnome.Weather
+Terminal=false
+Categories=Utility;
+Keywords=weather;forecast;radar;temperature;rain;wind;aqi;weather-rs;
+StartupWMClass=weather-rs
+StartupNotify=true
+SingleMainWindow=true
