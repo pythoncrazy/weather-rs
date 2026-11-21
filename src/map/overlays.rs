@@ -33,10 +33,12 @@ pub(super) struct CityBadge {
     pub sub: String,
     pub col: Color,
     pub active: bool,
+    pub is_current_location: bool,
+    pub wind_deg: Option<f64>,
 }
 
 pub(super) fn init_wind_particles() -> Vec<WindParticle> {
-    (0..420)
+    (0..300)
         .map(|i| {
             let s1 = ((i as f32 * 97.13).sin() * 43_758.547).fract().abs();
             let s2 = ((i as f32 * 241.79).cos() * 28_411.91).fract().abs();
@@ -89,30 +91,48 @@ impl MapEngine {
         bundles: &HashMap<String, WeatherBundle>,
         dt_sec: f32,
     ) {
-        let (dt, pts) = (
+        let (dt, ts) = (
             dt_sec.clamp(0.004, 0.06),
-            self.all_weather_points(bundles, self.selected_forecast_timestamp()),
+            self.selected_forecast_timestamp(),
         );
-        if pts.is_empty() {
-            return;
-        }
         let (vw, vh, gw, gh) = (900.0_f32, 760.0_f32, 16_usize, 12_usize);
-        let vp = MapViewport {
-            bounds: Size::new(vw, vh),
-            lat: self.center_lat,
-            lon: self.center_lon,
-            zoom: self.zoom,
-            corner_r: 0.0,
-        };
-        let (lats, lons) = grid_coords((gw, gh), vp, false);
-        let mut grid = vec![(0.0_f32, 0.0_f32, 2.0_f32); gw * gh];
-        for (gy, &lat) in lats.iter().enumerate() {
-            for (gx, &lon) in lons.iter().enumerate() {
-                let (wu, wv, spd) = idw_wind(&pts, lat as f64, lon as f64);
-                let d = spd as f32 + 0.35;
-                grid[gy * gw + gx] = (wu as f32 / d, -(wv as f32 / d), spd as f32);
+        let sig = [
+            (self.center_lat * 100.0).round() as i64 as u64,
+            (self.center_lon * 100.0).round() as i64 as u64,
+            (self.zoom * 100.0).round() as u64,
+            self.grid_gen,
+            bundles.len() as u64,
+            ts.map_or(0, |t| (t / 180) as u64),
+        ]
+        .into_iter()
+        .fold(0_u64, |a, v| a.wrapping_mul(31).wrapping_add(v));
+        let grid = if let Some((s, g)) = self.wind_grid
+            && s == sig
+        {
+            g
+        } else {
+            let pts = self.all_weather_points(bundles, ts);
+            if pts.is_empty() {
+                return;
             }
-        }
+            let vp = MapViewport {
+                bounds: Size::new(vw, vh),
+                lat: self.center_lat,
+                lon: self.center_lon,
+                zoom: self.zoom,
+            };
+            let (lats, lons) = grid_coords((gw, gh), vp, false);
+            let mut g = [(0.0_f32, 0.0_f32, 2.0_f32); 192];
+            for (gy, &lat) in lats.iter().enumerate() {
+                for (gx, &lon) in lons.iter().enumerate() {
+                    let (wu, wv, spd) = idw_wind(&pts, lat as f64, lon as f64);
+                    let d = spd as f32 + 0.35;
+                    g[gy * gw + gx] = (wu as f32 / d, -(wv as f32 / d), spd as f32);
+                }
+            }
+            self.wind_grid = Some((sig, g));
+            g
+        };
         for (idx, p) in self.particles.iter_mut().enumerate() {
             let (dx1, dy1, s1) = sample_wind(&grid, gw, gh, p.u, p.v);
             let px1 = 26.0 + s1 * 15.5;
@@ -192,7 +212,7 @@ impl MapEngine {
         }
         let (fw, fh) = (96_usize, 64_usize);
         let (lats, lons) = grid_coords((fw, fh), vp, true);
-        let samples: Vec<(f32, f32, f32)> = if ov == WeatherOverlay::AirQuality {
+        let raw_samples: Vec<(f32, f32, f32)> = if ov == WeatherOverlay::AirQuality {
             self.all_aqi_points(bundles)
                 .into_iter()
                 .map(|(la, lo, v)| (la as f32, lo as f32, v as f32))
@@ -209,6 +229,32 @@ impl MapEngine {
                 .map(|pt| (pt.lat as f32, pt.lon as f32, pt.v[idx]))
                 .collect()
         };
+        // Spatial viewport culling + Structure-of-Arrays for branchless SIMD-friendly IDW.
+        let (clat_f, clon_f) = (vp.lat as f32, vp.lon as f32);
+        let lat_half = (lats[0] - lats[fh - 1]).abs() * 0.5 + 14.0;
+        let lon_span = (360.0 / 2.0_f32.powf((vp.zoom - 1.5).max(0.0) as f32)).min(180.0);
+        let lon_half = (lon_span * 0.85 + 18.0).min(180.0);
+        let mut plat = Vec::with_capacity(raw_samples.len());
+        let mut plon = Vec::with_capacity(raw_samples.len());
+        let mut pval = Vec::with_capacity(raw_samples.len());
+        for &(la, lo, v) in &raw_samples {
+            let dl = (lo - clon_f).abs();
+            if (la - clat_f).abs() <= lat_half && dl.min(360.0 - dl) <= lon_half {
+                plat.push(la);
+                plon.push(lo);
+                pval.push(v);
+            }
+        }
+        if plat.len() < 8 && raw_samples.len() > plat.len() {
+            plat.clear();
+            plon.clear();
+            pval.clear();
+            for &(la, lo, v) in &raw_samples {
+                plat.push(la);
+                plon.push(lo);
+                pval.push(v);
+            }
+        }
         const P_STOPS: [(f64, [u8; 3]); 5] = [
             (0.08, [72, 184, 255]),
             (1.2, [54, 160, 255]),
@@ -224,7 +270,7 @@ impl MapEngine {
                         Color::TRANSPARENT
                     }
                     WeatherOverlay::RadarTimeline => {
-                        let r = idw_f32(&samples, lat, lon, 0.08, true, 0.0) as f64;
+                        let r = idw_soa((&plat, &plon, &pval), (lat, lon), 0.08, true, 0.0) as f64;
                         if r < 0.08 {
                             Color::TRANSPARENT
                         } else {
@@ -235,12 +281,14 @@ impl MapEngine {
                             )
                         }
                     }
-                    WeatherOverlay::Temperature => {
-                        temp_to_color(idw_f32(&samples, lat, lon, 0.12, true, 15.0) as f64, 0.58)
-                    }
+                    WeatherOverlay::Temperature => temp_to_color(
+                        idw_soa((&plat, &plon, &pval), (lat, lon), 0.12, true, 15.0) as f64,
+                        0.58,
+                    ),
                     WeatherOverlay::WindFlow => {
-                        let b =
-                            (idw_f32(&samples, lat, lon, 0.12, true, 3.0) / 26.0).clamp(0.0, 1.0);
+                        let b = (idw_soa((&plat, &plon, &pval), (lat, lon), 0.12, true, 3.0)
+                            / 26.0)
+                            .clamp(0.0, 1.0);
                         rgba8(
                             (12.0 + b * 34.0) as u8,
                             (88.0 + b * 58.0) as u8,
@@ -249,12 +297,15 @@ impl MapEngine {
                         )
                     }
                     WeatherOverlay::Pressure => pressure_to_color(
-                        idw_f32(&samples, lat, lon, 0.12, true, 1013.25) as f64,
+                        idw_soa((&plat, &plon, &pval), (lat, lon), 0.12, true, 1013.25) as f64,
                         0.56,
                     ),
                     WeatherOverlay::AirQuality => Color {
                         a: 0.50,
-                        ..aqi_to_color(idw_f32(&samples, lat, lon, 0.25, false, 32.0).round() as i32)
+                        ..aqi_to_color(
+                            idw_soa((&plat, &plon, &pval), (lat, lon), 0.25, false, 32.0).round()
+                                as i32,
+                        )
                     },
                     _ => Color::TRANSPARENT,
                 };
@@ -267,7 +318,9 @@ impl MapEngine {
                 ]);
             }
         }
-        bleed_transparent_edges(&mut rgba, fw as u32, fh as u32);
+        if ov == WeatherOverlay::RadarTimeline {
+            bleed_transparent_edges(&mut rgba, fw as u32, fh as u32);
+        }
         let h = adv_image::Handle::from_rgba(fw as u32, fh as u32, rgba);
         if let Ok(mut g) = self.scalar_tex.lock() {
             *g = Some((sig, h.clone()));
@@ -283,25 +336,41 @@ pub(super) fn declutter_badges<'a>(
     zoom: f64,
     rect: Rectangle,
 ) -> Vec<(usize, &'a CityBadge, Point, Point)> {
-    let mut order: Vec<usize> = (0..badges.len()).collect();
-    order.sort_by_key(|&i| !badges[i].active);
+    let ws = 256.0 * 2.0_f64.powf(zoom);
+    let (cwx, cwy) = lat_lon_to_world_px(clat, clon, zoom);
     let mut out: Vec<(usize, &'a CityBadge, Point, Point)> = Vec::with_capacity(badges.len());
-    for i in order {
-        let b = &badges[i];
-        let pos = project_lat_lon_to_screen(b.lat, b.lon, clat, clon, zoom, rect);
-        if pos.x < -36.0 || pos.x > rect.width + 36.0 || pos.y < -36.0 || pos.y > rect.height + 36.0
-        {
-            continue;
+    for active_pass in [true, false] {
+        for (i, b) in badges.iter().enumerate() {
+            if b.active != active_pass {
+                continue;
+            }
+            let (mut wx, wy) = lat_lon_to_world_px(b.lat, b.lon, zoom);
+            if wx - cwx > ws * 0.5 {
+                wx -= ws;
+            } else if cwx - wx > ws * 0.5 {
+                wx += ws;
+            }
+            let pos = Point::new(
+                rect.width * 0.5 + (wx - cwx) as f32,
+                rect.height * 0.5 + (wy - cwy) as f32,
+            );
+            if pos.x < -36.0
+                || pos.x > rect.width + 36.0
+                || pos.y < -36.0
+                || pos.y > rect.height + 36.0
+            {
+                continue;
+            }
+            let disc = Point::new(pos.x, if b.active { pos.y - 31.0 } else { pos.y });
+            if !b.active
+                && out
+                    .iter()
+                    .any(|(_, _, _, dc)| (dc.x - disc.x).powi(2) + (dc.y - disc.y).powi(2) < 2704.0)
+            {
+                continue;
+            }
+            out.push((i, b, pos, disc));
         }
-        let disc = Point::new(pos.x, if b.active { pos.y - 18.0 } else { pos.y });
-        if !b.active
-            && out
-                .iter()
-                .any(|(_, _, _, dc)| (dc.x - disc.x).hypot(dc.y - disc.y) < 52.0)
-        {
-            continue;
-        }
-        out.push((i, b, pos, disc));
     }
     out
 }
@@ -407,21 +476,33 @@ fn viewport_inside_hrrr(clat: f64, clon: f64, zoom: f64) -> bool {
     in_hrrr(clat - hs, clon - hs * 1.3) && in_hrrr(clat + hs, clon + hs * 1.3)
 }
 
-fn idw_f32(pts: &[(f32, f32, f32)], lat: f32, lon: f32, eps: f32, cubic: bool, fb: f32) -> f32 {
+fn idw_soa(
+    (plat, plon, pval): (&[f32], &[f32], &[f32]),
+    (lat, lon): (f32, f32),
+    eps: f32,
+    quartic: bool,
+    fb: f32,
+) -> f32 {
     let (mut ws, mut acc) = (0.0_f32, 0.0_f32);
-    for &(pla, plo, v) in pts {
-        let mut dl = (plo - lon).abs();
-        if dl > 180.0 {
-            dl = 360.0 - dl;
+    if quartic {
+        for i in 0..plat.len() {
+            let dla = plat[i] - lat;
+            let dl = (plon[i] - lon).abs();
+            let dl = dl.min(360.0 - dl);
+            let d2 = dla * dla + dl * dl + eps;
+            let w = 1.0 / (d2 * d2);
+            ws += w;
+            acc += pval[i] * w;
         }
-        let d2 = (pla - lat).powi(2) + dl * dl + eps;
-        let w = if cubic {
-            1.0 / (d2 * d2.sqrt())
-        } else {
-            1.0 / d2
-        };
-        ws += w;
-        acc += v * w;
+    } else {
+        for i in 0..plat.len() {
+            let dla = plat[i] - lat;
+            let dl = (plon[i] - lon).abs();
+            let dl = dl.min(360.0 - dl);
+            let w = 1.0 / (dla * dla + dl * dl + eps);
+            ws += w;
+            acc += pval[i] * w;
+        }
     }
     if ws > 0.0 { acc / ws } else { fb }
 }
@@ -429,11 +510,10 @@ fn idw_f32(pts: &[(f32, f32, f32)], lat: f32, lon: f32, eps: f32, cubic: bool, f
 pub(super) fn idw_wind(pts: &[GridWeatherPoint], lat: f64, lon: f64) -> (f64, f64, f64) {
     let (mut ws, mut us, mut vs, mut ss) = (0.0, 0.0, 0.0, 0.0);
     for pt in pts {
-        let mut dl = (pt.lon - lon).abs();
-        if dl > 180.0 {
-            dl = 360.0 - dl;
-        }
-        let w = 1.0 / ((pt.lat - lat).powi(2) + dl * dl + 0.15);
+        let dl = (pt.lon - lon).abs();
+        let dl = dl.min(360.0 - dl);
+        let dlat = pt.lat - lat;
+        let w = 1.0 / (dlat * dlat + dl * dl + 0.15);
         ws += w;
         us += pt.v[2] as f64 * w;
         vs += pt.v[3] as f64 * w;

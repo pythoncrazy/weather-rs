@@ -1,26 +1,31 @@
 use crate::model::{Settings, WeatherBundle};
-use std::fs;
-use std::io::ErrorKind;
+use std::fs::{self, File};
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 static PENDING_SETTINGS: Mutex<Option<Settings>> = Mutex::new(None);
 static SETTINGS_LOCK: Mutex<()> = Mutex::new(());
+static CONFIG_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("weather-rs")
+});
+static CACHE_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
+    dirs::cache_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("weather-rs")
+});
 
 pub fn request_shutdown() {
     SHUTDOWN.store(true, Ordering::Release);
 }
 pub fn is_shutting_down() -> bool {
     SHUTDOWN.load(Ordering::Acquire)
-}
-
-fn app_dir(base: Option<PathBuf>) -> PathBuf {
-    base.unwrap_or_else(|| PathBuf::from("."))
-        .join("weather-rs")
 }
 
 fn atomic_write(dir: &Path, name: &str, bytes: &[u8]) {
@@ -34,16 +39,13 @@ fn atomic_write(dir: &Path, name: &str, bytes: &[u8]) {
             Err(e)
         }
     });
-    if res.is_ok() {
-        let _ = fs::rename(&tmp, dir.join(name));
-    } else {
+    if res.and_then(|()| fs::rename(&tmp, dir.join(name))).is_err() {
         let _ = fs::remove_file(&tmp);
     }
 }
 
 pub fn load_settings() -> (Settings, bool) {
-    let path = app_dir(dirs::config_dir()).join("settings.json");
-    if let Ok(b) = fs::read(path)
+    if let Ok(b) = fs::read(CONFIG_DIR.join("settings.json"))
         && let Ok(mut s) = serde_json::from_slice::<Settings>(&b)
     {
         s.deduplicate_locations();
@@ -56,11 +58,14 @@ fn write_settings_sync(s: &Settings) {
     if let Ok(_g) = SETTINGS_LOCK.lock()
         && let Ok(json) = serde_json::to_vec_pretty(s)
     {
-        atomic_write(&app_dir(dirs::config_dir()), "settings.json", &json);
+        atomic_write(&CONFIG_DIR, "settings.json", &json);
     }
 }
 
 pub fn save_settings(s: &Settings) {
+    if cfg!(test) {
+        return;
+    }
     if is_shutting_down() {
         write_settings_sync(s);
         return;
@@ -68,7 +73,7 @@ pub fn save_settings(s: &Settings) {
     if let Ok(mut slot) = PENDING_SETTINGS.lock() {
         *slot = Some(s.clone());
     }
-    rayon::spawn(flush_pending_settings);
+    std::thread::spawn(flush_pending_settings);
 }
 
 pub fn flush_pending_settings() {
@@ -90,16 +95,19 @@ fn safe_name(raw: &str) -> String {
 }
 
 pub fn load_cached_bundle(id: &str) -> Option<WeatherBundle> {
-    let p = app_dir(dirs::cache_dir())
+    let p = CACHE_DIR
         .join("forecasts")
         .join(format!("{}.json", safe_name(id)));
     serde_json::from_slice(&fs::read(p).ok()?).ok()
 }
 
 pub fn save_cached_bundle(b: &WeatherBundle) {
+    if cfg!(test) {
+        return;
+    }
     if let Ok(bytes) = serde_json::to_vec(b) {
         atomic_write(
-            &app_dir(dirs::cache_dir()).join("forecasts"),
+            &CACHE_DIR.join("forecasts"),
             &format!("{}.json", safe_name(&b.location.id)),
             &bytes,
         );
@@ -107,18 +115,24 @@ pub fn save_cached_bundle(b: &WeatherBundle) {
 }
 
 fn tile_dir(ns: &str, z: u8) -> PathBuf {
-    app_dir(dirs::cache_dir())
+    CACHE_DIR
         .join("tiles")
         .join(safe_name(ns))
         .join(z.to_string())
 }
 
 pub fn load_cached_tile(ns: &str, z: u8, x: u32, y: u32, max_age: Duration) -> Option<Vec<u8>> {
-    let p = tile_dir(ns, z).join(format!("{x}_{y}.bin"));
+    let mut f = File::open(tile_dir(ns, z).join(format!("{x}_{y}.bin"))).ok()?;
+    let meta = f.metadata().ok()?;
     let age = SystemTime::now()
-        .duration_since(fs::metadata(&p).ok()?.modified().ok()?)
+        .duration_since(meta.modified().ok()?)
         .unwrap_or(Duration::ZERO);
-    (age <= max_age).then(|| fs::read(p).ok()).flatten()
+    if age > max_age {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(meta.len().min(512 * 1024) as usize);
+    f.read_to_end(&mut buf).ok()?;
+    Some(buf)
 }
 
 pub fn save_cached_tile(ns: &str, z: u8, x: u32, y: u32, bytes: &[u8]) {
@@ -137,7 +151,7 @@ pub fn spawn_background_cache_prune() {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        let Ok(entries) = fs::read_dir(app_dir(dirs::cache_dir()).join("tiles")) else {
+        let Ok(entries) = fs::read_dir(CACHE_DIR.join("tiles")) else {
             return;
         };
         let (now, ttl) = (SystemTime::now(), Duration::from_secs(3 * 3600));

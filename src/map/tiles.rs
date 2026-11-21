@@ -5,16 +5,210 @@ use crate::storage::{delete_cached_tile, is_shutting_down, load_cached_tile, sav
 use iced::advanced::image as adv_image;
 use iced::widget::canvas::Frame;
 use iced::{Rectangle, Size};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroU32;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
+
+thread_local! {
+    static SMOOTH_TMP: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) };
+    static BLEED_TMP: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct TileKey(pub String, pub u8, pub u32, pub u32);
 
+pub(super) enum TileEvent {
+    Loaded(TileKey, Option<adv_image::Handle>),
+    Failed(TileKey),
+    Cancelled(TileKey),
+}
+
 type TileCoord = (u8, u32, u32);
-type TileMap = HashMap<TileCoord, adv_image::Handle>;
+type TileMap = HashMap<TileCoord, Option<adv_image::Handle>>;
+
+struct TileJob {
+    key: TileKey,
+    url: String,
+    ttl: Duration,
+    high: bool,
+    cancellable: bool,
+    epoch: u64,
+}
+
+#[derive(Default)]
+struct JobQueues {
+    high: VecDeque<TileJob>,
+    low: VecDeque<TileJob>,
+}
+
+impl JobQueues {
+    fn push(&mut self, job: TileJob) -> Option<TileJob> {
+        if job.high {
+            self.high.push_front(job);
+            (self.high.len() > 96)
+                .then(|| self.high.pop_back())
+                .flatten()
+        } else if self.low.len() >= 192 {
+            Some(job)
+        } else {
+            self.low.push_back(job);
+            None
+        }
+    }
+    fn pop(&mut self) -> Option<TileJob> {
+        self.high.pop_front().or_else(|| self.low.pop_front())
+    }
+}
+
+struct PriorityChan {
+    q: Mutex<JobQueues>,
+    cv: Condvar,
+}
+
+impl PriorityChan {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            q: Mutex::new(JobQueues::default()),
+            cv: Condvar::new(),
+        })
+    }
+    fn push(&self, job: TileJob, tx: &mpsc::Sender<TileEvent>) {
+        let dropped = self.q.lock().ok().and_then(|mut q| {
+            let d = q.push(job);
+            self.cv.notify_one();
+            d
+        });
+        if let Some(d) = dropped {
+            let _ = tx.send(TileEvent::Cancelled(d.key));
+        }
+    }
+    fn pop_blocking(&self) -> Option<TileJob> {
+        let Ok(mut q) = self.q.lock() else {
+            return None;
+        };
+        loop {
+            if is_shutting_down() {
+                return None;
+            }
+            if let Some(job) = q.pop() {
+                return Some(job);
+            }
+            let Ok((guard, _)) = self.cv.wait_timeout(q, Duration::from_millis(250)) else {
+                return None;
+            };
+            q = guard;
+        }
+    }
+    fn purge_stale(&self, epoch: u64, removed: &mut Vec<TileKey>) {
+        if let Ok(mut q) = self.q.lock() {
+            let mut keep_fn = |j: &TileJob| {
+                let keep = !j.cancellable || j.epoch == epoch;
+                if !keep {
+                    removed.push(j.key.clone());
+                }
+                keep
+            };
+            q.high.retain(&mut keep_fn);
+            q.low.retain(&mut keep_fn);
+        }
+    }
+}
+
+pub(super) struct TileWorkers {
+    disk: Arc<PriorityChan>,
+    net: Arc<PriorityChan>,
+    epoch: Arc<AtomicU64>,
+}
+
+impl TileWorkers {
+    pub fn spawn(client: WeatherClient, tx: mpsc::Sender<TileEvent>, wake: Arc<Notify>) -> Self {
+        let disk = PriorityChan::new();
+        let net = PriorityChan::new();
+        let epoch = Arc::new(AtomicU64::new(1));
+
+        // 2 fast local disk-cache decode threads (never blocked by HTTP I/O).
+        for _ in 0..2 {
+            let (d, n, ep, tx, wk) = (
+                Arc::clone(&disk),
+                Arc::clone(&net),
+                Arc::clone(&epoch),
+                tx.clone(),
+                Arc::clone(&wake),
+            );
+            std::thread::spawn(move || {
+                while let Some(job) = d.pop_blocking() {
+                    if job.cancellable && job.epoch != ep.load(Ordering::Acquire) {
+                        let _ = tx.send(TileEvent::Cancelled(job.key));
+                        continue;
+                    }
+                    if let Some(cached) =
+                        load_cached_tile(&job.key.0, job.key.1, job.key.2, job.key.3, job.ttl)
+                    {
+                        if let Some(h) = decode_tile(&job.key.0, &cached) {
+                            let _ = tx.send(TileEvent::Loaded(job.key, h));
+                            wk.notify_one();
+                            continue;
+                        }
+                        delete_cached_tile(&job.key.0, job.key.1, job.key.2, job.key.3);
+                    }
+                    n.push(job, &tx);
+                }
+            });
+        }
+
+        // 8 dedicated HTTP I/O threads (saturated without excess idle threads).
+        for _ in 0..8 {
+            let (n, ep, c, tx, wk) = (
+                Arc::clone(&net),
+                Arc::clone(&epoch),
+                client.clone(),
+                tx.clone(),
+                Arc::clone(&wake),
+            );
+            std::thread::spawn(move || {
+                while let Some(job) = n.pop_blocking() {
+                    if job.cancellable && job.epoch != ep.load(Ordering::Acquire) {
+                        let _ = tx.send(TileEvent::Cancelled(job.key));
+                        continue;
+                    }
+                    if let Ok(bytes) = c.fetch_bytes(&job.url)
+                        && let Some(h) = decode_tile(&job.key.0, &bytes)
+                    {
+                        let dk = job.key.clone();
+                        let _ = tx.send(TileEvent::Loaded(job.key, h));
+                        wk.notify_one();
+                        if !is_shutting_down() {
+                            save_cached_tile(&dk.0, dk.1, dk.2, dk.3, &bytes);
+                        }
+                    } else {
+                        let _ = tx.send(TileEvent::Failed(job.key));
+                        wk.notify_one();
+                    }
+                }
+            });
+        }
+
+        Self { disk, net, epoch }
+    }
+
+    pub fn bump_epoch(&self, in_flight: &mut HashSet<TileKey>) {
+        let ep = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let mut removed = Vec::new();
+        self.disk.purge_stale(ep, &mut removed);
+        self.net.purge_stale(ep, &mut removed);
+        for k in removed {
+            in_flight.remove(&k);
+        }
+    }
+
+    pub fn current_epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+}
 
 pub(super) struct SharedTilePool {
     pub tiles: HashMap<String, TileMap>,
@@ -22,12 +216,40 @@ pub(super) struct SharedTilePool {
     pub in_flight: HashSet<TileKey>,
     pub failed_until: HashMap<TileKey, Instant>,
     pub tx: mpsc::Sender<WorkerEvent>,
-    pub client: WeatherClient,
+    pub tile_tx: mpsc::Sender<TileEvent>,
+    pub tile_rx: mpsc::Receiver<TileEvent>,
+    pub workers: TileWorkers,
 }
 
 impl SharedTilePool {
+    pub fn drain_ready(&mut self) -> bool {
+        let mut any = false;
+        while let Ok(ev) = self.tile_rx.try_recv() {
+            any = true;
+            match ev {
+                TileEvent::Loaded(k, h) => {
+                    self.in_flight.remove(&k);
+                    self.insert(k, h);
+                }
+                TileEvent::Failed(k) => {
+                    self.in_flight.remove(&k);
+                    self.failed_until
+                        .insert(k, Instant::now() + Duration::from_secs(18));
+                }
+                TileEvent::Cancelled(k) => {
+                    self.in_flight.remove(&k);
+                }
+            }
+        }
+        any
+    }
+
     pub fn has_tile(&self, ns: &str, c: TileCoord) -> bool {
         self.tiles.get(ns).is_some_and(|m| m.contains_key(&c))
+    }
+
+    pub fn bump_epoch(&mut self) {
+        self.workers.bump_epoch(&mut self.in_flight);
     }
 
     pub fn ensure(
@@ -37,8 +259,12 @@ impl SharedTilePool {
         url_fn: impl FnOnce() -> String,
         ttl: Duration,
         high: bool,
+        cancellable: bool,
     ) {
-        if self.has_tile(ns, c) || is_shutting_down() || (!high && self.in_flight.len() >= 128) {
+        if self.has_tile(ns, c)
+            || is_shutting_down()
+            || (!high && cancellable && self.in_flight.len() >= 192)
+        {
             return;
         }
         let key = TileKey(ns.into(), c.0, c.1, c.2);
@@ -55,48 +281,28 @@ impl SharedTilePool {
             return;
         }
         self.in_flight.insert(key.clone());
-        let (tx, client) = (self.tx.clone(), self.client.clone());
-        let task = move || {
-            if is_shutting_down() {
-                return;
-            }
-            if let Some(cached) = load_cached_tile(&key.0, key.1, key.2, key.3, ttl) {
-                if let Some(h) = decode_tile(&key.0, &cached) {
-                    let _ = tx.send(WorkerEvent::TileLoaded(key, h));
-                    return;
-                }
-                delete_cached_tile(&key.0, key.1, key.2, key.3);
-            }
-            if is_shutting_down() {
-                return;
-            }
-            if let Ok(bytes) = client.fetch_bytes(&url)
-                && let Some(h) = decode_tile(&key.0, &bytes)
-            {
-                let dk = key.clone();
-                let _ = tx.send(WorkerEvent::TileLoaded(key, h));
-                if !is_shutting_down() {
-                    save_cached_tile(&dk.0, dk.1, dk.2, dk.3, &bytes);
-                }
-                return;
-            }
-            let _ = tx.send(WorkerEvent::TileFailed(key));
-        };
-        if high {
-            rayon::spawn(task);
-        } else {
-            rayon::spawn_fifo(task);
-        }
+        let epoch = self.workers.current_epoch();
+        self.workers.disk.push(
+            TileJob {
+                key,
+                url,
+                ttl,
+                high,
+                cancellable,
+                epoch,
+            },
+            &self.tile_tx,
+        );
     }
 
-    pub fn insert(&mut self, key: TileKey, handle: adv_image::Handle) {
+    pub fn insert(&mut self, key: TileKey, handle: Option<adv_image::Handle>) {
         let coord = (key.1, key.2, key.3);
         let ns_map = self.tiles.entry(key.0.clone()).or_default();
-        if !ns_map.contains_key(&coord) {
+        if !ns_map.contains_key(&coord) && key.1 > 2 {
             self.lru.push_back(key.clone());
         }
         ns_map.insert(coord, handle);
-        while self.lru.len() > 1024 {
+        while self.lru.len() > 1536 {
             if let Some(old) = self.lru.pop_front()
                 && let Some(m) = self.tiles.get_mut(&old.0)
             {
@@ -109,71 +315,102 @@ impl SharedTilePool {
     }
 }
 
-fn decode_tile(ns: &str, bytes: &[u8]) -> Option<adv_image::Handle> {
+fn is_radar_ns(ns: &str) -> bool {
+    ns.starts_with("hrrr_") || ns.starts_with("lwxr256_") || ns.starts_with("rv256_")
+}
+fn is_opaque_base_ns(ns: &str) -> bool {
+    matches!(
+        ns,
+        "esri_dark_base" | "esri_sat" | "esri_topo" | "carto_voyager"
+    )
+}
+
+fn decode_tile(ns: &str, bytes: &[u8]) -> Option<Option<adv_image::Handle>> {
     let rgba = ::image::load_from_memory(bytes).ok()?.into_rgba8();
     let (w, h) = rgba.dimensions();
     if w == 0 || h == 0 || w > 512 || h > 512 {
         return None;
     }
     let mut raw = rgba.into_raw();
-    stylize_radar_tile(ns, &mut raw, w, h);
-    bleed_transparent_edges(&mut raw, w, h);
-    Some(adv_image::Handle::from_rgba(w, h, raw))
+    if is_radar_ns(ns) {
+        if !stylize_radar_tile(ns, &mut raw, w, h) {
+            return Some(None);
+        }
+        bleed_transparent_edges(&mut raw, w, h);
+    } else if !is_opaque_base_ns(ns) {
+        bleed_transparent_edges(&mut raw, w, h);
+    }
+    Some(Some(adv_image::Handle::from_rgba(w, h, raw)))
 }
 
 fn smooth_radar_alpha(rgba: &mut [u8], w: usize, h: usize) {
     if w < 3 || h < 3 || rgba.len() != w * h * 4 {
         return;
     }
-    let mut tmp = vec![0_u16; rgba.len()];
-    for y in 0..h {
-        for x in 0..w {
-            let (i0, i1, i2) = (
-                (y * w + x.saturating_sub(1)) * 4,
-                (y * w + x) * 4,
-                (y * w + (x + 1).min(w - 1)) * 4,
-            );
-            let (a0, a1, a2) = (
-                rgba[i0 + 3] as u32,
-                rgba[i1 + 3] as u32,
-                rgba[i2 + 3] as u32,
-            );
-            let asum = a0 + a1 * 2 + a2;
-            if asum == 0 {
+    SMOOTH_TMP.with(|cell| {
+        let mut tmp = cell.borrow_mut();
+        tmp.resize(rgba.len(), 0);
+        let mut row_any = [false; 512];
+        for (y, has_any) in row_any.iter_mut().enumerate().take(h) {
+            let row = y * w;
+            let mut any = false;
+            for x in 0..w {
+                let (i0, i1, i2) = (
+                    (row + x.saturating_sub(1)) * 4,
+                    (row + x) * 4,
+                    (row + (x + 1).min(w - 1)) * 4,
+                );
+                let (a0, a1, a2) = (
+                    rgba[i0 + 3] as u32,
+                    rgba[i1 + 3] as u32,
+                    rgba[i2 + 3] as u32,
+                );
+                let asum = a0 + a1 * 2 + a2;
+                if asum == 0 {
+                    tmp[i1 + 3] = 0;
+                    continue;
+                }
+                any = true;
+                for c in 0..3 {
+                    tmp[i1 + c] = ((rgba[i0 + c] as u32 * a0
+                        + rgba[i1 + c] as u32 * a1 * 2
+                        + rgba[i2 + c] as u32 * a2)
+                        >> 2) as u16;
+                }
+                tmp[i1 + 3] = (asum >> 2) as u16;
+            }
+            *has_any = any;
+        }
+        for y in 0..h {
+            let (ya, yb) = (y.saturating_sub(1), (y + 1).min(h - 1));
+            if !row_any[ya] && !row_any[y] && !row_any[yb] {
                 continue;
             }
-            for c in 0..3 {
-                tmp[i1 + c] = ((rgba[i0 + c] as u32 * a0
-                    + rgba[i1 + c] as u32 * a1 * 2
-                    + rgba[i2 + c] as u32 * a2)
-                    >> 2) as u16;
-            }
-            tmp[i1 + 3] = (asum >> 2) as u16;
-        }
-    }
-    for y in 0..h {
-        let (y0, y1) = (y.saturating_sub(1), (y + 1).min(h - 1));
-        for x in 0..w {
-            let (i0, i1, i2) = ((y0 * w + x) * 4, (y * w + x) * 4, (y1 * w + x) * 4);
-            let asum = tmp[i0 + 3] as u32 + tmp[i1 + 3] as u32 * 2 + tmp[i2 + 3] as u32;
-            if let Some(nz) = NonZeroU32::new(asum) {
-                for c in 0..3 {
-                    rgba[i1 + c] =
-                        ((tmp[i0 + c] as u32 + tmp[i1 + c] as u32 * 2 + tmp[i2 + c] as u32) / nz)
-                            .min(255) as u8;
+            let (y0, yc, y1) = (ya * w, y * w, yb * w);
+            for x in 0..w {
+                let (i0, i1, i2) = ((y0 + x) * 4, (yc + x) * 4, (y1 + x) * 4);
+                let asum = tmp[i0 + 3] as u32 + tmp[i1 + 3] as u32 * 2 + tmp[i2 + 3] as u32;
+                if let Some(nz) = NonZeroU32::new(asum) {
+                    for c in 0..3 {
+                        rgba[i1 + c] =
+                            ((tmp[i0 + c] as u32 + tmp[i1 + c] as u32 * 2 + tmp[i2 + c] as u32)
+                                / nz)
+                                .min(255) as u8;
+                    }
+                    rgba[i1 + 3] = ((asum + 2) >> 2).min(255) as u8;
+                } else {
+                    rgba[i1 + 3] = 0;
                 }
-                rgba[i1 + 3] = ((asum + 2) >> 2).min(255) as u8;
-            } else {
-                rgba[i1 + 3] = 0;
             }
         }
-    }
+    });
 }
 
-pub(super) fn stylize_radar_tile(ns: &str, rgba: &mut [u8], w: u32, h: u32) {
+/// Stylizes radar RGBA tiles in-place. Returns `false` if the tile is completely empty/transparent.
+pub(super) fn stylize_radar_tile(ns: &str, rgba: &mut [u8], w: u32, h: u32) -> bool {
     let (refp, refd) = (ns.starts_with("hrrr_refp_"), ns.starts_with("hrrr_refd_"));
     if !refp && !refd && !ns.starts_with("lwxr256_") && !ns.starts_with("rv256_") {
-        return;
+        return true;
     }
     const RAIN_STOPS: [(f64, [u8; 3]); 5] = [
         (0.0, [110, 198, 255]),
@@ -182,6 +419,7 @@ pub(super) fn stylize_radar_tile(ns: &str, rgba: &mut [u8], w: u32, h: u32) {
         (0.85, [162, 68, 230]),
         (1.0, [244, 171, 55]),
     ];
+    let mut any_visible = false;
     if refp || refd {
         for px in rgba.as_chunks_mut::<4>().0.iter_mut() {
             let a = px[3];
@@ -226,69 +464,103 @@ pub(super) fn stylize_radar_tile(ns: &str, rgba: &mut [u8], w: u32, h: u32) {
                     (115.0 + inten * 145.0).min(245.0),
                 )
             };
+            let out_a = (na * (a as f32 / 255.0)).clamp(0.0, 255.0) as u8;
+            if out_a > 0 {
+                any_visible = true;
+            }
             px.copy_from_slice(&[
                 nr.clamp(0.0, 255.0) as u8,
                 ng.clamp(0.0, 255.0) as u8,
                 nb.clamp(0.0, 255.0) as u8,
-                (na * (a as f32 / 255.0)).clamp(0.0, 255.0) as u8,
+                out_a,
             ]);
         }
+    } else {
+        any_visible = rgba.as_chunks::<4>().0.iter().any(|p| p[3] >= 10);
+    }
+    if !any_visible {
+        return false;
     }
     smooth_radar_alpha(rgba, w as usize, h as usize);
+    true
 }
 
+/// 1-pass RGB color bleed into adjacent transparent pixels to eliminate dark halos under GPU bilinear filtering.
 pub(super) fn bleed_transparent_edges(rgba: &mut [u8], w: u32, h: u32) {
     let (w, h) = (w as usize, h as usize);
-    if w < 2
-        || h < 2
-        || rgba.len() != w * h * 4
-        || !rgba.as_chunks::<4>().0.iter().any(|p| p[3] == 0)
-    {
+    if w < 2 || h < 2 || rgba.len() != w * h * 4 {
         return;
     }
-    let mut next = rgba.to_vec();
-    for _ in 0..2 {
-        let mut changed = false;
-        for y in 0..h {
+    let row_bytes = w * 4;
+    let mut row_has_opaque = [false; 512];
+    let mut row_has_trans = [false; 512];
+    let (mut any_op, mut any_tr) = (false, false);
+    for y in 0..h {
+        let mut op = false;
+        let mut tr = false;
+        for p in rgba[y * row_bytes..(y + 1) * row_bytes].as_chunks::<4>().0 {
+            if p[3] == 0 {
+                tr = true;
+            } else {
+                op = true;
+            }
+            if op && tr {
+                break;
+            }
+        }
+        row_has_opaque[y] = op;
+        row_has_trans[y] = tr;
+        any_op |= op;
+        any_tr |= tr;
+    }
+    if !any_op || !any_tr {
+        return;
+    }
+    BLEED_TMP.with(|cell| {
+        let mut src = cell.borrow_mut();
+        src.clear();
+        src.extend_from_slice(rgba);
+        for (y, &has_tr) in row_has_trans.iter().enumerate().take(h) {
+            if !has_tr {
+                continue;
+            }
+            let (y0, y1) = (y.saturating_sub(1), (y + 1).min(h - 1));
+            if !row_has_opaque[y0..=y1].iter().any(|&v| v) {
+                continue;
+            }
             for x in 0..w {
                 let i = (y * w + x) * 4;
-                if next[i + 3] != 0 {
+                if src[i + 3] != 0 {
                     continue;
                 }
                 let (mut r, mut g, mut b, mut wa) = (0_u32, 0_u32, 0_u32, 0_u32);
-                for ny in y.saturating_sub(1)..=(y + 1).min(h - 1) {
-                    for nx in x.saturating_sub(1)..=(x + 1).min(w - 1) {
-                        let ni = (ny * w + nx) * 4;
-                        let na = next[ni + 3] as u32;
+                let (x0, x1) = (x.saturating_sub(1), (x + 1).min(w - 1));
+                for (ny, &has_op) in row_has_opaque.iter().enumerate().take(y1 + 1).skip(y0) {
+                    if !has_op {
+                        continue;
+                    }
+                    let nr = ny * w;
+                    for nx in x0..=x1 {
+                        let ni = (nr + nx) * 4;
+                        let na = src[ni + 3] as u32;
                         if na > 0 {
-                            r += next[ni] as u32 * na;
-                            g += next[ni + 1] as u32 * na;
-                            b += next[ni + 2] as u32 * na;
+                            r += src[ni] as u32 * na;
+                            g += src[ni + 1] as u32 * na;
+                            b += src[ni + 2] as u32 * na;
                             wa += na;
                         }
                     }
                 }
                 if let Some(nz) = NonZeroU32::new(wa) {
-                    rgba[i..i + 4].copy_from_slice(&[
+                    rgba[i..i + 3].copy_from_slice(&[
                         (r / nz) as u8,
                         (g / nz) as u8,
                         (b / nz) as u8,
-                        0,
                     ]);
-                    changed = true;
                 }
             }
         }
-        if !changed {
-            break;
-        }
-        for i in (0..rgba.len()).step_by(4) {
-            if next[i + 3] == 0 && (rgba[i] | rgba[i + 1] | rgba[i + 2]) != 0 {
-                next[i..i + 3].copy_from_slice(&rgba[i..i + 3]);
-                next[i + 3] = 1;
-            }
-        }
-    }
+    });
 }
 
 pub(super) fn effective_tile_zoom(zoom: f64, max_z: u8) -> u8 {
@@ -308,7 +580,6 @@ pub(super) struct MapViewport {
     pub lat: f64,
     pub lon: f64,
     pub zoom: f64,
-    pub corner_r: f32,
 }
 
 pub(super) struct TileLayer<'a> {
@@ -317,6 +588,7 @@ pub(super) struct TileLayer<'a> {
     pub opacity: f32,
     pub opaque_base: bool,
     pub fallback: bool,
+    pub allow_fetch: bool,
     pub ttl: Duration,
     pub offset: (f64, f64),
 }
@@ -328,6 +600,7 @@ impl<'a> TileLayer<'a> {
             opacity,
             opaque_base: false,
             fallback: true,
+            allow_fetch: true,
             ttl,
             offset: (0.0, 0.0),
         }
@@ -385,6 +658,7 @@ fn find_ancestor(
     (1..=max_dz).take_while(|&dz| tz >= dz + 2).find_map(|dz| {
         let (az, awx, awy) = (tz - dz, wx >> dz, wy >> dz);
         ns.get(&(az, awx, awy))
+            .and_then(Option::as_ref)
             .cloned()
             .map(|h| (dz, az, awx, awy, h))
     })
@@ -397,6 +671,7 @@ pub(super) fn draw_tile_layer(
     layer: TileLayer<'_>,
     url_fn: impl Fn(u8, u32, u32) -> String,
 ) {
+    pool.drain_ready();
     let vp_rect = Rectangle::with_size(vp.bounds);
     let tz = effective_tile_zoom(vp.zoom, layer.max_z);
     let (px, n) = (256.0 * 2.0_f64.powf(vp.zoom - tz as f64), 1_i64 << tz);
@@ -416,24 +691,27 @@ pub(super) fn draw_tile_layer(
     if min_y > max_y || min_x > max_x {
         return;
     }
-    for ty in (min_y - 1).max(0)..=(max_y + 1).min(n - 1) {
-        for tx in (min_x - 1)..=(max_x + 1) {
-            let (wx, wy) = (tx.rem_euclid(n) as u32, ty as u32);
-            let vis = (min_y..=max_y).contains(&ty) && (min_x..=max_x).contains(&tx);
-            pool.ensure(
-                layer.ns,
-                (tz, wx, wy),
-                || url_fn(tz, wx, wy),
-                layer.ttl,
-                vis,
-            );
+    if layer.allow_fetch {
+        for ty in (min_y - 1).max(0)..=(max_y + 1).min(n - 1) {
+            for tx in (min_x - 1)..=(max_x + 1) {
+                let (wx, wy) = (tx.rem_euclid(n) as u32, ty as u32);
+                let vis = (min_y..=max_y).contains(&ty) && (min_x..=max_x).contains(&tx);
+                pool.ensure(
+                    layer.ns,
+                    (tz, wx, wy),
+                    || url_fn(tz, wx, wy),
+                    layer.ttl,
+                    vis,
+                    true,
+                );
+            }
         }
     }
     let Some(ns) = pool.tiles.get(layer.ns) else {
         return;
     };
     if layer.opaque_base && layer.fallback {
-        let mut drawn = HashSet::new();
+        let mut drawn: Vec<(u8, i64, u32)> = Vec::new();
         for ty in min_y..=max_y {
             for tx in min_x..=max_x {
                 let (wx, wy) = (tx.rem_euclid(n) as u32, ty as u32);
@@ -442,11 +720,13 @@ pub(super) fn draw_tile_layer(
                 }
                 if let Some((dz, az, awx, awy, ah)) = find_ancestor(ns, tz, wx, wy, 5) {
                     let gax = tx.div_euclid(n) * (1_i64 << az) + awx as i64;
-                    if drawn.insert((az, gax, awy)) {
+                    let key = (az, gax, awy);
+                    if !drawn.contains(&key) {
+                        drawn.push(key);
                         let r =
                             tile_rect((gax, awy as i64), px * (1_u32 << dz) as f64, c, half, true);
                         if r.intersects(&vp_rect) {
-                            draw_img(frame, r, ah, layer.opacity, vp.corner_r);
+                            draw_img(frame, r, ah, layer.opacity, 0.0);
                         }
                     }
                 } else {
@@ -458,8 +738,10 @@ pub(super) fn draw_tile_layer(
                         let (sub, cpx, mut any) = (1_u32 << dz, px / (1_u32 << dz) as f64, false);
                         for sy in 0..sub {
                             for sx in 0..sub {
-                                if let Some(ch) =
-                                    ns.get(&(cz, (wx << dz) + sx, (wy << dz) + sy)).cloned()
+                                if let Some(ch) = ns
+                                    .get(&(cz, (wx << dz) + sx, (wy << dz) + sy))
+                                    .and_then(Option::as_ref)
+                                    .cloned()
                                 {
                                     any = true;
                                     let r = tile_rect(
@@ -470,7 +752,7 @@ pub(super) fn draw_tile_layer(
                                         true,
                                     );
                                     if r.intersects(&vp_rect) {
-                                        draw_img(frame, r, ch, layer.opacity, vp.corner_r);
+                                        draw_img(frame, r, ch, layer.opacity, 0.0);
                                     }
                                 }
                             }
@@ -490,16 +772,20 @@ pub(super) fn draw_tile_layer(
                 continue;
             }
             let (wx, wy) = (tx.rem_euclid(n) as u32, ty as u32);
-            if let Some(h) = ns.get(&(tz, wx, wy)).cloned() {
-                draw_img(frame, dst, h, layer.opacity, vp.corner_r);
-            } else if !layer.opaque_base
-                && layer.fallback
-                && let Some((dz, az, awx, awy, ah)) = find_ancestor(ns, tz, wx, wy, 2)
-                && let Some(clipped) = dst.intersection(&vp_rect)
-            {
-                let gax = tx.div_euclid(n) * (1_i64 << az) + awx as i64;
-                let r = tile_rect((gax, awy as i64), px * (1_u32 << dz) as f64, c, half, false);
-                frame.with_clip(clipped, |sub| draw_img(sub, r, ah, layer.opacity, 0.0));
+            match ns.get(&(tz, wx, wy)) {
+                Some(Some(h)) => draw_img(frame, dst, h.clone(), layer.opacity, 0.0),
+                Some(None) => {}
+                None if !layer.opaque_base && layer.fallback => {
+                    if let Some((dz, az, awx, awy, ah)) = find_ancestor(ns, tz, wx, wy, 2)
+                        && let Some(clipped) = dst.intersection(&vp_rect)
+                    {
+                        let gax = tx.div_euclid(n) * (1_i64 << az) + awx as i64;
+                        let r =
+                            tile_rect((gax, awy as i64), px * (1_u32 << dz) as f64, c, half, false);
+                        frame.with_clip(clipped, |sub| draw_img(sub, r, ah, layer.opacity, 0.0));
+                    }
+                }
+                None => {}
             }
         }
     }

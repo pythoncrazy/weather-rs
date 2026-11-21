@@ -7,9 +7,23 @@ use crate::model::{
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use ureq::Agent;
+
+static NWS_STATIONS: LazyLock<Mutex<HashMap<(i32, i32), String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Circuit-breaker: Unix timestamp until which `api.open-meteo.com` is skipped after a connect/timeout stall.
+static OPEN_METEO_BACKOFF_UNTIL: AtomicI64 = AtomicI64::new(0);
+
+fn open_meteo_healthy() -> bool {
+    Utc::now().timestamp() >= OPEN_METEO_BACKOFF_UNTIL.load(Ordering::Relaxed)
+}
+fn note_open_meteo_fail() {
+    OPEN_METEO_BACKOFF_UNTIL.store(Utc::now().timestamp() + 45, Ordering::Relaxed);
+}
 
 const UA: &str = "weather-rs/0.2.0 (https://github.com/pythoncrazy/weather-rs)";
 
@@ -137,7 +151,8 @@ impl Default for WeatherClient {
 
 fn build_agent(ms: u64) -> Agent {
     Agent::config_builder()
-        .timeout_connect(Some(Duration::from_millis(1_500)))
+        .timeout_connect(Some(Duration::from_millis(1_100)))
+        .timeout_recv_response(Some(Duration::from_millis(ms.min(2_500))))
         .timeout_global(Some(Duration::from_millis(ms)))
         .max_idle_connections_per_host(24)
         .max_idle_connections(64)
@@ -235,11 +250,152 @@ fn mk_bundle(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WifiAp {
+    mac: String,
+    signal_dbm: i32,
+    freq_mhz: Option<u32>,
+    locally_administered: bool,
+}
+
+fn parse_nmcli_wifi_aps(raw: &str) -> Vec<WifiAp> {
+    let mut best: BTreeMap<String, WifiAp> = BTreeMap::new();
+    for line in raw.lines() {
+        let mut parts = line.rsplitn(3, ':');
+        let (Some(freq_s), Some(sig_s), Some(bssid_s)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let mac = bssid_s.replace("\\:", ":").trim().to_ascii_lowercase();
+        let bytes: Vec<u8> = mac
+            .split(':')
+            .filter_map(|h| {
+                (h.len() == 2)
+                    .then(|| u8::from_str_radix(h, 16).ok())
+                    .flatten()
+            })
+            .collect();
+        if bytes.len() != 6
+            || bytes.iter().all(|&b| b == 0)
+            || bytes.iter().all(|&b| b == 0xff)
+            || (bytes[0] & 0x01) != 0
+        {
+            continue;
+        }
+        let sig_pct: i32 = sig_s.trim().parse().unwrap_or(0).clamp(0, 100);
+        let signal_dbm = -100 + sig_pct / 2;
+        let freq_mhz = freq_s
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&f| f > 0);
+        let ap = WifiAp {
+            mac: mac.clone(),
+            signal_dbm,
+            freq_mhz,
+            locally_administered: (bytes[0] & 0x02) != 0,
+        };
+        match best.get_mut(&mac) {
+            Some(prev) if prev.signal_dbm >= ap.signal_dbm => {}
+            _ => {
+                best.insert(mac, ap);
+            }
+        }
+    }
+    let mut aps: Vec<WifiAp> = best.into_values().collect();
+    // Prioritize globally-unique OUI MACs (indexed in BeaconDB) over virtual/locally-administered ones.
+    aps.sort_by(|a, b| {
+        a.locally_administered
+            .cmp(&b.locally_administered)
+            .then_with(|| b.signal_dbm.cmp(&a.signal_dbm))
+            .then_with(|| a.mac.cmp(&b.mac))
+    });
+    aps.truncate(80);
+    aps
+}
+
+fn parse_beacondb_response(v: &Value) -> Option<(f64, f64)> {
+    if v.get("fallback").is_some() {
+        return None;
+    }
+    let (lat, lon) = (jf(v, "/location/lat")?, jf(v, "/location/lng")?);
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+        return None;
+    }
+    if jf(v, "/accuracy").is_some_and(|a| a > 5_000.0) {
+        return None;
+    }
+    Some((lat, lon))
+}
+
+#[cfg(target_os = "linux")]
+fn scan_wifi_aps() -> Vec<WifiAp> {
+    std::process::Command::new("nmcli")
+        .args([
+            "-t",
+            "-f",
+            "BSSID,SIGNAL,FREQ",
+            "dev",
+            "wifi",
+            "list",
+            "--rescan",
+            "no",
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| parse_nmcli_wifi_aps(&s))
+        .unwrap_or_default()
+}
+
+#[cfg(target_os = "linux")]
+fn trigger_wifi_rescan_async() {
+    let _ = std::process::Command::new("nmcli")
+        .args(["dev", "wifi", "rescan"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+#[cfg(not(target_os = "linux"))]
+fn scan_wifi_aps() -> Vec<WifiAp> {
+    Vec::new()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn trigger_wifi_rescan_async() {}
+
+fn query_beacondb(agent: &Agent, aps: &[WifiAp]) -> Option<(f64, f64)> {
+    if aps.len() < 2 {
+        return None;
+    }
+    let body = serde_json::json!({
+        "wifiAccessPoints": aps.iter().map(|ap| {
+            let mut m = serde_json::Map::new();
+            m.insert("macAddress".into(), Value::String(ap.mac.clone()));
+            m.insert("signalStrength".into(), Value::from(ap.signal_dbm));
+            if let Some(f) = ap.freq_mhz {
+                m.insert("frequency".into(), Value::from(f));
+            }
+            Value::Object(m)
+        }).collect::<Vec<_>>(),
+        "considerIp": false,
+    });
+    let mut resp = agent
+        .post("https://api.beacondb.net/v1/geolocate")
+        .header("Content-Type", "application/json")
+        .send_json(&body)
+        .ok()?;
+    let v = resp.body_mut().read_json::<Value>().ok()?;
+    parse_beacondb_response(&v)
+}
+
 impl WeatherClient {
     pub fn new() -> Self {
         Self {
-            std_agent: build_agent(6500),
-            fast_agent: build_agent(3200),
+            std_agent: build_agent(6000),
+            fast_agent: build_agent(1800),
         }
     }
 
@@ -252,21 +408,58 @@ impl WeatherClient {
             .map_err(|e| e.to_string())
     }
 
-    pub fn detect_current_location(&self) -> Option<Location> {
-        const ENDPOINTS: [(&str, &str); 2] = [
-            ("https://ipwho.is/", "/timezone/id"),
+    fn detect_wifi_location(&self, agent: &Agent) -> Option<Location> {
+        let cached = scan_wifi_aps();
+        let Some((lat, lon)) = query_beacondb(agent, &cached) else {
+            // Refresh NM's AP cache asynchronously without blocking the caller for ~7s.
+            trigger_wifi_rescan_async();
+            return None;
+        };
+        let mut loc = self.reverse_geocode_with_agent(agent, lat, lon);
+        (loc.id, loc.is_current_location) = ("current_location".into(), true);
+        Some(loc)
+    }
+
+    pub fn detect_current_location(&self) -> Option<(Location, bool)> {
+        // Use a fresh short-timeout agent so Wi-Fi/VPN switches never stall on stale pooled sockets.
+        let agent: Agent = Agent::config_builder()
+            .timeout_connect(Some(Duration::from_millis(2_000)))
+            .timeout_global(Some(Duration::from_millis(4_000)))
+            .max_idle_connections(0)
+            .user_agent(UA)
+            .build()
+            .into();
+        // Prefer ~50m Wi-Fi BSSID triangulation (works even behind VPN), fall back to IP geolocation.
+        if let Some(loc) = self.detect_wifi_location(&agent) {
+            return Some((loc, true));
+        }
+        const ENDPOINTS: [(&str, &str); 3] = [
             ("https://get.geojs.io/v1/ip/geo.json", "/timezone"),
+            ("https://ipwho.is/", "/timezone/id"),
+            ("https://ipinfo.io/json", "/timezone"),
         ];
         for (url, tz_p) in ENDPOINTS {
-            let Ok(v) = get_val(&self.fast_agent, url) else {
+            let Ok(mut resp) = agent.get(url).header("Cache-Control", "no-cache").call() else {
+                continue;
+            };
+            let Ok(v) = resp.body_mut().read_json::<Value>() else {
                 continue;
             };
             if v.get("success").and_then(Value::as_bool) == Some(false) {
                 continue;
             }
-            let lat = jf(&v, "/latitude").or_else(|| js(&v, "/latitude")?.parse().ok());
-            let lon = jf(&v, "/longitude").or_else(|| js(&v, "/longitude")?.parse().ok());
-            if let (Some(la), Some(lo)) = (lat, lon) {
+            let (lat, lon) = jf(&v, "/latitude")
+                .or_else(|| js(&v, "/latitude")?.parse().ok())
+                .zip(jf(&v, "/longitude").or_else(|| js(&v, "/longitude")?.parse().ok()))
+                .or_else(|| {
+                    let (a, b) = js(&v, "/loc")?.split_once(',')?;
+                    Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+                })
+                .unzip();
+            if let (Some(la), Some(lo)) = (lat, lon)
+                && (-90.0..=90.0).contains(&la)
+                && (-180.0..=180.0).contains(&lo)
+            {
                 let name = js(&v, "/city")
                     .filter(|s| !s.is_empty())
                     .unwrap_or("Current Location");
@@ -274,13 +467,15 @@ impl WeatherClient {
                     name,
                     js(&v, "/region").unwrap_or(""),
                     js(&v, "/country").unwrap_or(""),
-                    js(&v, "/country_code").unwrap_or(""),
+                    js(&v, "/country_code")
+                        .or_else(|| js(&v, "/country").filter(|s| s.len() == 2))
+                        .unwrap_or(""),
                     la,
                     lo,
                     js(&v, tz_p).unwrap_or(""),
                 );
                 (l.id, l.is_current_location) = ("current_location".into(), true);
-                return Some(l);
+                return Some((l, false));
             }
         }
         None
@@ -349,37 +544,64 @@ impl WeatherClient {
     }
 
     pub fn reverse_geocode(&self, lat: f64, lon: f64) -> Location {
+        self.reverse_geocode_with_agent(&self.fast_agent, lat, lon)
+    }
+
+    fn reverse_geocode_with_agent(&self, agent: &Agent, lat: f64, lon: f64) -> Location {
         let url = format!(
-            "https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat={lat:.4}&lon={lon:.4}&zoom=10&addressdetails=1"
+            "https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat={lat:.5}&lon={lon:.5}&zoom=12&addressdetails=1"
         );
-        let v = get_val(&self.fast_agent, &url).unwrap_or(Value::Null);
-        let name = [
-            "/address/city",
-            "/address/town",
-            "/address/village",
-            "/address/municipality",
-            "/address/county",
-            "/address/state",
-            "/name",
-        ]
-        .iter()
-        .find_map(|p| js(&v, p).filter(|s| !s.is_empty()))
-        .map_or_else(|| format!("{lat:.2}°, {lon:.2}°"), str::to_string);
-        let reg = js(&v, "/address/state")
-            .or_else(|| js(&v, "/address/region"))
-            .unwrap_or("");
-        let cc = js(&v, "/address/country_code")
-            .unwrap_or("")
-            .to_ascii_uppercase();
-        Location::new(
-            name,
-            reg,
-            js(&v, "/address/country").unwrap_or(""),
-            &cc,
-            lat,
-            lon,
-            "",
-        )
+        if let Ok(v) = get_val(agent, &url)
+            && let Some(name) = [
+                "/address/city",
+                "/address/town",
+                "/address/village",
+                "/address/municipality",
+                "/address/suburb",
+                "/address/hamlet",
+                "/address/county",
+                "/address/state",
+                "/name",
+            ]
+            .iter()
+            .find_map(|p| js(&v, p).filter(|s| !s.is_empty()))
+        {
+            let reg = js(&v, "/address/state")
+                .or_else(|| js(&v, "/address/region"))
+                .unwrap_or("");
+            let cc = js(&v, "/address/country_code")
+                .unwrap_or("")
+                .to_ascii_uppercase();
+            return Location::new(
+                name,
+                reg,
+                js(&v, "/address/country").unwrap_or(""),
+                &cc,
+                lat,
+                lon,
+                "",
+            );
+        }
+        // Fast fallback if Nominatim is rate-limited or unreachable.
+        let bdc = format!(
+            "https://api.bigdatacloud.net/data/reverse-geocode-client?latitude={lat:.5}&longitude={lon:.5}&localityLanguage=en"
+        );
+        if let Ok(v) = get_val(agent, &bdc)
+            && let Some(name) = ["/locality", "/city", "/principalSubdivision"]
+                .iter()
+                .find_map(|p| js(&v, p).filter(|s| !s.is_empty()))
+        {
+            return Location::new(
+                name,
+                js(&v, "/principalSubdivision").unwrap_or(""),
+                js(&v, "/countryName").unwrap_or(""),
+                &js(&v, "/countryCode").unwrap_or("").to_ascii_uppercase(),
+                lat,
+                lon,
+                "",
+            );
+        }
+        Location::new(format!("{lat:.2}°, {lon:.2}°"), "", "", "", lat, lon, "")
     }
 
     fn probe_hrrr(&self, init_u: i64, prod: &str, refp: bool) -> Option<(i64, String, bool)> {
@@ -398,50 +620,26 @@ impl WeatherClient {
 
     fn detect_latest_hrrr_init(&self) -> Option<(i64, String, bool)> {
         let h = (Utc::now().timestamp() / 3600) * 3600;
-        let (a, b) = std::thread::scope(|s| {
-            let p1 = s.spawn(|| self.probe_hrrr(h - 3600, "REFP", true));
-            let p2 = s.spawn(|| self.probe_hrrr(h - 7200, "REFP", true));
-            (p1.join().ok().flatten(), p2.join().ok().flatten())
-        });
-        if let Some(hit) = a.or(b) {
-            return Some(hit);
-        }
-        for lag in 1..=4_i64 {
-            let t = h - lag * 3600;
-            if lag >= 3
-                && let Some(hit) = self.probe_hrrr(t, "REFP", true)
-            {
-                return Some(hit);
-            }
-            if let Some(hit) = self.probe_hrrr(t, "REFD", false) {
-                return Some(hit);
-            }
-        }
-        None
+        let candidates = [
+            (h - 3600, "REFP", true),
+            (h - 7200, "REFP", true),
+            (h - 10800, "REFP", true),
+            (h - 3600, "REFD", false),
+        ];
+        std::thread::scope(|s| {
+            let handles: Vec<_> = candidates
+                .iter()
+                .map(|&(t, p, r)| s.spawn(move || self.probe_hrrr(t, p, r)))
+                .collect();
+            handles.into_iter().find_map(|h| h.join().ok().flatten())
+        })
     }
 
-    pub fn fetch_rainviewer_manifest(&self) -> Option<RainViewerManifest> {
-        let (lwxr, hrrr) = std::thread::scope(|s| {
-            let h = s.spawn(|| self.detect_latest_hrrr_init());
-            let lw = get_val(
-                &self.fast_agent,
-                "https://api.librewxr.net/public/weather-maps.json",
-            )
-            .ok();
-            (lw, h.join().ok().flatten())
-        });
-        let (primary, is_lwxr) = if lwxr.is_some() {
-            (lwxr, true)
-        } else {
-            (
-                get_val(
-                    &self.std_agent,
-                    "https://api.rainviewer.com/public/weather-maps.json",
-                )
-                .ok(),
-                false,
-            )
-        };
+    fn build_radar_manifest(
+        primary: Option<&Value>,
+        is_lwxr: bool,
+        hrrr: Option<(i64, String, bool)>,
+    ) -> Option<RainViewerManifest> {
         let mut host = if is_lwxr {
             "https://api.librewxr.net"
         } else {
@@ -456,29 +654,24 @@ impl WeatherClient {
                 RadarFrameSource::RainViewer(p.into())
             }
         };
-        if let Some(v) = &primary {
+        if let Some(v) = primary {
             if let Some(h) = js(v, "/host") {
                 host = h.into();
             }
+            let push_list = |frames: &mut Vec<RainViewerFrame>, items: &[Value], nowcast: bool| {
+                for item in items {
+                    if let (Some(t), Some(p)) = (ji(item, "/time"), js(item, "/path")) {
+                        frames.push(RainViewerFrame {
+                            time_unix: t,
+                            is_nowcast: nowcast && t > now + 120,
+                            source: mk_src(p),
+                        });
+                    }
+                }
+            };
             let past = ja(v, "/radar/past");
-            for item in past.iter().skip(past.len().saturating_sub(6)) {
-                if let (Some(t), Some(p)) = (ji(item, "/time"), js(item, "/path")) {
-                    frames.push(RainViewerFrame {
-                        time_unix: t,
-                        is_nowcast: false,
-                        source: mk_src(p),
-                    });
-                }
-            }
-            for item in ja(v, "/radar/nowcast") {
-                if let (Some(t), Some(p)) = (ji(item, "/time"), js(item, "/path")) {
-                    frames.push(RainViewerFrame {
-                        time_unix: t,
-                        is_nowcast: t > now + 120,
-                        source: mk_src(p),
-                    });
-                }
-            }
+            push_list(&mut frames, &past[past.len().saturating_sub(6)..], false);
+            push_list(&mut frames, ja(v, "/radar/nowcast"), true);
         }
         let live_ts = frames
             .iter()
@@ -532,6 +725,42 @@ impl WeatherClient {
         (!frames.is_empty()).then_some(RainViewerManifest { host, frames })
     }
 
+    /// Streams the live radar manifest immediately (~160ms), then upgrades with HRRR forecast frames.
+    pub fn fetch_radar_manifest_streaming(&self, mut emit: impl FnMut(RainViewerManifest)) {
+        std::thread::scope(|s| {
+            let hrrr_h = s.spawn(|| self.detect_latest_hrrr_init());
+            let (primary, is_lwxr) = match get_val(
+                &self.fast_agent,
+                "https://api.librewxr.net/public/weather-maps.json",
+            ) {
+                Ok(v) => (Some(v), true),
+                Err(_) => (
+                    get_val(
+                        &self.std_agent,
+                        "https://api.rainviewer.com/public/weather-maps.json",
+                    )
+                    .ok(),
+                    false,
+                ),
+            };
+            if let Some(m) = Self::build_radar_manifest(primary.as_ref(), is_lwxr, None) {
+                emit(m);
+            }
+            if let Ok(Some(hrrr)) = hrrr_h.join()
+                && let Some(m) = Self::build_radar_manifest(primary.as_ref(), is_lwxr, Some(hrrr))
+            {
+                emit(m);
+            }
+        });
+    }
+
+    #[cfg(test)]
+    pub fn fetch_rainviewer_manifest(&self) -> Option<RainViewerManifest> {
+        let mut last = None;
+        self.fetch_radar_manifest_streaming(|m| last = Some(m));
+        last
+    }
+
     pub fn fetch_grid_batch(&self, coords: &[(f64, f64)]) -> Vec<GridWeatherPoint> {
         if coords.is_empty() {
             return Vec::new();
@@ -540,60 +769,89 @@ impl WeatherClient {
         let url = format!(
             "https://api.open-meteo.com/v1/forecast?latitude={lats}&longitude={lons}&current=temperature_2m,precipitation,wind_speed_10m,wind_direction_10m,pressure_msl&hourly=temperature_2m,precipitation,wind_speed_10m,wind_direction_10m,pressure_msl&forecast_hours=14&timeformat=unixtime&wind_speed_unit=ms"
         );
-        if let Ok(val) = get_val(&self.std_agent, &url) {
-            let pts: Vec<_> = as_items(&val)
-                .into_iter()
-                .zip(coords)
-                .filter_map(|(it, &(la, lo))| {
-                    let (tc, ws, wd, pr) = (
-                        jf(it, "/current/temperature_2m")?,
-                        jf(it, "/current/wind_speed_10m").unwrap_or(0.0),
-                        jf(it, "/current/wind_direction_10m").unwrap_or(0.0),
-                        jf(it, "/current/pressure_msl").unwrap_or(1013.25),
-                    );
-                    let (u, v) = wind_uv(ws, wd);
-                    let (mut hourly, mut hl) = ([(0_i64, [0.0_f32; 6]); 14], 0_usize);
-                    if let Some(h) = it.get("hourly") {
-                        for (i, tv) in ja(h, "/time").iter().take(14).enumerate() {
-                            let Some(ts) = tv.as_i64() else { continue };
-                            let hs = at_f(h, "wind_speed_10m", i, ws);
-                            let (hu, hv) = wind_uv(hs, at_f(h, "wind_direction_10m", i, wd));
-                            hourly[hl] = (
-                                ts,
-                                [
-                                    at_f(h, "temperature_2m", i, tc) as f32,
-                                    at_f(h, "precipitation", i, 0.0) as f32,
-                                    hu,
-                                    hv,
-                                    hs as f32,
-                                    at_f(h, "pressure_msl", i, pr) as f32,
-                                ],
-                            );
-                            hl += 1;
+        if open_meteo_healthy() {
+            if let Ok(val) = get_val(&self.std_agent, &url) {
+                let pts: Vec<_> = as_items(&val)
+                    .into_iter()
+                    .zip(coords)
+                    .filter_map(|(it, &(la, lo))| {
+                        let (tc, ws, wd, pr) = (
+                            jf(it, "/current/temperature_2m")?,
+                            jf(it, "/current/wind_speed_10m").unwrap_or(0.0),
+                            jf(it, "/current/wind_direction_10m").unwrap_or(0.0),
+                            jf(it, "/current/pressure_msl").unwrap_or(1013.25),
+                        );
+                        let (u, v) = wind_uv(ws, wd);
+                        let (mut hourly, mut hl) = ([(0_i64, [0.0_f32; 6]); 14], 0_usize);
+                        if let Some(h) = it.get("hourly") {
+                            for (i, tv) in ja(h, "/time").iter().take(14).enumerate() {
+                                let Some(ts) = tv.as_i64() else { continue };
+                                let hs = at_f(h, "wind_speed_10m", i, ws);
+                                let (hu, hv) = wind_uv(hs, at_f(h, "wind_direction_10m", i, wd));
+                                hourly[hl] = (
+                                    ts,
+                                    [
+                                        at_f(h, "temperature_2m", i, tc) as f32,
+                                        at_f(h, "precipitation", i, 0.0) as f32,
+                                        hu,
+                                        hv,
+                                        hs as f32,
+                                        at_f(h, "pressure_msl", i, pr) as f32,
+                                    ],
+                                );
+                                hl += 1;
+                            }
                         }
-                    }
-                    let p0 = jf(it, "/current/precipitation").unwrap_or(0.0) as f32;
-                    Some(GridWeatherPoint {
-                        lat: clamp_lat(la),
-                        lon: wrap_lon(lo),
-                        v: [tc as f32, p0, u, v, ws as f32, pr as f32],
-                        hourly,
-                        hourly_len: hl as u8,
+                        let p0 = jf(it, "/current/precipitation").unwrap_or(0.0) as f32;
+                        Some(GridWeatherPoint {
+                            lat: clamp_lat(la),
+                            lon: wrap_lon(lo),
+                            v: [tc as f32, p0, u, v, ws as f32, pr as f32],
+                            hourly,
+                            hourly_len: hl as u8,
+                        })
+                    })
+                    .collect();
+                if !pts.is_empty() {
+                    return pts;
+                }
+            } else {
+                note_open_meteo_fail();
+            }
+        }
+        std::thread::scope(|s| {
+            let hs: Vec<_> = coords
+                .iter()
+                .take(8)
+                .map(|&(la, lo)| {
+                    s.spawn(move || {
+                        let (la, lo) = (clamp_lat(la), wrap_lon(lo));
+                        let url = format!(
+                            "https://api.met.no/weatherapi/locationforecast/2.0/compact?lat={la:.3}&lon={lo:.3}"
+                        );
+                        let v = get_val(&self.fast_agent, &url).ok()?;
+                        let d = v.pointer("/properties/timeseries/0/data/instant/details")?;
+                        let ws = jf(d, "/wind_speed").unwrap_or(0.0);
+                        let (wu, wv) = wind_uv(ws, jf(d, "/wind_from_direction").unwrap_or(0.0));
+                        Some(GridWeatherPoint::stationary(
+                            la,
+                            lo,
+                            [
+                                jf(d, "/air_temperature")? as f32,
+                                0.0,
+                                wu,
+                                wv,
+                                ws as f32,
+                                jf(d, "/air_pressure_at_sea_level").unwrap_or(1013.25) as f32,
+                            ],
+                        ))
                     })
                 })
                 .collect();
-            if !pts.is_empty() {
-                return pts;
-            }
-        }
-        coords.iter().take(8).filter_map(|&(la, lo)| {
-            let (la, lo) = (clamp_lat(la), wrap_lon(lo));
-            let v = get_val(&self.fast_agent, &format!("https://api.met.no/weatherapi/locationforecast/2.0/compact?lat={la:.3}&lon={lo:.3}")).ok()?;
-            let d = v.pointer("/properties/timeseries/0/data/instant/details")?;
-            let ws = jf(d, "/wind_speed").unwrap_or(0.0);
-            let (wu, wv) = wind_uv(ws, jf(d, "/wind_from_direction").unwrap_or(0.0));
-            Some(GridWeatherPoint::stationary(la, lo, [jf(d, "/air_temperature")? as f32, 0.0, wu, wv, ws as f32, jf(d, "/air_pressure_at_sea_level").unwrap_or(1013.25) as f32]))
-        }).collect()
+            hs.into_iter()
+                .filter_map(|h| h.join().ok().flatten())
+                .collect()
+        })
     }
 
     pub fn fetch_aqi_grid_batch(&self, coords: &[(f64, f64)]) -> Vec<(f64, f64, f64)> {
@@ -616,30 +874,33 @@ impl WeatherClient {
             .collect()
     }
 
-    fn merge_nws_obs(&self, cur: &mut CurrentWeather, lat: f64, lon: f64) -> bool {
+    fn fetch_nws_obs(&self, lat: f64, lon: f64) -> Option<Value> {
         if !(17.0..=72.0).contains(&lat) || !(-179.0..=-64.0).contains(&lon) {
-            return false;
+            return None;
         }
-        let Some(pts) = get_nws(
-            &self.fast_agent,
-            &format!("https://api.weather.gov/points/{lat:.4},{lon:.4}"),
-        ) else {
-            return false;
+        let key = ((lat * 20.0).round() as i32, (lon * 20.0).round() as i32);
+        let id = if let Some(cached) = NWS_STATIONS.lock().ok().and_then(|m| m.get(&key).cloned()) {
+            cached
+        } else {
+            let pts = get_nws(
+                &self.fast_agent,
+                &format!("https://api.weather.gov/points/{lat:.4},{lon:.4}"),
+            )?;
+            let st = js(&pts, "/properties/observationStations")
+                .and_then(|u| get_nws(&self.fast_agent, u))?;
+            let id = js(&st, "/features/0/properties/stationIdentifier")?.to_string();
+            if let Ok(mut m) = NWS_STATIONS.lock() {
+                m.insert(key, id.clone());
+            }
+            id
         };
-        let Some(st) =
-            js(&pts, "/properties/observationStations").and_then(|u| get_nws(&self.fast_agent, u))
-        else {
-            return false;
-        };
-        let Some(id) = js(&st, "/features/0/properties/stationIdentifier") else {
-            return false;
-        };
-        let Some(obs) = get_nws(
+        get_nws(
             &self.fast_agent,
             &format!("https://api.weather.gov/stations/{id}/observations/latest"),
-        ) else {
-            return false;
-        };
+        )
+    }
+
+    fn apply_nws_obs(cur: &mut CurrentWeather, obs: &Value) -> bool {
         let Some(p) = obs.get("properties") else {
             return false;
         };
@@ -692,8 +953,12 @@ impl WeatherClient {
             cur.visibility_m = Some(v);
         }
         if merged {
-            cur.feels_like_c =
-                apparent_temperature_c(cur.temp_c, cur.humidity_pct, cur.wind_speed_mps);
+            cur.feels_like_c = val("windChill")
+                .or_else(|| val("heatIndex"))
+                .filter(|t| (-75.0..=75.0).contains(t))
+                .unwrap_or_else(|| {
+                    apparent_temperature_c(cur.temp_c, cur.humidity_pct, cur.wind_speed_mps)
+                });
         }
         merged
     }
@@ -703,25 +968,58 @@ impl WeatherClient {
         loc: &Location,
         provider: ProviderChoice,
     ) -> Result<WeatherBundle, String> {
+        self.fetch_weather_inner(loc, provider, true, None)
+    }
+
+    pub fn fetch_weather_streaming(
+        &self,
+        loc: &Location,
+        provider: ProviderChoice,
+        mut on_primary: impl FnMut(WeatherBundle),
+    ) -> Result<WeatherBundle, String> {
+        self.fetch_weather_inner(loc, provider, true, Some(&mut on_primary))
+    }
+
+    pub fn fetch_weather_quick(
+        &self,
+        loc: &Location,
+        provider: ProviderChoice,
+    ) -> Result<WeatherBundle, String> {
+        self.fetch_weather_inner(loc, provider, false, None)
+    }
+
+    fn fetch_weather_inner(
+        &self,
+        loc: &Location,
+        provider: ProviderChoice,
+        enrich: bool,
+        on_primary: Option<&mut dyn FnMut(WeatherBundle)>,
+    ) -> Result<WeatherBundle, String> {
         let nordic = (55.0..=72.0).contains(&loc.lat) && (3.0..=32.0).contains(&loc.lon);
         std::thread::scope(|s| {
-            let aqi_h = s.spawn(|| self.fetch_air_quality(loc.lat, loc.lon));
-            let alerts_h = s.spawn(|| self.fetch_nws_alerts(loc.lat, loc.lon));
+            let aqi_h = enrich.then(|| s.spawn(|| self.fetch_air_quality(loc.lat, loc.lon)));
+            let alerts_h = enrich.then(|| s.spawn(|| self.fetch_nws_alerts(loc.lat, loc.lon)));
+            let nws_h = (provider != ProviderChoice::MetNorway)
+                .then(|| s.spawn(|| self.fetch_nws_obs(loc.lat, loc.lon)));
             let mut b = match provider {
                 ProviderChoice::MetNorway => self.fetch_met_norway(loc),
-                ProviderChoice::Auto if nordic => self
+                ProviderChoice::Auto if nordic || !open_meteo_healthy() => self
                     .fetch_met_norway(loc)
                     .or_else(|_| self.fetch_open_meteo(loc)),
                 _ => self
                     .fetch_open_meteo(loc)
+                    .inspect_err(|_| note_open_meteo_fail())
                     .or_else(|_| self.fetch_met_norway(loc)),
             }?;
-            if provider != ProviderChoice::MetNorway
-                && self.merge_nws_obs(&mut b.current, loc.lat, loc.lon)
+            if let Some(cb) = on_primary {
+                cb(b.clone());
+            }
+            if let Some(obs) = nws_h.and_then(|h| h.join().ok().flatten())
+                && Self::apply_nws_obs(&mut b.current, &obs)
             {
                 append_source(&mut b.source_name, "NOAA NWS");
             }
-            if let Ok((aqi, tz)) = aqi_h.join() {
+            if let Some((aqi, tz)) = aqi_h.and_then(|h| h.join().ok()) {
                 if b.location.timezone.is_empty()
                     && let Some(tz) = tz
                 {
@@ -732,7 +1030,7 @@ impl WeatherClient {
                     append_source(&mut b.source_name, "CAMS AQI");
                 }
             }
-            if let Ok(alerts) = alerts_h.join()
+            if let Some(alerts) = alerts_h.and_then(|h| h.join().ok())
                 && !alerts.is_empty()
             {
                 b.alerts = alerts;
@@ -774,7 +1072,7 @@ impl WeatherClient {
             return Vec::new();
         };
         let mut seen = HashSet::new();
-        ja(&v, "/features")
+        let mut alerts: Vec<_> = ja(&v, "/features")
             .iter()
             .filter_map(|f| {
                 let p = f.get("properties")?;
@@ -797,7 +1095,9 @@ impl WeatherClient {
                     expires: js(p, "/expires").unwrap_or("").into(),
                 })
             })
-            .collect()
+            .collect();
+        alerts.sort_by_key(|a| a.severity as u8);
+        alerts
     }
 
     fn fetch_met_norway(&self, loc: &Location) -> Result<WeatherBundle, String> {
@@ -823,6 +1123,7 @@ impl WeatherClient {
             uv: f64,
         }
         let mut days: BTreeMap<NaiveDate, Acc> = BTreeMap::new();
+        let mut first_hourly_idx: Option<usize> = None;
         for (idx, e) in series.iter().enumerate() {
             let (Some(ts), Some(data), Some(d)) = (
                 rfc3339(e, "/time"),
@@ -883,6 +1184,9 @@ impl WeatherClient {
                 .and_then(|n| rfc3339(n, "/time"))
                 .map_or(bh, |nt| ((nt - ts) / 3600).clamp(1, 12));
             if ts >= now - 3500 && hourly.len() < 72 {
+                if first_hourly_idx.is_none() {
+                    first_hourly_idx = Some(idx);
+                }
                 hourly.push(HourlyForecast {
                     timestamp_unix: ts,
                     temp_c: tc,
@@ -923,7 +1227,7 @@ impl WeatherClient {
                 a.cond = Some(cond);
             }
         }
-        let fd = series[0]
+        let fd = series[first_hourly_idx.unwrap_or(0)]
             .pointer("/data/instant/details")
             .unwrap_or(&Value::Null);
         let fh = hourly.first().cloned().ok_or("No hourly forecast points")?;
@@ -1013,7 +1317,7 @@ impl WeatherClient {
 
     fn fetch_open_meteo(&self, location: &Location) -> Result<WeatherBundle, String> {
         let url = format!(
-            "https://api.open-meteo.com/v1/forecast?latitude={:.4}&longitude={:.4}&models=best_match&current=temperature_2m,relative_humidity_2m,dew_point_2m,apparent_temperature,is_day,precipitation,weather_code,cloud_cover,pressure_msl,wind_speed_10m,wind_direction_10m,wind_gusts_10m,visibility,uv_index&minutely_15=precipitation&forecast_minutely_15=24&hourly=temperature_2m,apparent_temperature,precipitation_probability,precipitation,weather_code,pressure_msl,cloud_cover,visibility,wind_speed_10m,wind_direction_10m,uv_index,relative_humidity_2m,is_day&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_sum,precipitation_probability_max,wind_speed_10m_max&wind_speed_unit=ms&timeformat=unixtime&timezone=auto&forecast_days=10",
+            "https://api.open-meteo.com/v1/forecast?latitude={:.4}&longitude={:.4}&models=best_match&current=temperature_2m,relative_humidity_2m,dew_point_2m,apparent_temperature,is_day,precipitation,weather_code,cloud_cover,pressure_msl,wind_speed_10m,wind_direction_10m,wind_gusts_10m,visibility,uv_index&minutely_15=precipitation&forecast_minutely_15=6&hourly=temperature_2m,apparent_temperature,precipitation_probability,precipitation,weather_code,pressure_msl,cloud_cover,visibility,wind_speed_10m,wind_direction_10m,uv_index,relative_humidity_2m,is_day&forecast_hours=72&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_sum,precipitation_probability_max,wind_speed_10m_max&wind_speed_unit=ms&timeformat=unixtime&timezone=auto&forecast_days=10",
             location.lat, location.lon
         );
         let val = get_val(&self.std_agent, &url).map_err(|e| format!("Open-Meteo error: {e}"))?;
@@ -1197,5 +1501,52 @@ mod tests {
             .collect();
         assert!(m.frames.iter().filter(|f| !f.is_nowcast).count() >= 6 && fut.len() >= 8);
         assert!(fut.iter().map(|f| f.time_unix).max().unwrap_or(0) >= now + 6 * 3600);
+    }
+
+    #[test]
+    fn wifi_ap_parsing_and_beacondb_validation() {
+        let sample = "\
+4E\\:D7\\:4A\\:7D\\:84\\:71:90:5180 MHz
+14\\:22\\:3B\\:4F\\:C0\\:7A:60:2462 MHz
+14\\:22\\:3B\\:4F\\:C0\\:7A:80:2462 MHz
+AC\\:39\\:3D\\:19\\:CE\\:03:48:2437 MHz
+00\\:00\\:00\\:00\\:00\\:00:99:2412 MHz
+FF\\:FF\\:FF\\:FF\\:FF\\:FF:99:2412 MHz
+01\\:00\\:5E\\:00\\:00\\:01:80:2412 MHz
+bad:line
+";
+        let aps = parse_nmcli_wifi_aps(sample);
+        assert_eq!(aps.len(), 3);
+        // Globally-unique OUI MACs sorted before locally-administered (0x4e has bit 1 set), strongest first.
+        assert_eq!(aps[0].mac, "14:22:3b:4f:c0:7a");
+        assert_eq!(aps[0].signal_dbm, -60); // dedup kept 80% (-60 dBm) over 60% (-70 dBm)
+        assert_eq!(aps[0].freq_mhz, Some(2462));
+        assert!(!aps[0].locally_administered);
+        assert_eq!(aps[1].mac, "ac:39:3d:19:ce:03");
+        assert!(!aps[1].locally_administered);
+        assert_eq!(aps[2].mac, "4e:d7:4a:7d:84:71");
+        assert!(aps[2].locally_administered);
+
+        let good: Value = serde_json::json!({
+            "location": { "lat": 37.878076, "lng": -122.266842 },
+            "accuracy": 49.0
+        });
+        assert_eq!(
+            parse_beacondb_response(&good),
+            Some((37.878076, -122.266842))
+        );
+
+        let ip_fallback: Value = serde_json::json!({
+            "location": { "lat": 37.89, "lng": -122.26 },
+            "accuracy": 25000.0,
+            "fallback": "ipf"
+        });
+        assert_eq!(parse_beacondb_response(&ip_fallback), None);
+
+        let coarse: Value = serde_json::json!({
+            "location": { "lat": 37.89, "lng": -122.26 },
+            "accuracy": 12000.0
+        });
+        assert_eq!(parse_beacondb_response(&coarse), None);
     }
 }

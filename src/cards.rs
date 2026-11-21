@@ -78,6 +78,27 @@ impl Ctx<'_> {
     }
 }
 
+pub(crate) fn today_daily_index(b: &WeatherBundle, loc: &crate::model::Location) -> usize {
+    let d = loc.local_date(Utc::now().timestamp());
+    let (y, m, day) = (d.year().clamp(0, 9999) as u32, d.month(), d.day());
+    let today = [
+        b'0' + (y / 1000) as u8,
+        b'0' + ((y / 100) % 10) as u8,
+        b'0' + ((y / 10) % 10) as u8,
+        b'0' + (y % 10) as u8,
+        b'-',
+        b'0' + (m / 10) as u8,
+        b'0' + (m % 10) as u8,
+        b'-',
+        b'0' + (day / 10) as u8,
+        b'0' + (day % 10) as u8,
+    ];
+    b.daily
+        .iter()
+        .position(|d| d.date.as_bytes() >= today.as_slice())
+        .unwrap_or(0)
+}
+
 impl WeatherApp {
     fn ctx(&self, p: SkyPalette) -> Ctx<'_> {
         Ctx {
@@ -100,7 +121,8 @@ impl WeatherApp {
             loc.subtitle().to_uppercase()
         };
         let (tsz, ssz) = if cur { (23.0, 10.5) } else { (26.0, 10.0) };
-        let hl = b.daily.first().map_or_else(String::new, |d| {
+        let di = today_daily_index(b, loc);
+        let hl = b.daily.get(di).map_or_else(String::new, |d| {
             format!(
                 "H:{}  L:{}",
                 self.settings.format_temp(d.temp_max_c),
@@ -147,11 +169,19 @@ impl WeatherApp {
             .spacing(5)
             .align_y(Alignment::Center);
         let mut rows: Vec<El<'a>> = vec![hd.into()];
-        let bc = (
-            rgba8(255, 255, 255, 0.14),
-            rgba8(255, 255, 255, 0.24),
-            p.text_primary,
-        );
+        let bc = if p.is_light {
+            (
+                rgba8(24, 42, 72, 0.08),
+                rgba8(24, 42, 72, 0.16),
+                p.text_primary,
+            )
+        } else {
+            (
+                rgba8(255, 255, 255, 0.14),
+                rgba8(255, 255, 255, 0.24),
+                p.text_primary,
+            )
+        };
         for (i, a) in b.alerts.iter().enumerate() {
             let open = self.expanded_alert_idx == Some(i);
             let lbl = tm(if open { "Hide" } else { "Details" }, 11.0, p.text_primary);
@@ -182,14 +212,36 @@ impl WeatherApp {
         w: f32,
     ) -> Option<El<'a>> {
         let now = Utc::now().timestamp();
-        let samp: Vec<f64> = b
+        let raw: Vec<(i64, f64)> = b
             .minutely
             .iter()
-            .filter(|s| s.timestamp_unix >= now - 600 && s.timestamp_unix <= now + 3900)
-            .take(16)
-            .map(|s| s.precip_mm_hr)
+            .filter(|s| s.timestamp_unix >= now - 900 && s.timestamp_unix <= now + 4500)
+            .map(|s| (s.timestamp_unix, s.precip_mm_hr.max(0.0)))
             .collect();
-        if samp.len() < 3 || !samp.iter().any(|&r| r > 0.06) {
+        if raw.len() < 2 || !raw.iter().any(|&(_, r)| r > 0.06) {
+            return None;
+        }
+        // Resample onto 13 uniform 5-minute buckets across Now..60m so bars align with ticks.
+        let samp: Vec<f64> = (0..13)
+            .map(|i| {
+                let ts = now + i * 300;
+                if ts <= raw[0].0 {
+                    raw[0].1
+                } else if ts >= raw[raw.len() - 1].0 {
+                    raw[raw.len() - 1].1
+                } else {
+                    raw.windows(2)
+                        .find_map(|w| {
+                            (ts >= w[0].0 && ts <= w[1].0).then(|| {
+                                let t = (ts - w[0].0) as f64 / (w[1].0 - w[0].0).max(1) as f64;
+                                w[0].1 + (w[1].1 - w[0].1) * t
+                            })
+                        })
+                        .unwrap_or(0.0)
+                }
+            })
+            .collect();
+        if !samp.iter().any(|&r| r > 0.06) {
             return None;
         }
         let max_r = samp.iter().copied().fold(0.0_f64, f64::max);
@@ -253,7 +305,7 @@ impl WeatherApp {
         let mut sun: Vec<_> = b
             .daily
             .iter()
-            .take(2)
+            .take(3)
             .flat_map(|d| {
                 let sr = d.sunrise_unix.map(|t| (t, true, "Sunrise"));
                 let ss = d.sunset_unix.map(|t| (t, false, "Sunset"));
@@ -268,15 +320,20 @@ impl WeatherApp {
             } else {
                 loc.format_local_hour(h.timestamp_unix, h24)
             };
+            let (cond, is_day, temp_c) = if i == 0 {
+                (b.current.condition, b.current.is_day, b.current.temp_c)
+            } else {
+                (h.condition, h.is_day, h.temp_c)
+            };
             let ic = icon_prob_cell(
-                h.condition,
-                h.is_day,
+                cond,
+                is_day,
                 h.precip_prob_pct,
                 (20.0, 22.0, 9.5, 4.0, 44.0),
                 None,
                 p.is_light,
             );
-            let tc = self.settings.format_temp(h.temp_c);
+            let tc = self.settings.format_temp(temp_c);
             let slot = column![
                 tb(hr, 11.5, p.text_primary),
                 ic,
@@ -301,6 +358,7 @@ impl WeatherApp {
         }
         let sb = scrollable::Scrollbar::new().width(0).scroller_width(0);
         let strip = scrollable(row(cols).spacing(6).padding([2, 0]))
+            .id("hourly-strip-scroll")
             .direction(scrollable::Direction::Horizontal(sb))
             .width(Fill);
         let col = column![
@@ -323,7 +381,9 @@ impl WeatherApp {
         w: f32,
         h_opt: Option<f32>,
     ) -> El<'a> {
-        let days = &b.daily[..b.daily.len().min(10)];
+        let loc = self.active_location().unwrap_or(&b.location);
+        let di0 = today_daily_index(b, loc);
+        let days = &b.daily[di0..(di0 + 10).min(b.daily.len())];
         let omin = days
             .iter()
             .map(|d| d.temp_min_c)
@@ -404,8 +464,8 @@ impl WeatherApp {
                 let sun = match (d.sunrise_unix, d.sunset_unix) {
                     (Some(sr), Some(ss)) => format!(
                         "{} / {}",
-                        b.location.format_local_time(sr, h24),
-                        b.location.format_local_time(ss, h24)
+                        loc.format_local_time(sr, h24),
+                        loc.format_local_time(ss, h24)
                     ),
                     _ => "—".into(),
                 };
@@ -474,14 +534,14 @@ impl WeatherApp {
         let c = self.ctx(p);
         if let Some(a) = &b.air_quality {
             let f = (a.us_aqi as f32 / 250.0).clamp(0.02, 0.98);
-            let note = format!("{} (PM2.5 {:.1})", a.summary(), a.pm2_5);
+            let (cat, sum) = a.info();
             c.spec(
                 (w, h),
                 (UiIcon::Air, "AIR QUALITY"),
                 a.us_aqi.to_string(),
-                a.category(),
+                cat,
                 f,
-                note,
+                format!("{sum} (PM2.5 {:.1})", a.pm2_5),
             )
         } else {
             c.simple(
@@ -594,26 +654,25 @@ impl WeatherApp {
             self.ctx(p),
         );
         let fmt = |t: i64| loc.format_local_time(t, c.s.use_24h_time);
-        let r0 = b.daily.first().and_then(|d| d.sunrise_unix);
-        let s0 = b.daily.first().and_then(|d| d.sunset_unix);
-        let r1 = b.daily.get(1).and_then(|d| d.sunrise_unix);
-        let (ic, title, main_t, sub_t) = if s0.is_some_and(|s| now < s) {
-            (
-                UiIcon::Sunset,
-                "SUNSET",
-                s0.map(fmt).unwrap_or_else(|| "--:--".into()),
-                r0.map(|r| format!("Sunrise: {}", fmt(r)))
-                    .unwrap_or_default(),
-            )
+        let di = today_daily_index(b, loc);
+        let r0 = b.daily.get(di).and_then(|d| d.sunrise_unix);
+        let s0 = b.daily.get(di).and_then(|d| d.sunset_unix);
+        let r1 = b.daily.get(di + 1).and_then(|d| d.sunrise_unix);
+        let is_day_before_set = !r0.is_some_and(|r| now < r) && s0.is_some_and(|s| now < s);
+        let (ic, title, main_ts, sub_lbl, sub_ts) = if is_day_before_set {
+            (UiIcon::Sunset, "SUNSET", s0, "Sunrise", r1.or(r0))
         } else {
-            (
-                UiIcon::Sunrise,
-                "SUNRISE",
-                r1.or(r0).map(fmt).unwrap_or_else(|| "--:--".into()),
-                s0.map(|s| format!("Sunset: {}", fmt(s)))
-                    .unwrap_or_default(),
-            )
+            let rise = if r0.is_some_and(|r| now < r) {
+                r0
+            } else {
+                r1.or(r0)
+            };
+            (UiIcon::Sunrise, "SUNRISE", rise, "Sunset", s0)
         };
+        let main_t = main_ts.map(fmt).unwrap_or_else(|| "--:--".into());
+        let sub_t = sub_ts
+            .map(|t| format!("{sub_lbl}: {}", fmt(t)))
+            .unwrap_or_default();
         let arc = widget_canvas(WidgetCanvas::SunArc(r0, s0, now, p.is_light), Fill, 36);
         let col = column![
             c.hdr(ic, title),
@@ -655,11 +714,13 @@ impl WeatherApp {
         h: f32,
     ) -> El<'a> {
         let c = self.ctx(p);
+        let loc = self.active_location().unwrap_or(&b.location);
+        let di = today_daily_index(b, loc);
         let today = b
             .daily
-            .first()
+            .get(di)
             .map_or(b.current.precip_mm, |d| d.precip_sum_mm);
-        let tmrw = b.daily.get(1).map_or(0.0, |d| d.precip_sum_mm);
+        let tmrw = b.daily.get(di + 1).map_or(0.0, |d| d.precip_sum_mm);
         let next = if tmrw > 0.1 {
             format!("{} expected tomorrow.", c.s.format_precip(tmrw))
         } else {
@@ -681,6 +742,12 @@ impl WeatherApp {
     pub(crate) fn view_moon_card<'a>(&self, p: SkyPalette, w: f32, h: f32) -> El<'a> {
         let (m, c) = (compute_moon_info(Utc::now().timestamp()), self.ctx(p));
         let to_full = (14.765 - m.age_days).rem_euclid(29.53).round() as i32;
+        let age_d = m.age_days.round() as i32;
+        let fmt_days = |n: i32, zero_lbl: &'static str| match n {
+            0 => zero_lbl.to_string(),
+            1 => "1 DAY".into(),
+            _ => format!("{n} DAYS"),
+        };
         let kv = |l: &'static str, v: String| {
             row![
                 tm(l, 10.5, p.text_primary),
@@ -691,9 +758,9 @@ impl WeatherApp {
         let st = column![
             kv("Illumination", format!("{:.0}%", m.illumination_pct)),
             hairline(p.divider),
-            kv("Lunar Age", format!("{:.0} DAYS", m.age_days)),
+            kv("Lunar Age", fmt_days(age_d, "0 DAYS")),
             hairline(p.divider),
-            kv("Next Full Moon", format!("{to_full} DAYS"))
+            kv("Next Full Moon", fmt_days(to_full, "TODAY"))
         ]
         .spacing(5)
         .width(Fill);
@@ -786,13 +853,21 @@ impl WeatherApp {
         h: f32,
     ) -> El<'a> {
         let c = self.ctx(p);
-        let today = b.daily.first().map_or(b.current.temp_c, |d| d.temp_max_c);
-        let mean = if b.daily.is_empty() {
+        let loc = self.active_location().unwrap_or(&b.location);
+        let di = today_daily_index(b, loc);
+        let slice = &b.daily[di..];
+        let today = slice.first().map_or(b.current.temp_c, |d| d.temp_max_c);
+        let mean = if slice.is_empty() {
             today
         } else {
-            b.daily.iter().map(|d| d.temp_max_c).sum::<f64>() / b.daily.len() as f64
+            slice.iter().map(|d| d.temp_max_c).sum::<f64>() / slice.len() as f64
         };
-        let delta = (c.s.convert_temp(today) - c.s.convert_temp(mean)).round();
+        let raw_delta = (c.s.convert_temp(today) - c.s.convert_temp(mean)).round();
+        let delta = if raw_delta.abs() < 0.5 {
+            0.0
+        } else {
+            raw_delta
+        };
         let hi_row = |l: &'static str, tc: f64| {
             row![
                 text(l).size(10.0).color(p.text_muted),

@@ -52,7 +52,8 @@ pub fn compute_sun_times(lat: f64, lon: f64, date: NaiveDate) -> SunTimes {
 }
 
 pub fn is_daytime_at(lat: f64, lon: f64, ts: i64) -> bool {
-    let Some(dt) = Utc.timestamp_opt(ts, 0).single() else {
+    let solar_ts = ts + (lon * 240.0).round() as i64;
+    let Some(dt) = Utc.timestamp_opt(solar_ts, 0).single() else {
         return true;
     };
     let sun = compute_sun_times(lat, lon, dt.date_naive());
@@ -105,5 +106,26 @@ mod tests {
                 && (0.0..=100.0).contains(&m.illumination_pct)
                 && !m.phase_name.is_empty()
         );
+        // Berkeley 4:30 PM PST on Nov 20 (= 00:30 UTC on Nov 21) is daytime!
+        let brk_pm = Utc
+            .with_ymd_and_hms(2026, 11, 21, 0, 30, 0)
+            .single()
+            .expect("dt")
+            .timestamp();
+        assert!(is_daytime_at(37.872, -122.273, brk_pm));
+        // Sydney 9:00 AM AEDT on Nov 21 (= 22:00 UTC on Nov 20) is daytime!
+        let syd_am = Utc
+            .with_ymd_and_hms(2026, 11, 20, 22, 0, 0)
+            .single()
+            .expect("dt")
+            .timestamp();
+        assert!(is_daytime_at(-33.8688, 151.2093, syd_am));
+        // Sydney 1:00 AM AEDT (= 14:00 UTC previous day) is nighttime!
+        let syd_night = Utc
+            .with_ymd_and_hms(2026, 11, 20, 14, 0, 0)
+            .single()
+            .expect("dt")
+            .timestamp();
+        assert!(!is_daytime_at(-33.8688, 151.2093, syd_night));
     }
 }

@@ -4,12 +4,22 @@ use iced::advanced::image as adv_image;
 use iced::font::Weight;
 use iced::widget::canvas::gradient::Linear;
 use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke, Text as CanvasText};
-use iced::widget::{button, container, svg};
+use iced::widget::{button, container, image};
 use iced::{Alignment, Color, Element, Length::Fill, Point, Rectangle, Renderer, Size, Theme};
+use std::collections::HashMap;
 use std::f32::consts::{PI, TAU};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock, RwLock};
 
 static CLOUD_TEX: LazyLock<adv_image::Handle> = LazyLock::new(generate_volumetric_cloud_tex);
+
+pub fn preload_cloud_tex() {
+    let _ = std::thread::Builder::new()
+        .name("cloud-tex".into())
+        .spawn(|| {
+            let _ = &*CLOUD_TEX;
+            let _ = &*SUN_EVENT_HANDLES;
+        });
+}
 
 fn line(f: &mut Frame, a: (f32, f32), b: (f32, f32), w: f32, c: Color) {
     let p = Path::line(Point::new(a.0, a.1), Point::new(b.0, b.1));
@@ -40,12 +50,32 @@ fn label(f: &mut Frame, s: impl Into<String>, x: f32, y: f32, c: Color, sz: f32,
         ..CanvasText::default()
     });
 }
-fn svg_el<'a, M: 'a>(inner: &str, size: f32) -> Element<'a, M> {
+fn svg_handle(inner: &str) -> adv_image::Handle {
+    const PX: u32 = 48;
     let s = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">{inner}</svg>"#);
-    svg(svg::Handle::from_memory(s.into_bytes()))
-        .width(size)
-        .height(size)
-        .into()
+    let mut px = resvg::tiny_skia::Pixmap::new(PX, PX).expect("icon pixmap");
+    if let Ok(tree) = resvg::usvg::Tree::from_str(&s, &resvg::usvg::Options::default()) {
+        let sc = PX as f32 / 24.0;
+        resvg::render(
+            &tree,
+            resvg::tiny_skia::Transform::from_scale(sc, sc),
+            &mut px.as_mut(),
+        );
+    }
+    // Un-premultiply RGBA for iced_wgpu::image (which expects straight alpha).
+    let mut rgba = px.take();
+    for p in rgba.as_chunks_mut::<4>().0 {
+        let a = p[3] as u32;
+        if a > 0 && a < 255 {
+            p[0] = ((p[0] as u32 * 255 + (a >> 1)) / a).min(255) as u8;
+            p[1] = ((p[1] as u32 * 255 + (a >> 1)) / a).min(255) as u8;
+            p[2] = ((p[2] as u32 * 255 + (a >> 1)) / a).min(255) as u8;
+        }
+    }
+    adv_image::Handle::from_rgba(PX, PX, rgba)
+}
+fn svg_from_handle<'a, M: 'a>(handle: adv_image::Handle, size: f32) -> Element<'a, M> {
+    image(handle).width(size).height(size).into()
 }
 
 fn smooth_noise(x: f32, y: f32) -> f32 {
@@ -120,9 +150,12 @@ pub enum UiIcon {
     Trend,
     Moon,
     Alert,
+    Check,
+    Cloud,
+    Radar,
 }
 
-const UI_SVGS: [&str; 26] = [
+const UI_SVGS: [&str; 29] = [
     r#"<rect x="2.5" y="3.5" width="19" height="17" rx="3" fill="none" stroke="{c}" stroke-width="1.7"/><line x1="8.5" y1="3.5" x2="8.5" y2="20.5" stroke="{c}" stroke-width="1.7"/>"#,
     r#"<circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="{c}" stroke-width="1.8"/><line x1="15.5" y1="15.5" x2="20.5" y2="20.5" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/>"#,
     r#"<polygon points="3,11 21,3 13,21 11,13" fill="none" stroke="{c}" stroke-width="1.8" stroke-linejoin="round"/>"#,
@@ -139,8 +172,8 @@ const UI_SVGS: [&str; 26] = [
     r#"<path d="M3 9h11.5a2.5 2.5 0 1 0-2.5-2.5" fill="none" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/><path d="M3 13h15.5a2.5 2.5 0 1 1-2.5 2.5" fill="none" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/><path d="M3 17h8.5a2 2 0 1 1-2 2" fill="none" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/>"#,
     r#"<path d="M3 12a9 9 0 0 1 18 0Z" fill="none" stroke="{c}" stroke-width="1.8" stroke-linejoin="round"/><path d="M12 12v6.5a2 2 0 0 1-4 0" fill="none" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/>"#,
     r#"<circle cx="12" cy="12" r="4.5" fill="none" stroke="{c}" stroke-width="1.8"/><line x1="12" y1="2.5" x2="12" y2="5" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/><line x1="12" y1="19" x2="12" y2="21.5" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/><line x1="2.5" y1="12" x2="5" y2="12" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/><line x1="19" y1="12" x2="21.5" y2="12" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/><line x1="5.3" y1="5.3" x2="7.1" y2="7.1" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/><line x1="16.9" y1="16.9" x2="18.7" y2="18.7" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/><line x1="18.7" y1="5.3" x2="16.9" y2="7.1" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/><line x1="7.1" y1="16.9" x2="5.3" y2="18.7" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/>"#,
-    r#"<path d="M5 16a7 7 0 0 1 14 0" fill="none" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/><line x1="2.5" y1="16" x2="21.5" y2="16" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/><line x1="12" y1="4" x2="12" y2="7" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/>"#,
-    r#"<path d="M5 16a7 7 0 0 1 14 0" fill="none" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/><line x1="2.5" y1="16" x2="21.5" y2="16" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/><line x1="12" y1="4" x2="12" y2="7" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/>"#,
+    r#"<path d="M5 17a7 7 0 0 1 14 0" fill="none" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/><line x1="2.5" y1="17" x2="21.5" y2="17" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/><line x1="12" y1="3.5" x2="12" y2="8.5" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/><polyline points="9.2,6.2 12,3.4 14.8,6.2" fill="none" stroke="{c}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    r#"<path d="M5 17a7 7 0 0 1 14 0" fill="none" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/><line x1="2.5" y1="17" x2="21.5" y2="17" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/><line x1="12" y1="3.5" x2="12" y2="8.5" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/><polyline points="9.2,5.8 12,8.6 14.8,5.8" fill="none" stroke="{c}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>"#,
     r#"<path d="M14 14.8V5a2 2 0 1 0-4 0v9.8a4 4 0 1 0 4 0Z" fill="none" stroke="{c}" stroke-width="1.8"/>"#,
     r#"<path d="M12 3.5C12 3.5 6 10.2 6 14.5a6 6 0 0 0 12 0c0-4.3-6-11-6-11Z" fill="none" stroke="{c}" stroke-width="1.8" stroke-linejoin="round"/>"#,
     r#"<path d="M4 9c2.5-2 5 2 7.5 0s5-2 8.5 0" fill="none" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/><path d="M4 14c2.5-2 5 2 7.5 0s5-2 8.5 0" fill="none" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/><path d="M4 19c2.5-2 5 2 7.5 0s5-2 8.5 0" fill="none" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/>"#,
@@ -149,12 +182,32 @@ const UI_SVGS: [&str; 26] = [
     r#"<polyline points="3,17 9,11 13,14 21,6" fill="none" stroke="{c}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><polyline points="16,6 21,6 21,11" fill="none" stroke="{c}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>"#,
     r#"<path d="M19 14.5A7.5 7.5 0 0 1 9.5 5a7.5 7.5 0 1 0 9.5 9.5Z" fill="none" stroke="{c}" stroke-width="1.8" stroke-linejoin="round"/>"#,
     r#"<path d="M12 3.5L2.8 19.5h18.4L12 3.5Z" fill="none" stroke="{c}" stroke-width="1.8" stroke-linejoin="round"/><line x1="12" y1="9.5" x2="12" y2="14" stroke="{c}" stroke-width="1.8" stroke-linecap="round"/><circle cx="12" cy="17" r="1" fill="{c}"/>"#,
+    r#"<polyline points="4.5,12.5 9.5,17.5 19.5,6.5" fill="none" stroke="{c}" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>"#,
+    r#"<path d="M7 18h10a4 4 0 0 0 .5-8 5.4 5.4 0 0 0-10.3-1.4A4.2 4.2 0 0 0 7 18Z" fill="none" stroke="{c}" stroke-width="1.8" stroke-linejoin="round"/>"#,
+    r#"<circle cx="12" cy="12" r="2.2" fill="{c}"/><path d="M7.8 7.8a6 6 0 0 0 0 8.4M16.2 7.8a6 6 0 0 1 0 8.4M4.8 4.8a10.2 10.2 0 0 0 0 14.4M19.2 4.8a10.2 10.2 0 0 1 0 14.4" fill="none" stroke="{c}" stroke-width="1.7" stroke-linecap="round"/>"#,
 ];
+
+static UI_ICON_CACHE: LazyLock<RwLock<HashMap<(u8, u32), adv_image::Handle>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 pub fn icon_svg<'a, M: 'a>(icon: UiIcon, size: f32, color: Color) -> Element<'a, M> {
     let u = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
-    let hex = format!("#{:02X}{:02X}{:02X}", u(color.r), u(color.g), u(color.b));
-    svg_el(&UI_SVGS[icon as usize].replace("{c}", &hex), size)
+    let (r, g, b) = (u(color.r), u(color.g), u(color.b));
+    let key = (
+        icon as u8,
+        ((r as u32) << 16) | ((g as u32) << 8) | b as u32,
+    );
+    if let Ok(cache) = UI_ICON_CACHE.read()
+        && let Some(h) = cache.get(&key)
+    {
+        return svg_from_handle(h.clone(), size);
+    }
+    let hex = format!("#{r:02X}{g:02X}{b:02X}");
+    let h = svg_handle(&UI_SVGS[icon as usize].replace("{c}", &hex));
+    if let Ok(mut cache) = UI_ICON_CACHE.write() {
+        cache.insert(key, h.clone());
+    }
+    svg_from_handle(h, size)
 }
 
 pub fn icon_btn<'a, M: Clone + 'a>(
@@ -177,11 +230,9 @@ pub fn icon_btn<'a, M: Clone + 'a>(
         .into()
 }
 
-pub fn weather_icon_svg<'a, M: 'a>(
-    cond: WeatherCondition,
-    is_day: bool,
-    size: f32,
-) -> Element<'a, M> {
+static WEATHER_ICON_HANDLES: [OnceLock<adv_image::Handle>; 26] = [const { OnceLock::new() }; 26];
+
+fn build_weather_svg_handle(cond: WeatherCondition, is_day: bool) -> adv_image::Handle {
     const SUN: &str = r##"<circle cx="12" cy="12" r="5.2" fill="#FFCC33"/><g stroke="#FFCC33" stroke-width="1.8" stroke-linecap="round"><line x1="12" y1="3" x2="12" y2="4.8"/><line x1="12" y1="19.2" x2="12" y2="21"/><line x1="3" y1="12" x2="4.8" y2="12"/><line x1="19.2" y1="12" x2="21" y2="12"/><line x1="5.6" y1="5.6" x2="6.9" y2="6.9"/><line x1="17.1" y1="17.1" x2="18.4" y2="18.4"/><line x1="18.4" y1="5.6" x2="17.1" y2="6.9"/><line x1="6.9" y1="17.1" x2="5.6" y2="18.4"/></g>"##;
     const MOON: &str = r##"<path d="M17.8 14.6A6.5 6.5 0 0 1 9.4 6.2a6.5 6.5 0 1 0 8.4 8.4Z" fill="#CFE0FA" stroke="#7B98C4" stroke-width="0.9" stroke-linejoin="round"/>"##;
     const SSUN: &str = r##"<circle cx="8.8" cy="9" r="4" fill="#FFCC33"/><g stroke="#FFCC33" stroke-width="1.5" stroke-linecap="round"><line x1="8.8" y1="2.8" x2="8.8" y2="4"/><line x1="2.6" y1="9" x2="3.8" y2="9"/><line x1="4.4" y1="4.6" x2="5.3" y2="5.5"/><line x1="13.2" y1="4.6" x2="12.3" y2="5.5"/></g>"##;
@@ -190,7 +241,7 @@ pub fn weather_icon_svg<'a, M: 'a>(
     const BCK: &str = r##"<path d="M5.5 15.5h8.5a3 3 0 0 0 .3-6 4.2 4.2 0 0 0-8-1.2 3.5 3.5 0 0 0-.8 7.2Z" fill="#B0C2DA" stroke="#7F97B8" stroke-width="0.75" stroke-linejoin="round"/>"##;
     const STM: &str = r##"<path d="M6.8 14.5h10.2a3.6 3.6 0 0 0 .3-7.2 5 5 0 0 0-9.7-1.4 4.1 4.1 0 0 0-.8 8.6Z" fill="#C6D4E6" stroke="#7E96B8" stroke-width="0.85" stroke-linejoin="round"/>"##;
     use WeatherCondition as W;
-    let inner = match cond {
+    let inner: String = match cond {
         W::Clear => (if is_day { SUN } else { MOON }).into(),
         W::MostlyClear | W::PartlyCloudy => format!("{}{CLD}", if is_day { SSUN } else { SMOON }),
         W::Overcast => format!("{BCK}{CLD}"),
@@ -210,23 +261,42 @@ pub fn weather_icon_svg<'a, M: 'a>(
             r##"{STM}<polygon points="12.8,13.6 9.5,17.8 12.2,17.8 10.9,21.0 15.3,16.6 12.5,16.6" fill="#FFD43B"/>"##
         ),
     };
-    svg_el(&inner, size)
+    svg_handle(&inner)
 }
 
-pub fn sun_event_svg<'a, M: 'a>(is_sunrise: bool, size: f32) -> Element<'a, M> {
-    let arr = if is_sunrise {
-        r##"<polyline points="9.5,7.5 12,5 14.5,7.5" fill="none" stroke="#FFD452" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>"##
-    } else {
-        r##"<polyline points="9.5,5.5 12,8 14.5,5.5" fill="none" stroke="#FFB347" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>"##
+pub fn weather_icon_svg<'a, M: 'a>(
+    cond: WeatherCondition,
+    is_day: bool,
+    size: f32,
+) -> Element<'a, M> {
+    let h = WEATHER_ICON_HANDLES[(cond as usize) * 2 + usize::from(is_day)]
+        .get_or_init(|| build_weather_svg_handle(cond, is_day));
+    svg_from_handle(h.clone(), size)
+}
+
+static SUN_EVENT_HANDLES: LazyLock<[adv_image::Handle; 2]> = LazyLock::new(|| {
+    let build = |arr: &str| {
+        svg_handle(&format!(
+            r##"{arr}<path d="M6 16a6 6 0 0 1 12 0" fill="#FFC83D"/><line x1="3" y1="16.5" x2="21" y2="16.5" stroke="#FFE394" stroke-width="1.8" stroke-linecap="round"/><line x1="6.5" y1="19.5" x2="17.5" y2="19.5" stroke="#FFFFFF" stroke-opacity="0.55" stroke-width="1.5" stroke-linecap="round"/>"##
+        ))
     };
-    let body = format!(
-        r##"{arr}<path d="M6 16a6 6 0 0 1 12 0" fill="#FFC83D"/><line x1="3" y1="16.5" x2="21" y2="16.5" stroke="#FFE394" stroke-width="1.8" stroke-linecap="round"/><line x1="6.5" y1="19.5" x2="17.5" y2="19.5" stroke="#FFFFFF" stroke-opacity="0.55" stroke-width="1.5" stroke-linecap="round"/>"##
-    );
-    svg_el(&body, size)
+    [
+        build(
+            r##"<polyline points="9.5,5.5 12,8 14.5,5.5" fill="none" stroke="#FFB347" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>"##,
+        ),
+        build(
+            r##"<polyline points="9.5,7.5 12,5 14.5,7.5" fill="none" stroke="#FFD452" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>"##,
+        ),
+    ]
+});
+
+pub fn sun_event_svg<'a, M: 'a>(is_sunrise: bool, size: f32) -> Element<'a, M> {
+    svg_from_handle(SUN_EVENT_HANDLES[usize::from(is_sunrise)].clone(), size)
 }
 
 pub enum WidgetCanvas {
-    Sky(SkyPalette, WeatherCondition, bool, f32),
+    SkyBackdrop(SkyPalette, WeatherCondition),
+    SkyParticles(bool, WeatherCondition, bool, f32),
     TempBar((f64, f64), (f64, f64), Option<f64>, bool),
     Spectrum(f32),
     Compass(f64, SkyPalette),
@@ -244,14 +314,7 @@ pub fn widget_canvas<'a, M: 'a>(
     Canvas::new(kind).width(w).height(h).into()
 }
 
-fn draw_sky(
-    f: &mut Frame,
-    (bw, bh): (f32, f32),
-    pal: SkyPalette,
-    cond: WeatherCondition,
-    day: bool,
-    ph: f32,
-) {
+fn draw_sky_backdrop(f: &mut Frame, (bw, bh): (f32, f32), pal: SkyPalette, cond: WeatherCondition) {
     use WeatherCondition as W;
     let g = Linear::new(Point::ORIGIN, Point::new(0.0, bh))
         .add_stop(0.0, pal.sky_top)
@@ -275,6 +338,20 @@ fn draw_sky(
             height: (bh * 0.62).min(520.0),
         };
         f.draw_image(r, adv_image::Image::new(CLOUD_TEX.clone()).opacity(op));
+    }
+}
+
+fn draw_sky_particles(
+    f: &mut Frame,
+    (bw, bh): (f32, f32),
+    is_light: bool,
+    cond: WeatherCondition,
+    day: bool,
+    ph: f32,
+) {
+    use WeatherCondition as W;
+    if is_light {
+        return;
     }
     if !day && matches!(cond, W::Clear | W::MostlyClear | W::PartlyCloudy) {
         for i in 0..42 {
@@ -443,7 +520,10 @@ impl<M> canvas::Program<M> for WidgetCanvas {
         let mut f = Frame::new(r, b.size());
         let (bw, bh) = (b.width.max(1.0), b.height.max(1.0));
         match self {
-            Self::Sky(pal, cond, day, ph) => draw_sky(&mut f, (bw, bh), *pal, *cond, *day, *ph),
+            Self::SkyBackdrop(pal, cond) => draw_sky_backdrop(&mut f, (bw, bh), *pal, *cond),
+            Self::SkyParticles(light, cond, day, ph) => {
+                draw_sky_particles(&mut f, (bw, bh), *light, *cond, *day, *ph)
+            }
             Self::Compass(deg, pal) => draw_compass(&mut f, (bw, bh), *deg, *pal),
             Self::Pressure(hpa, val, unit, pal) => {
                 draw_pressure(&mut f, (bw, bh), *hpa, val, unit, *pal)
@@ -569,7 +649,7 @@ impl<M> canvas::Program<M> for WidgetCanvas {
                     line(&mut f, (0.0, by - fr * ch), (bw, by - fr * ch), 1.0, guide);
                 }
                 let gaps = gap * (n.saturating_sub(1) as f32);
-                let bar_w = ((bw - gaps) / n as f32).clamp(3.0, 22.0);
+                let bar_w = ((bw - gaps) / n as f32).max(3.0);
                 let sx = ((bw - (bar_w * n as f32 + gaps)) * 0.5).max(0.0);
                 let dry = if *light {
                     rgba8(30, 50, 80, 0.15)
@@ -616,6 +696,21 @@ pub fn temp_to_color(c: f64, a: f32) -> Color {
         (44.0, [183, 28, 88]),
     ];
     ramp(c, &S, a)
+}
+pub fn temp_badge_color(c: f64) -> Color {
+    // Rich, high-contrast Apple Weather pin fills calibrated for crisp white numerals.
+    const S: [(f64, [u8; 3]); 9] = [
+        (-25.0, [84, 58, 178]),
+        (-10.0, [34, 108, 224]),
+        (0.0, [22, 134, 214]),
+        (8.0, [26, 146, 186]),
+        (15.0, [40, 158, 118]),
+        (21.0, [186, 146, 26]),
+        (27.0, [224, 112, 24]),
+        (33.0, [218, 62, 46]),
+        (42.0, [168, 28, 72]),
+    ];
+    ramp(c, &S, 1.0)
 }
 pub fn wind_to_color(mps: f64, a: f32) -> Color {
     const S: [(f64, [u8; 3]); 5] = [

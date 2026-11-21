@@ -5,7 +5,7 @@ use iced::font::{Family, Font, Weight};
 use iced::widget::{Space, button, container, scrollable, text};
 use iced::{Background, Border, Color, Element, Fill, Length, Shadow, Theme, Vector};
 use std::io::Read;
-use std::sync::{Arc, Once};
+use std::sync::{Arc, OnceLock};
 
 const INTER_FONTS: [&[u8]; 4] = [
     include_bytes!("../assets/fonts/Inter-Regular.woff"),
@@ -13,12 +13,28 @@ const INTER_FONTS: [&[u8]; 4] = [
     include_bytes!("../assets/fonts/Inter-SemiBold.woff"),
     include_bytes!("../assets/fonts/Inter-Bold.woff"),
 ];
-static LOAD_FONTS: Once = Once::new();
+static LOAD_FONTS: OnceLock<()> = OnceLock::new();
+
+pub fn preload_fonts() {
+    let _ = std::thread::Builder::new()
+        .name("font-preload".into())
+        .spawn(ensure_fonts_loaded);
+}
 
 pub fn ensure_fonts_loaded() {
-    use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-    LOAD_FONTS.call_once(|| {
-        let sfnts: Vec<_> = INTER_FONTS.par_iter().map(|w| woff_to_sfnt(w)).collect();
+    LOAD_FONTS.get_or_init(|| {
+        // Run WOFF->SFNT decompression in parallel with cosmic_text's font_system() init.
+        let sfnts = std::thread::scope(|s| {
+            let dec = s.spawn(|| {
+                let mut out = Vec::with_capacity(INTER_FONTS.len());
+                for w in INTER_FONTS {
+                    out.push(woff_to_sfnt(w));
+                }
+                out
+            });
+            let _ = font_system();
+            dec.join().expect("woff decode")
+        });
         let mut fs = font_system().write().expect("font system");
         for sfnt in sfnts {
             fs.raw()
@@ -50,7 +66,13 @@ fn woff_to_sfnt(woff: &[u8]) -> Vec<u8> {
             (&woff[e..e + 4], be32(e + 16), data)
         })
         .collect();
-    let (sh, mut out) = (n.ilog2(), Vec::new());
+    let total_len: usize = 12
+        + 16 * n
+        + tables
+            .iter()
+            .map(|(_, _, d)| d.len().next_multiple_of(4))
+            .sum::<usize>();
+    let (sh, mut out) = (n.ilog2(), Vec::with_capacity(total_len));
     let rng = 16u16 << sh;
     out.extend_from_slice(&woff[4..8]);
     for v in [n as u16, rng, sh as u16, n as u16 * 16 - rng] {

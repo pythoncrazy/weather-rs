@@ -15,10 +15,11 @@ keywords = ["weather", "radar", "iced", "desktop", "gis"]
 categories = ["gui", "science"]
 
 [dependencies]
-iced = { version = "=0.14.0", default-features = false, features = ["canvas", "svg", "image-without-codecs", "advanced", "linux-theme-detection", "wgpu-bare", "tiny-skia", "tokio", "x11", "wayland", "web-colors", "crisp"] }
+iced = { version = "=0.14.0", default-features = false, features = ["canvas", "image-without-codecs", "advanced", "wgpu-bare", "tiny-skia", "tokio", "x11", "wayland", "web-colors", "crisp"] }
+resvg = { version = "=0.45.1", default-features = false }
 tokio = { version = "=1.40.0", default-features = false, features = ["rt-multi-thread", "macros", "time", "sync"] }
 flate2 = { version = "=1.1.11", default-features = false, features = ["rust_backend"] }
-ureq = { version = "=3.4.2", features = ["json"] }
+ureq = { version = "=3.4.2", features = ["json", "gzip"] }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.146"
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
@@ -26,7 +27,6 @@ chrono = { version = "=0.4.45", default-features = false, features = ["clock", "
 chrono-tz = "=0.10.4"
 dirs = "=6.0.0"
 percent-encoding = "=2.3.2"
-rayon = "=1.12.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 wgpu = { version = "=27.0.1", default-features = false, features = ["std", "parking_lot", "wgsl", "vulkan"] }

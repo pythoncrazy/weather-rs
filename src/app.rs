@@ -22,8 +22,40 @@ use iced::widget::{
 use iced::window;
 use iced::{Alignment, Color, Element, Fill, Size, Subscription, Task};
 use std::collections::{HashMap, HashSet};
-use std::sync::mpsc;
+use std::hash::{Hash, Hasher};
+use std::net::{IpAddr, UdpSocket};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
+
+fn local_route_ip() -> Option<IpAddr> {
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("1.1.1.1:80").ok()?;
+    Some(sock.local_addr().ok()?.ip())
+}
+
+#[derive(Clone)]
+struct WakeHandle(Arc<Notify>);
+
+impl Hash for WakeHandle {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.0).hash(state);
+    }
+}
+
+fn wake_stream(handle: &WakeHandle) -> impl iced::futures::Stream<Item = Msg> + use<> {
+    let notify = Arc::clone(&handle.0);
+    iced::stream::channel(4, async move |mut output| {
+        use iced::futures::SinkExt;
+        loop {
+            notify.notified().await;
+            tokio::time::sleep(Duration::from_millis(12)).await;
+            if output.send(Msg::Tick).await.is_err() {
+                break;
+            }
+        }
+    })
+}
 
 #[derive(Debug, Clone)]
 pub enum Pref {
@@ -65,7 +97,8 @@ enum WorkerOut {
     WeatherLoaded(String, Box<WeatherBundle>),
     WeatherFailed(String, String),
     SearchDone(String, Vec<Location>),
-    CurrentLocation(Location),
+    CurrentLocation(Location, bool),
+    CurrentLocationFailed,
 }
 
 pub struct WeatherApp {
@@ -84,23 +117,29 @@ pub struct WeatherApp {
     last_search_edit: Option<Instant>,
     search_in_flight: bool,
     pub search_results: Vec<Location>,
+    detect_focus_pending: bool,
+    detect_in_flight: bool,
+    current_location_precise: bool,
+    last_location_check: Instant,
+    last_location_wall: i64,
+    last_route_check: Instant,
+    last_route_ip: Option<IpAddr>,
     pub map: MapEngine,
     client: WeatherClient,
     tx: mpsc::Sender<WorkerOut>,
     rx: mpsc::Receiver<WorkerOut>,
+    wake: Arc<Notify>,
     boot_instant: Instant,
     last_auto_refresh: Instant,
 }
 
 impl WeatherApp {
     pub fn boot() -> (Self, Task<Msg>) {
-        use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
-        ensure_fonts_loaded();
         let (mut settings, first_run) = load_settings();
         settings.deduplicate_locations();
         let bundles = settings
             .saved_locations
-            .par_iter()
+            .iter()
             .filter_map(|loc| {
                 let mut c = load_cached_bundle(&loc.id)?;
                 if !loc.timezone.is_empty() {
@@ -115,11 +154,17 @@ impl WeatherApp {
             .as_ref()
             .and_then(|id| settings.saved_locations.iter().find(|l| &l.id == id))
             .map_or((47.6062, -122.3321), |l| (l.lat, l.lon));
-        let (client, (tx, rx), now) = (WeatherClient::new(), mpsc::channel(), Instant::now());
+        let light = settings.theme_mode == ThemeMode::Light;
+        let (client, (tx, rx), wake, now) = (
+            WeatherClient::new(),
+            mpsc::channel(),
+            Arc::new(Notify::new()),
+            Instant::now(),
+        );
         let mut app = Self {
-            map: MapEngine::new(client.clone(), lat, lon),
+            map: MapEngine::new(client.clone(), lat, lon, light, Arc::clone(&wake)),
             settings,
-            window_size: Size::new(1340.0, 860.0),
+            window_size: Size::new(1180.0, 760.0),
             show_sidebar: true,
             map_expanded: false,
             show_preferences: false,
@@ -133,22 +178,30 @@ impl WeatherApp {
             last_search_edit: None,
             search_in_flight: false,
             search_results: Vec::new(),
+            detect_focus_pending: first_run,
+            detect_in_flight: false,
+            current_location_precise: false,
+            last_location_check: now,
+            last_location_wall: Utc::now().timestamp(),
+            last_route_check: now,
+            last_route_ip: local_route_ip(),
             client,
             tx,
             rx,
+            wake,
             boot_instant: now,
             last_auto_refresh: now,
         };
-        app.spawn_refresh_all();
-        if first_run
-            || !app
-                .settings
-                .saved_locations
-                .iter()
-                .any(|l| l.is_current_location)
+        let light = app.active_palette().is_light;
+        #[cfg(target_os = "linux")]
         {
-            app.spawn_detect_location();
+            let wk = Arc::clone(&app.wake);
+            sctk_adwaita::on_ready(move || wk.notify_one());
         }
+        app.map
+            .prewarm_saved_locations(&app.settings.saved_locations, light);
+        app.spawn_refresh_all();
+        app.spawn_detect_location();
         (app, Task::none())
     }
 
@@ -166,11 +219,8 @@ impl WeatherApp {
 
     pub fn subscription(&self) -> Subscription<Msg> {
         use WeatherCondition as W;
-        let fast = self.map.needs_fast_tick(self.map_expanded)
-            || !self.loading_ids.is_empty()
-            || self.search_in_flight
-            || (self.search_query.trim().len() >= 2
-                && self.search_query.trim() != self.last_dispatched_query);
+        let search_debounce = self.search_query.trim().len() >= 2
+            && self.search_query.trim() != self.last_dispatched_query;
         let sky_anim = self.settings.animate_weather
             && !self.active_palette().is_light
             && self.active_bundle().is_some_and(|b| {
@@ -187,11 +237,14 @@ impl WeatherApp {
                             | W::Sleet
                     )
             });
-        let tick = if fast || sky_anim {
+        let tick = if self.map.needs_animation_tick(self.map_expanded) || sky_anim {
             window::frames().map(|_| Msg::Tick)
+        } else if search_debounce {
+            iced::time::every(Duration::from_millis(80)).map(|_| Msg::Tick)
         } else {
-            iced::time::every(Duration::from_secs(2)).map(|_| Msg::Tick)
+            iced::time::every(Duration::from_secs(30)).map(|_| Msg::Tick)
         };
+        let worker_wake = Subscription::run_with(WakeHandle(Arc::clone(&self.wake)), wake_stream);
         let keys = keyboard::listen().map(|ev| match ev {
             keyboard::Event::KeyPressed {
                 key: Key::Named(keyboard::key::Named::Escape),
@@ -205,12 +258,14 @@ impl WeatherApp {
                 "r" | "R" => Msg::RefreshAll,
                 "k" | "K" => Msg::FocusSearch,
                 "m" | "M" => Msg::ToggleMap,
+                "q" | "Q" => Msg::WindowCloseRequested,
                 _ => Msg::Noop,
             },
             _ => Msg::Noop,
         });
         Subscription::batch([
             tick,
+            worker_wake,
             window::resize_events().map(|(_, s)| Msg::WindowResized(s)),
             window::close_requests().map(|_| Msg::WindowCloseRequested),
             keys,
@@ -225,48 +280,93 @@ impl WeatherApp {
 
     fn dispatch_search(&mut self, q: String) {
         (self.last_dispatched_query, self.search_in_flight) = (q.clone(), true);
-        let (c, tx) = (self.client.clone(), self.tx.clone());
-        rayon::spawn(move || {
+        let (c, tx, wk) = (self.client.clone(), self.tx.clone(), Arc::clone(&self.wake));
+        std::thread::spawn(move || {
             if !is_shutting_down() {
                 let _ = tx.send(WorkerOut::SearchDone(q.clone(), c.search_locations(&q)));
+                wk.notify_one();
             }
         });
     }
 
-    fn spawn_detect_location(&self) {
-        let (c, tx) = (self.client.clone(), self.tx.clone());
-        rayon::spawn(move || {
-            if !is_shutting_down()
-                && let Some(loc) = c.detect_current_location()
-            {
-                let _ = tx.send(WorkerOut::CurrentLocation(loc));
+    fn spawn_detect_location(&mut self) {
+        if self.detect_in_flight {
+            return;
+        }
+        self.detect_in_flight = true;
+        self.last_location_check = Instant::now();
+        self.last_location_wall = Utc::now().timestamp();
+        let (c, tx, wk) = (self.client.clone(), self.tx.clone(), Arc::clone(&self.wake));
+        let _ = std::thread::Builder::new()
+            .name("loc-detect".into())
+            .spawn(move || {
+                if is_shutting_down() {
+                    return;
+                }
+                let out = match c.detect_current_location() {
+                    Some((loc, precise)) => WorkerOut::CurrentLocation(loc, precise),
+                    None => WorkerOut::CurrentLocationFailed,
+                };
+                let _ = tx.send(out);
+                wk.notify_one();
+            });
+    }
+
+    fn spawn_refresh_batch(&mut self, locs: Vec<Location>) {
+        let jobs: Vec<(Location, bool)> = locs
+            .into_iter()
+            .filter(|l| self.loading_ids.insert(l.id.clone()))
+            .map(|l| {
+                let cached = self.bundles.contains_key(&l.id);
+                (l, cached)
+            })
+            .collect();
+        if jobs.is_empty() {
+            return;
+        }
+        let (c, tx, wk, prov) = (
+            self.client.clone(),
+            self.tx.clone(),
+            Arc::clone(&self.wake),
+            self.settings.provider,
+        );
+        std::thread::spawn(move || {
+            for (loc, has_cached) in jobs {
+                if is_shutting_down() {
+                    return;
+                }
+                let res = if has_cached {
+                    c.fetch_weather(&loc, prov)
+                } else {
+                    c.fetch_weather_streaming(&loc, prov, |early| {
+                        if !is_shutting_down() {
+                            let _ =
+                                tx.send(WorkerOut::WeatherLoaded(loc.id.clone(), Box::new(early)));
+                            wk.notify_one();
+                        }
+                    })
+                };
+                match res {
+                    Ok(b) if !is_shutting_down() => {
+                        let disk = b.clone();
+                        let _ = tx.send(WorkerOut::WeatherLoaded(loc.id, Box::new(b)));
+                        wk.notify_one();
+                        if !is_shutting_down() {
+                            save_cached_bundle(&disk);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        let _ = tx.send(WorkerOut::WeatherFailed(loc.id, err));
+                        wk.notify_one();
+                    }
+                }
             }
         });
     }
 
     fn spawn_refresh_location(&mut self, loc: Location) {
-        if !self.loading_ids.insert(loc.id.clone()) {
-            return;
-        }
-        let (c, tx, prov) = (self.client.clone(), self.tx.clone(), self.settings.provider);
-        rayon::spawn(move || {
-            if is_shutting_down() {
-                return;
-            }
-            match c.fetch_weather(&loc, prov) {
-                Ok(b) if !is_shutting_down() => {
-                    let disk = b.clone();
-                    let _ = tx.send(WorkerOut::WeatherLoaded(loc.id, Box::new(b)));
-                    if !is_shutting_down() {
-                        save_cached_bundle(&disk);
-                    }
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    let _ = tx.send(WorkerOut::WeatherFailed(loc.id, err));
-                }
-            }
-        });
+        self.spawn_refresh_batch(vec![loc]);
     }
 
     fn spawn_refresh_all(&mut self) {
@@ -278,31 +378,136 @@ impl WeatherApp {
             let act = locs.remove(p);
             locs.insert(0, act);
         }
-        for loc in locs {
-            self.spawn_refresh_location(loc);
+        // Active city gets its own immediate lane; remaining saved cities refresh on 1 background thread
+        // so startup never spawns a thundering herd of 20+ concurrent HTTP connections.
+        if !locs.is_empty() {
+            let rest = locs.split_off(1);
+            self.spawn_refresh_batch(locs);
+            self.spawn_refresh_batch(rest);
         }
         self.last_auto_refresh = Instant::now();
     }
 
-    fn add_or_select_location(&mut self, loc: Location) {
+    fn reset_scroll_tasks() -> Task<Msg> {
+        Task::batch([
+            operation::snap_to("bento-scroll", operation::RelativeOffset::START),
+            operation::snap_to("split-scroll", operation::RelativeOffset::START),
+            operation::snap_to("hourly-strip-scroll", operation::RelativeOffset::START),
+        ])
+    }
+
+    fn select_location(&mut self, id: String, jump_map: bool) -> Task<Msg> {
+        self.detect_focus_pending = false;
+        (
+            self.settings.selected_location_id,
+            self.expanded_alert_idx,
+            self.selected_day_idx,
+            self.last_error,
+        ) = (Some(id.clone()), None, None, None);
+        save_settings(&self.settings);
+        if let Some(loc) = self
+            .settings
+            .saved_locations
+            .iter()
+            .find(|l| l.id == id)
+            .cloned()
+        {
+            if jump_map {
+                let light = self.active_palette().is_light;
+                self.map
+                    .jump_to_location(loc.lat, loc.lon, self.map_expanded, light);
+            }
+            if !self.bundles.contains_key(&id) {
+                self.spawn_refresh_location(loc);
+            }
+        }
+        Self::reset_scroll_tasks()
+    }
+
+    fn add_or_select_location(&mut self, loc: Location) -> Task<Msg> {
         if let Some(ex) = self
             .settings
             .saved_locations
             .iter()
-            .find(|l| l.is_same_place(&loc))
+            .find(|l| !l.is_current_location && l.is_same_place(&loc))
         {
-            let (id, lat, lon) = (ex.id.clone(), ex.lat, ex.lon);
-            self.settings.selected_location_id = Some(id);
-            self.map.fly_to(lat, lon, Some(6.5));
-            save_settings(&self.settings);
+            let id = ex.id.clone();
+            return self.select_location(id, true);
+        }
+        let id = loc.id.clone();
+        self.settings.saved_locations.push(loc);
+        self.select_location(id, true)
+    }
+
+    fn apply_detected_location(&mut self, mut loc: Location, precise: bool) {
+        self.detect_in_flight = false;
+        let focus = std::mem::take(&mut self.detect_focus_pending);
+        let (lat, lon) = (loc.lat, loc.lon);
+        let prev = self
+            .settings
+            .saved_locations
+            .iter()
+            .find(|l| l.is_current_location)
+            .cloned();
+        if loc.timezone.is_empty()
+            && let Some(p) = &prev
+            && !p.timezone.is_empty()
+            && (p.lat - lat).abs() < 1.0
+            && (p.lon - lon).abs() < 1.0
+        {
+            loc.timezone = p.timezone.clone();
+        }
+        let big_move = prev.as_ref().is_none_or(|p| {
+            (p.lat - lat).abs() > 0.15 || (p.lon - lon).abs() > 0.15 || p.name != loc.name
+        });
+        // Never downgrade a precise Wi-Fi fix to a nearby coarse IP fallback unless the user moved cities.
+        let moved = if !precise && self.current_location_precise {
+            big_move
+        } else {
+            let tol = if precise { 0.002 } else { 0.015 };
+            prev.as_ref().is_none_or(|p| {
+                (p.lat - lat).abs() > tol || (p.lon - lon).abs() > tol || p.name != loc.name
+            })
+        };
+        if precise {
+            self.current_location_precise = true;
+        } else if big_move {
+            self.current_location_precise = false;
+        }
+        let viewing_current =
+            self.settings.selected_location_id.as_deref() == Some(loc.id.as_str());
+        if !moved && !focus {
             return;
         }
-        let (id, lat, lon) = (loc.id.clone(), loc.lat, loc.lon);
-        self.settings.saved_locations.push(loc.clone());
-        self.settings.selected_location_id = Some(id);
-        save_settings(&self.settings);
-        self.spawn_refresh_location(loc);
-        self.map.fly_to(lat, lon, Some(6.5));
+        if moved {
+            if big_move {
+                self.bundles.remove(&loc.id);
+            }
+            self.settings
+                .saved_locations
+                .retain(|l| !l.is_current_location);
+            self.settings.saved_locations.insert(0, loc.clone());
+        }
+        let should_focus =
+            focus || (moved && viewing_current) || self.settings.selected_location_id.is_none();
+        if should_focus {
+            (
+                self.settings.selected_location_id,
+                self.expanded_alert_idx,
+                self.selected_day_idx,
+                self.last_error,
+            ) = (Some(loc.id.clone()), None, None, None);
+            let light = self.active_palette().is_light;
+            self.map
+                .jump_to_location(lat, lon, self.map_expanded, light);
+        }
+        if moved || should_focus {
+            save_settings(&self.settings);
+        }
+        if moved || !self.bundles.contains_key(&loc.id) {
+            self.loading_ids.remove(&loc.id);
+            self.spawn_refresh_location(loc);
+        }
     }
 
     fn drain_worker_messages(&mut self) {
@@ -316,12 +521,21 @@ impl WeatherApp {
                         .iter_mut()
                         .find(|l| l.id == id)
                     {
+                        // Drop stale weather responses if My Location moved while fetch was in flight.
+                        if sv.is_current_location
+                            && ((sv.lat - bundle.location.lat).abs() > 0.05
+                                || (sv.lon - bundle.location.lon).abs() > 0.05)
+                        {
+                            continue;
+                        }
                         if sv.timezone.is_empty() && !bundle.location.timezone.is_empty() {
                             sv.timezone = bundle.location.timezone.clone();
                             save_settings(&self.settings);
                         } else if !sv.timezone.is_empty() {
                             bundle.location.timezone = sv.timezone.clone();
                         }
+                    } else {
+                        continue;
                     }
                     if self.settings.selected_location_id.as_deref() == Some(id.as_str()) {
                         self.last_error = None;
@@ -340,17 +554,12 @@ impl WeatherApp {
                     }
                     self.search_in_flight = false;
                 }
-                WorkerOut::CurrentLocation(loc) => {
-                    let (lat, lon) = (loc.lat, loc.lon);
-                    self.settings
-                        .saved_locations
-                        .retain(|l| !l.is_current_location && !l.is_same_place(&loc));
-                    self.settings.saved_locations.insert(0, loc.clone());
-                    self.settings.selected_location_id = Some(loc.id.clone());
-                    (self.map.center_lat, self.map.center_lon) = (lat, lon);
-                    self.map.prewarm_region(lat, lon);
-                    save_settings(&self.settings);
-                    self.spawn_refresh_location(loc);
+                WorkerOut::CurrentLocation(loc, precise) => {
+                    self.apply_detected_location(loc, precise)
+                }
+                WorkerOut::CurrentLocationFailed => {
+                    self.detect_in_flight = false;
+                    self.detect_focus_pending = false;
                 }
             }
         }
@@ -370,6 +579,22 @@ impl WeatherApp {
                         .is_some_and(|t| t.elapsed() >= Duration::from_millis(200))
                 {
                     self.dispatch_search(q);
+                }
+                if self.last_route_check.elapsed() >= Duration::from_secs(10) {
+                    self.last_route_check = Instant::now();
+                    let cur_ip = local_route_ip();
+                    if cur_ip != self.last_route_ip {
+                        self.last_route_ip = cur_ip;
+                        if cur_ip.is_some() {
+                            self.spawn_detect_location();
+                        }
+                    }
+                }
+                let now_wall = Utc::now().timestamp();
+                if self.last_location_check.elapsed() >= Duration::from_secs(180)
+                    || (now_wall - self.last_location_wall).abs() >= 120
+                {
+                    self.spawn_detect_location();
                 }
                 if self.last_auto_refresh.elapsed() > Duration::from_secs(600) {
                     self.spawn_refresh_all();
@@ -398,43 +623,36 @@ impl WeatherApp {
                 save_settings(&self.settings);
                 self.map.tick(&self.bundles, self.map_expanded);
             }
-            Msg::TogglePreferences => self.show_preferences = !self.show_preferences,
-            Msg::RefreshAll => self.spawn_refresh_all(),
-            Msg::SelectLocation(id) => {
-                (
-                    self.settings.selected_location_id,
-                    self.expanded_alert_idx,
-                    self.selected_day_idx,
-                ) = (Some(id.clone()), None, None);
-                save_settings(&self.settings);
-                if let Some(loc) = self
-                    .settings
-                    .saved_locations
-                    .iter()
-                    .find(|l| l.id == id)
-                    .cloned()
-                {
-                    if self.map_expanded {
-                        self.map.fly_to(loc.lat, loc.lon, None);
-                    } else {
-                        (self.map.center_lat, self.map.center_lon) = (loc.lat, loc.lon);
-                    }
-                    self.map.prewarm_region(loc.lat, loc.lon);
-                    if !self.bundles.contains_key(&id) {
-                        self.spawn_refresh_location(loc);
-                    }
+            Msg::TogglePreferences => {
+                self.show_preferences = !self.show_preferences;
+                if self.show_preferences {
+                    self.clear_search();
                 }
             }
+            Msg::RefreshAll => {
+                self.spawn_refresh_all();
+                self.spawn_detect_location();
+            }
+            Msg::SelectLocation(id) => return self.select_location(id, true),
             Msg::RemoveLocation(id) if self.settings.saved_locations.len() > 1 => {
+                let was_selected =
+                    self.settings.selected_location_id.as_deref() == Some(id.as_str());
                 self.settings.saved_locations.retain(|l| l.id != id);
-                if self.settings.selected_location_id.as_deref() == Some(id.as_str()) {
-                    self.settings.selected_location_id =
-                        self.settings.saved_locations.first().map(|l| l.id.clone());
+                self.bundles.remove(&id);
+                self.loading_ids.remove(&id);
+                if was_selected
+                    && let Some(next_id) =
+                        self.settings.saved_locations.first().map(|l| l.id.clone())
+                {
+                    return self.select_location(next_id, true);
                 }
                 save_settings(&self.settings);
             }
             Msg::RemoveLocation(_) => {}
-            Msg::DetectLocation => self.spawn_detect_location(),
+            Msg::DetectLocation => {
+                self.detect_focus_pending = true;
+                self.spawn_detect_location();
+            }
             Msg::SearchChanged(v) => {
                 (self.search_query, self.last_search_edit) = (v, Some(Instant::now()));
                 if self.search_query.trim().len() < 2 {
@@ -445,7 +663,7 @@ impl WeatherApp {
             Msg::SubmitSearch => {
                 if let Some(first) = self.search_results.first().cloned() {
                     self.clear_search();
-                    self.add_or_select_location(first);
+                    return self.add_or_select_location(first);
                 } else {
                     let q = self.search_query.trim().to_string();
                     if q.len() >= 2 && !self.search_in_flight {
@@ -457,7 +675,7 @@ impl WeatherApp {
             Msg::ClearSearch => self.clear_search(),
             Msg::PickSearchResult(l) => {
                 self.clear_search();
-                self.add_or_select_location(l);
+                return self.add_or_select_location(l);
             }
             Msg::ToggleAlertDetails(i) => {
                 self.expanded_alert_idx = (self.expanded_alert_idx != Some(i)).then_some(i)
@@ -473,9 +691,12 @@ impl WeatherApp {
                 }));
             }
             Msg::Pref(p) => {
-                let mut refresh = false;
+                let (mut refresh, mut theme_changed) = (false, false);
                 match p {
-                    Pref::Theme(m) => self.settings.theme_mode = m,
+                    Pref::Theme(m) => {
+                        self.settings.theme_mode = m;
+                        theme_changed = true;
+                    }
                     Pref::Wind(u) => self.settings.wind_unit = u,
                     Pref::Pressure(u) => self.settings.pressure_unit = u,
                     Pref::Use24h(v) => self.settings.use_24h_time = v,
@@ -486,7 +707,13 @@ impl WeatherApp {
                     }
                 }
                 save_settings(&self.settings);
+                if theme_changed && let Some(loc) = self.active_location().cloned() {
+                    let light = self.active_palette().is_light;
+                    self.map
+                        .prewarm_region(loc.lat, loc.lon, self.map_expanded, light);
+                }
                 if refresh {
+                    self.loading_ids.clear();
                     self.spawn_refresh_all();
                 }
             }
@@ -502,10 +729,11 @@ impl WeatherApp {
                     match ext {
                         MapExternalAction::SetExpanded(e) => self.map_expanded = e,
                         MapExternalAction::SelectSaved(id) => {
-                            self.settings.selected_location_id = Some(id);
-                            save_settings(&self.settings);
+                            return self.select_location(id, false);
                         }
-                        MapExternalAction::SaveLocation(loc) => self.add_or_select_location(loc),
+                        MapExternalAction::SaveLocation(loc) => {
+                            return self.add_or_select_location(loc);
+                        }
                     }
                 }
             }
@@ -524,7 +752,7 @@ impl WeatherApp {
                         &self.settings,
                     );
                 } else if self.map_expanded {
-                    self.map_expanded = false;
+                    return self.update(Msg::Map(MapMsg::CloseMap));
                 } else {
                     self.selected_day_idx = None;
                 }
@@ -562,6 +790,7 @@ impl WeatherApp {
     }
 
     pub fn view(&self) -> Element<'_, Msg> {
+        ensure_fonts_loaded();
         let pal = self.active_palette();
         let (cond, day) = self
             .active_bundle()
@@ -584,7 +813,12 @@ impl WeatherApp {
             sp_w(0)
         };
         let mut layers = vec![
-            widget_canvas(WidgetCanvas::Sky(pal, cond, day, phase), Fill, Fill),
+            widget_canvas(WidgetCanvas::SkyBackdrop(pal, cond), Fill, Fill),
+            widget_canvas(
+                WidgetCanvas::SkyParticles(pal.is_light, cond, day, phase),
+                Fill,
+                Fill,
+            ),
             row![side, main].width(Fill).height(Fill).into(),
         ];
         if !self.search_results.is_empty()
@@ -649,7 +883,7 @@ impl WeatherApp {
                 )
             };
             let hl = b
-                .and_then(|b| b.daily.first())
+                .and_then(|b| b.daily.get(crate::cards::today_daily_index(b, loc)))
                 .map(|d| {
                     format!(
                         "H:{} L:{}",
@@ -701,7 +935,7 @@ impl WeatherApp {
                 Msg::SelectLocation(loc.id.clone()),
             )
             .width(Fill);
-            let row_el: Element<'_, Msg> = if total > 1 && !loc.is_current_location && sel {
+            let del_slot: Element<'_, Msg> = if total > 1 && !loc.is_current_location && sel {
                 let del = icon_btn(
                     UiIcon::Close,
                     10.5,
@@ -710,22 +944,19 @@ impl WeatherApp {
                     6.0,
                     Msg::RemoveLocation(loc.id.clone()),
                 );
-                row![
-                    sbtn,
-                    container(del)
-                        .padding(iced::Padding {
-                            top: 6.0,
-                            right: 4.0,
-                            bottom: 0.0,
-                            left: 0.0
-                        })
-                        .align_y(Alignment::Start)
-                ]
-                .align_y(Alignment::Start)
-                .into()
+                container(del)
+                    .padding(iced::Padding {
+                        top: 6.0,
+                        right: 4.0,
+                        bottom: 0.0,
+                        left: 0.0,
+                    })
+                    .align_y(Alignment::Start)
+                    .into()
             } else {
-                sbtn.into()
+                sp_w(0)
             };
+            let row_el: Element<'_, Msg> = row![sbtn, del_slot].align_y(Alignment::Start).into();
             items.push(
                 container(container(row_el).width(Fill).style(flat_box(
                     if sel {
@@ -869,6 +1100,26 @@ impl WeatherApp {
         .into()
     }
 
+    fn view_header_stack<'a>(
+        &'a self,
+        b: &'a WeatherBundle,
+        pal: SkyPalette,
+        w: f32,
+        gap: f32,
+    ) -> Element<'a, Msg> {
+        let mut h = column![self.view_hero(b, pal)]
+            .spacing(gap)
+            .width(w)
+            .align_x(Alignment::Center);
+        if !b.alerts.is_empty() {
+            h = h.push(self.view_alerts_card(b, pal, w));
+        }
+        if let Some(mc) = self.view_minutely_card(b, pal, w) {
+            h = h.push(mc);
+        }
+        h.into()
+    }
+
     fn view_full_bento_layout(&self, pal: SkyPalette) -> Element<'_, Msg> {
         let toolbar = self.view_top_toolbar_row(pal);
         let Some(b) = self.active_bundle() else {
@@ -907,17 +1158,13 @@ impl WeatherApp {
             th * 2.0 + g,
             th * 3.0 + g * 2.0,
         );
-        let mut content = column![self.view_hero(b, pal)]
-            .spacing(16)
-            .width(grid_w)
-            .align_x(Alignment::Center);
-        if !b.alerts.is_empty() {
-            content = content.push(self.view_alerts_card(b, pal, grid_w));
-        }
-        if let Some(mc) = self.view_minutely_card(b, pal, grid_w) {
-            content = content.push(mc);
-        }
-        content = content.push(self.view_hourly_card(b, pal, grid_w, 16));
+        let mut content = column![
+            self.view_header_stack(b, pal, grid_w, 16.0),
+            self.view_hourly_card(b, pal, grid_w, 16)
+        ]
+        .spacing(16)
+        .width(grid_w)
+        .align_x(Alignment::Center);
         let (d10, aqi, wind, map, moon) = (
             self.view_ten_day_card(b, pal, w2, Some(d10h)),
             self.view_aqi_card(b, pal, w2, th),
@@ -957,6 +1204,7 @@ impl WeatherApp {
         content = content.push(text(attr).size(10.5).color(pal.text_muted));
         let body =
             scrollable(column![sp_h(8), container(content).center_x(Fill), sp_h(28)].width(Fill))
+                .id("bento-scroll")
                 .width(Fill)
                 .height(Fill)
                 .style(sleek_scrollable);
@@ -972,7 +1220,7 @@ impl WeatherApp {
             let (cw, g, th) = (344.0_f32, 10.0_f32, 122.0_f32);
             let u = (cw - g) * 0.5;
             let col = column![
-                self.view_hero(b, pal),
+                self.view_header_stack(b, pal, cw, g),
                 self.view_hourly_card(b, pal, cw, 9),
                 row![
                     self.view_ten_day_card(b, pal, u + 16.0, None),
@@ -989,22 +1237,24 @@ impl WeatherApp {
                     self.view_feels_like_card(b, pal, u, th)
                 ]
                 .spacing(g),
-                self.view_moon_card(pal, cw, th),
                 row![
-                    self.view_visibility_card(b, pal, u, th),
+                    self.view_precip_summary_card(b, pal, u, th),
                     self.view_humidity_card(b, pal, u, th)
                 ]
                 .spacing(g),
+                self.view_moon_card(pal, cw, th),
                 row![
-                    self.view_pressure_card(b, pal, u, th),
-                    self.view_averages_card(b, pal, u, th)
+                    self.view_visibility_card(b, pal, u, th),
+                    self.view_pressure_card(b, pal, u, th)
                 ]
                 .spacing(g),
+                self.view_averages_card(b, pal, cw, th),
                 sp_h(16),
             ]
             .spacing(g)
             .width(cw);
             scrollable(container(col).padding([4, 12]))
+                .id("split-scroll")
                 .width(cw + 24.0)
                 .height(Fill)
                 .style(sleek_scrollable)
@@ -1012,17 +1262,34 @@ impl WeatherApp {
         } else {
             sp_w(0)
         };
-        let map_pane = container(self.map.view_expanded(
-            &self.settings.saved_locations,
-            &self.bundles,
-            self.settings.selected_location_id.as_deref(),
-            &self.settings,
-            Msg::Map,
-        ))
+        let map_border = if pal.is_light {
+            rgba8(20, 35, 60, 0.12)
+        } else {
+            rgba8(255, 255, 255, 0.14)
+        };
+        let map_pane = container(
+            container(self.map.view_expanded(
+                &self.settings.saved_locations,
+                &self.bundles,
+                self.settings.selected_location_id.as_deref(),
+                &self.settings,
+                Msg::Map,
+            ))
+            .width(Fill)
+            .height(Fill)
+            .clip(true)
+            .style(move |_| container::Style {
+                border: iced::Border {
+                    color: map_border,
+                    width: 1.0,
+                    radius: 13.0.into(),
+                },
+                ..Default::default()
+            }),
+        )
         .width(Fill)
         .height(Fill)
-        .padding([0, 12])
-        .clip(true);
+        .padding([0, 12]);
         column![
             toolbar,
             row![left, map_pane].width(Fill).height(Fill),
@@ -1061,12 +1328,13 @@ impl WeatherApp {
                 self.search_results
                     .iter()
                     .map(|r| {
-                        let lbl = txt(
-                            format!("{} — {}", r.name, r.subtitle()),
-                            12.0,
-                            Weight::Medium,
-                            Color::WHITE,
-                        );
+                        let sub = r.subtitle();
+                        let label = if sub.is_empty() {
+                            r.name.clone()
+                        } else {
+                            format!("{} — {sub}", r.name)
+                        };
+                        let lbl = txt(label, 12.0, Weight::Medium, Color::WHITE);
                         pbtn(
                             lbl,
                             [6, 10],
@@ -1121,72 +1389,107 @@ impl WeatherApp {
         .into_iter()
         .map(|p| pref_chip(p.label(), s.provider == p, Msg::Pref(Pref::Provider(p))))
         .collect();
+        let chips = |lbl, items: &[(&'static str, bool, Msg)]| {
+            pref_row(
+                lbl,
+                items
+                    .iter()
+                    .map(|(l, a, m)| pref_chip(l, *a, m.clone()))
+                    .collect(),
+            )
+        };
         let modal = container(
             column![
                 head,
                 hairline(pal.divider),
-                pref_row(
+                chips(
                     "Units",
-                    vec![
-                        pref_chip(
+                    &[
+                        (
                             "Celsius (°C)",
                             is_c,
                             if is_c { Msg::Noop } else { Msg::ToggleUnits }
                         ),
-                        pref_chip(
+                        (
                             "Fahrenheit (°F)",
                             !is_c,
                             if !is_c { Msg::Noop } else { Msg::ToggleUnits }
-                        )
+                        ),
                     ]
                 ),
-                pref_row(
+                chips(
                     "Wind",
-                    [
-                        ("km/h", WindUnit::KmH),
-                        ("mph", WindUnit::Mph),
-                        ("m/s", WindUnit::Ms),
-                        ("knots", WindUnit::Knots)
+                    &[
+                        (
+                            "km/h",
+                            s.wind_unit == WindUnit::KmH,
+                            Msg::Pref(Pref::Wind(WindUnit::KmH))
+                        ),
+                        (
+                            "mph",
+                            s.wind_unit == WindUnit::Mph,
+                            Msg::Pref(Pref::Wind(WindUnit::Mph))
+                        ),
+                        (
+                            "m/s",
+                            s.wind_unit == WindUnit::Ms,
+                            Msg::Pref(Pref::Wind(WindUnit::Ms))
+                        ),
+                        (
+                            "knots",
+                            s.wind_unit == WindUnit::Knots,
+                            Msg::Pref(Pref::Wind(WindUnit::Knots))
+                        ),
                     ]
-                    .into_iter()
-                    .map(|(l, u)| pref_chip(l, s.wind_unit == u, Msg::Pref(Pref::Wind(u))))
-                    .collect()
                 ),
-                pref_row(
+                chips(
                     "Pressure",
-                    [("hPa", PressureUnit::HPa), ("inHg", PressureUnit::InHg)]
-                        .into_iter()
-                        .map(|(l, u)| pref_chip(
-                            l,
-                            s.pressure_unit == u,
-                            Msg::Pref(Pref::Pressure(u))
-                        ))
-                        .collect()
-                ),
-                pref_row(
-                    "Appearance",
-                    [
-                        ("Dynamic Sky", ThemeMode::DynamicSky),
-                        ("Dark", ThemeMode::Dark),
-                        ("Light", ThemeMode::Light)
+                    &[
+                        (
+                            "hPa",
+                            s.pressure_unit == PressureUnit::HPa,
+                            Msg::Pref(Pref::Pressure(PressureUnit::HPa))
+                        ),
+                        (
+                            "inHg",
+                            s.pressure_unit == PressureUnit::InHg,
+                            Msg::Pref(Pref::Pressure(PressureUnit::InHg))
+                        ),
                     ]
-                    .into_iter()
-                    .map(|(l, m)| pref_chip(l, s.theme_mode == m, Msg::Pref(Pref::Theme(m))))
-                    .collect()
                 ),
-                pref_row(
+                chips(
+                    "Appearance",
+                    &[
+                        (
+                            "Dynamic Sky",
+                            s.theme_mode == ThemeMode::DynamicSky,
+                            Msg::Pref(Pref::Theme(ThemeMode::DynamicSky))
+                        ),
+                        (
+                            "Dark",
+                            s.theme_mode == ThemeMode::Dark,
+                            Msg::Pref(Pref::Theme(ThemeMode::Dark))
+                        ),
+                        (
+                            "Light",
+                            s.theme_mode == ThemeMode::Light,
+                            Msg::Pref(Pref::Theme(ThemeMode::Light))
+                        ),
+                    ]
+                ),
+                chips(
                     "Clock & Sky",
-                    vec![
-                        pref_chip(
+                    &[
+                        (
                             "24-Hour Time",
                             s.use_24h_time,
                             Msg::Pref(Pref::Use24h(!s.use_24h_time))
                         ),
-                        pref_chip(
+                        (
                             "Sky Motion",
                             s.animate_weather,
                             Msg::Pref(Pref::Animate(!s.animate_weather))
-                        )
+                        ),
                     ]
                 ),
                 hairline(pal.divider),
@@ -1278,7 +1581,8 @@ mod tests {
         for _ in 0..n {
             std::thread::sleep(Duration::from_millis(ms));
             let _ = app.update(Msg::Tick);
-            if stop && app.active_bundle().is_some() && !app.map.needs_fast_tick(app.map_expanded) {
+            if stop && app.active_bundle().is_some() && !app.map.has_pending_work(app.map_expanded)
+            {
                 break;
             }
         }
@@ -1383,98 +1687,161 @@ mod tests {
         assert!(!app.map_expanded);
     }
 
-    #[test]
-    fn persistent_renderer_zoom_in_out_repro() {
-        use iced_test::core::{clipboard::Null, renderer::Headless, theme::Base as _};
-        use iced_test::runtime::{UserInterface, user_interface::Cache};
-        let out_dir = reset_dir("WEATHER_RS_ZOOM_REPRO");
-        ensure_fonts_loaded();
-        let (mut app, _) = WeatherApp::boot();
-        let _ = app.update(Msg::Pref(Pref::Theme(ThemeMode::Dark)));
-        pump(&mut app, if out_dir.is_some() { 30 } else { 12 }, 100, true);
-        let bk = std::env::var("ICED_TEST_BACKEND").ok();
-        let mut r: iced::Renderer =
-            iced_test::futures::futures::executor::block_on(<iced::Renderer as Headless>::new(
-                fw(Weight::Normal),
-                iced::Pixels(16.0),
-                bk.as_deref(),
-            ))
-            .expect("headless renderer");
-        let (mut cache, logical, scale) = (Cache::default(), Size::new(1360.0, 900.0), 2.0_f32);
-        let phys = Size::new(
-            (logical.width * scale) as u32,
-            (logical.height * scale) as u32,
-        );
-        let px = |rgba: &[u8], lx: u32, ly: u32| {
-            let o = ((((ly * 2).min(phys.height - 1)) * phys.width + (lx * 2).min(phys.width - 1))
-                * 4) as usize;
-            (rgba[o], rgba[o + 1], rgba[o + 2])
-        };
-        let cur = iced::mouse::Cursor::Available(iced::Point::new(980.0, 460.0));
-        let mut render =
-            |app: &mut WeatherApp, evs: &[iced::Event], name: Option<&str>| -> Vec<u8> {
+    struct Harness {
+        r: iced::Renderer,
+        cache: iced_test::runtime::user_interface::Cache,
+        logical: Size,
+        phys: Size<u32>,
+        scale: f32,
+        cur: iced::mouse::Cursor,
+        dir: Option<PathBuf>,
+    }
+
+    impl Harness {
+        fn new(logical: Size, scale: f32, cur: iced::Point, env_dir: &str) -> Self {
+            use iced_test::core::renderer::Headless;
+            let bk = std::env::var("ICED_TEST_BACKEND").ok();
+            let r: iced::Renderer =
+                iced_test::futures::futures::executor::block_on(<iced::Renderer as Headless>::new(
+                    fw(Weight::Normal),
+                    iced::Pixels(16.0),
+                    bk.as_deref(),
+                ))
+                .expect("headless renderer");
+            Self {
+                r,
+                cache: Default::default(),
+                logical,
+                phys: Size::new(
+                    (logical.width * scale) as u32,
+                    (logical.height * scale) as u32,
+                ),
+                scale,
+                cur: iced::mouse::Cursor::Available(cur),
+                dir: reset_dir(env_dir),
+            }
+        }
+
+        fn render(
+            &mut self,
+            app: &mut WeatherApp,
+            evs: &[iced::Event],
+            name: Option<&str>,
+        ) -> Vec<u8> {
+            use iced_test::core::{clipboard::Null, renderer::Headless, theme::Base as _};
+            use iced_test::runtime::UserInterface;
+            if !evs.is_empty() {
                 let mut msgs = Vec::new();
-                let mut ui =
-                    UserInterface::build(app.view(), logical, std::mem::take(&mut cache), &mut r);
-                if !evs.is_empty() {
-                    let _ = ui.update(evs, cur, &mut r, &mut Null, &mut msgs);
-                }
-                cache = ui.into_cache();
+                let mut ui = UserInterface::build(
+                    app.view(),
+                    self.logical,
+                    std::mem::take(&mut self.cache),
+                    &mut self.r,
+                );
+                let _ = ui.update(evs, self.cur, &mut self.r, &mut Null, &mut msgs);
+                self.cache = ui.into_cache();
                 for m in msgs {
                     let _ = app.update(m);
                 }
-                let (th, base) = (iced::Theme::Dark, iced::Theme::Dark.base());
-                let mut ui =
-                    UserInterface::build(app.view(), logical, std::mem::take(&mut cache), &mut r);
-                let _ = ui.update(
-                    &[iced::Event::Window(window::Event::RedrawRequested(
-                        Instant::now(),
-                    ))],
-                    cur,
-                    &mut r,
-                    &mut Null,
-                    &mut Vec::new(),
-                );
-                ui.draw(
-                    &mut r,
-                    &th,
-                    &iced_test::core::renderer::Style {
-                        text_color: base.text_color,
-                    },
-                    cur,
-                );
-                cache = ui.into_cache();
-                let rgba = r.screenshot(phys, scale, base.background_color);
-                if let (Some(d), Some(n)) = (&out_dir, name)
-                    && let Some(img) =
-                        ::image::RgbaImage::from_raw(phys.width, phys.height, rgba.clone())
-                {
-                    let _ = img.save(d.join(format!("{n}.png")));
+            }
+            let (th, base) = (app.theme(), app.theme().base());
+            let mut ui = UserInterface::build(
+                app.view(),
+                self.logical,
+                std::mem::take(&mut self.cache),
+                &mut self.r,
+            );
+            let _ = ui.update(
+                &[iced::Event::Window(window::Event::RedrawRequested(
+                    Instant::now(),
+                ))],
+                self.cur,
+                &mut self.r,
+                &mut Null,
+                &mut Vec::new(),
+            );
+            ui.draw(
+                &mut self.r,
+                &th,
+                &iced_test::core::renderer::Style {
+                    text_color: base.text_color,
+                },
+                self.cur,
+            );
+            self.cache = ui.into_cache();
+            let rgba = self
+                .r
+                .screenshot(self.phys, self.scale, base.background_color);
+            if let (Some(d), Some(n)) = (&self.dir, name)
+                && let Some(img) =
+                    ::image::RgbaImage::from_raw(self.phys.width, self.phys.height, rgba.clone())
+            {
+                let _ = img.save(d.join(format!("{n}.png")));
+            }
+            rgba
+        }
+
+        fn px(&self, rgba: &[u8], lx: u32, ly: u32) -> (u8, u8, u8) {
+            let s = self.scale as u32;
+            let o = ((((ly * s).min(self.phys.height - 1)) * self.phys.width
+                + (lx * s).min(self.phys.width - 1))
+                * 4) as usize;
+            (rgba[o], rgba[o + 1], rgba[o + 2])
+        }
+
+        fn pump_render(&mut self, app: &mut WeatherApp, n: usize, ms: u64) {
+            if self.dir.is_some() {
+                for _ in 0..n {
+                    std::thread::sleep(Duration::from_millis(ms));
+                    let _ = app.update(Msg::Tick);
+                    let _ = self.render(app, &[], None);
                 }
-                rgba
-            };
-        let no_bleed = |rgba: &[u8], st: &str| {
-            let ((lr, lg, lb), (ur, ug, ub)) = (px(rgba, 576, 350), px(rgba, 920, 12));
-            assert!(
-                lr < 80 && lg < 100 && lb < 135,
-                "{st}: left bleed ({lr},{lg},{lb})"
-            );
-            assert!(
-                ur < 80 && ug < 100 && ub < 135,
-                "{st}: top bleed ({ur},{ug},{ub})"
-            );
+            }
+        }
+    }
+
+    fn mk_loc(n: &str, la: f64, lo: f64, tz: &str, cur: bool) -> Location {
+        let mut l = Location::new(n, "", "", "", la, lo, tz);
+        if cur {
+            (l.id, l.is_current_location) = ("current_location".into(), true);
+        }
+        l
+    }
+
+    #[test]
+    fn persistent_renderer_zoom_in_out_repro() {
+        ensure_fonts_loaded();
+        let mut h = Harness::new(
+            Size::new(1360.0, 900.0),
+            2.0,
+            iced::Point::new(980.0, 460.0),
+            "WEATHER_RS_ZOOM_REPRO",
+        );
+        let (mut app, _) = WeatherApp::boot();
+        let _ = app.update(Msg::Pref(Pref::Theme(ThemeMode::Dark)));
+        pump(&mut app, if h.dir.is_some() { 30 } else { 12 }, 100, true);
+        let no_bleed = |h: &Harness, rgba: &[u8], st: &str| {
+            for (pt, lbl) in [((576, 350), "left"), ((920, 12), "top")] {
+                let (r, g, b) = h.px(rgba, pt.0, pt.1);
+                assert!(
+                    r < 80 && g < 100 && b < 135,
+                    "{st}: {lbl} bleed ({r},{g},{b})"
+                );
+            }
         };
-        let _ = render(&mut app, &[], None);
+        let _ = h.render(&mut app, &[], None);
         pump(&mut app, 10, 80, false);
-        let (br, bg, bb) = px(&render(&mut app, &[], Some("01_bento_ready")), 1335, 575);
+        let img = h.render(&mut app, &[], Some("01_bento_ready"));
+        let (br, bg, bb) = h.px(&img, 1335, 575);
         assert!(
             br < 75 && bg < 95 && bb < 130,
             "Bento bleed ({br},{bg},{bb})"
         );
         let _ = app.update(Msg::Map(MapMsg::ExpandMap));
-        let _ = render(&mut app, &[], None);
+        let _ = h.render(&mut app, &[], None);
         pump(&mut app, 12, 80, false);
-        let (tr, tg, tb) = px(&render(&mut app, &[], Some("02_split_map_z5")), 980, 12);
+        let img = h.render(&mut app, &[], Some("02_split_map_z5"));
+        let (tr, tg, tb) = h.px(&img, 980, 12);
         assert!(
             tr < 75 && tg < 95 && tb < 130,
             "Split bleed ({tr},{tg},{tb})"
@@ -1484,30 +1851,17 @@ mod tests {
                 let ev = iced::Event::Mouse(iced::mouse::Event::WheelScrolled {
                     delta: iced::mouse::ScrollDelta::Lines { x: 0.0, y: dy },
                 });
-                no_bleed(
-                    &render(&mut app, &[ev], Some(&format!("{pre}_step{i}"))),
-                    pre,
-                );
+                let img = h.render(&mut app, &[ev], Some(&format!("{pre}_step{i}")));
+                no_bleed(&h, &img, pre);
             }
-            if out_dir.is_some() {
-                for _ in 0..16 {
-                    std::thread::sleep(Duration::from_millis(90));
-                    let _ = app.update(Msg::Tick);
-                    let _ = render(&mut app, &[], None);
-                }
-            }
-            no_bleed(
-                &render(
-                    &mut app,
-                    &[],
-                    Some(if dy > 0.0 {
-                        "04_zoom_in_settled"
-                    } else {
-                        "06_zoom_out_settled"
-                    }),
-                ),
-                pre,
-            );
+            h.pump_render(&mut app, 16, 90);
+            let settled = if dy > 0.0 {
+                "04_zoom_in_settled"
+            } else {
+                "06_zoom_out_settled"
+            };
+            let img = h.render(&mut app, &[], Some(settled));
+            no_bleed(&h, &img, pre);
         }
         let _ = app.update(Msg::Map(MapMsg::RecenterActive));
         for _ in 0..16 {
@@ -1516,31 +1870,203 @@ mod tests {
         let live_i = app.map.live_frame_idx();
         let _ = app.update(Msg::Map(MapMsg::ScrubRadar(live_i + 7)));
         assert!(app.map.selected_forecast_timestamp().is_some());
-        if out_dir.is_some() {
-            for _ in 0..14 {
-                std::thread::sleep(Duration::from_millis(85));
-                let _ = app.update(Msg::Tick);
-                let _ = render(&mut app, &[], None);
-            }
-        }
-        no_bleed(
-            &render(&mut app, &[], Some("07_future_radar_forecast")),
-            "07_future_radar_forecast",
-        );
+        h.pump_render(&mut app, 14, 85);
+        let img = h.render(&mut app, &[], Some("07_future_radar_forecast"));
+        no_bleed(&h, &img, "07_future_radar_forecast");
         let _ = app.update(Msg::Map(MapMsg::SelectOverlay(WeatherOverlay::Temperature)));
         let _ = app.update(Msg::Map(MapMsg::ScrubRadar(live_i + 10)));
-        if out_dir.is_some() {
-            for _ in 0..12 {
-                std::thread::sleep(Duration::from_millis(85));
-                let _ = app.update(Msg::Tick);
-                let _ = render(&mut app, &[], None);
-            }
-        }
-        no_bleed(
-            &render(&mut app, &[], Some("08_future_temp_forecast")),
-            "08_future_temp_forecast",
-        );
+        h.pump_render(&mut app, 12, 85);
+        let img = h.render(&mut app, &[], Some("08_future_temp_forecast"));
+        no_bleed(&h, &img, "08_future_temp_forecast");
         let _ = app.update(Msg::Map(MapMsg::JumpToLive));
         assert!(app.map.selected_forecast_timestamp().is_none());
+    }
+
+    #[test]
+    fn gaborone_berkeley_switch_repro() {
+        ensure_fonts_loaded();
+        let mut h = Harness::new(
+            Size::new(1340.0, 860.0),
+            1.0,
+            iced::Point::new(500.0, 400.0),
+            "WEATHER_RS_GB_REPRO",
+        );
+        let (mut app, _) = WeatherApp::boot();
+        for loc in [
+            mk_loc("Gaborone", -24.653, 25.905, "Africa/Gaborone", false),
+            mk_loc("Berkeley", 37.872, -122.273, "America/Los_Angeles", false),
+        ] {
+            if !app
+                .settings
+                .saved_locations
+                .iter()
+                .any(|l| l.name == loc.name)
+            {
+                app.settings.saved_locations.push(loc);
+            }
+        }
+        let find_id = |app: &WeatherApp, n: &str| {
+            app.settings
+                .saved_locations
+                .iter()
+                .find(|l| l.name == n)
+                .unwrap()
+                .id
+                .clone()
+        };
+        let (gab_id, brk_id) = (find_id(&app, "Gaborone"), find_id(&app, "Berkeley"));
+        let phys = h.phys;
+        let count_badge_blue = |rgba: &[u8], y1: u32| -> usize {
+            (400..y1.min(phys.height))
+                .flat_map(|y| (900..1250_u32.min(phys.width)).map(move |x| (x, y)))
+                .filter(|&(x, y)| {
+                    let i = ((y * phys.width + x) * 4) as usize;
+                    rgba[i + 2] > 160
+                        && rgba[i + 2] as i32 - rgba[i] as i32 > 75
+                        && rgba[i + 1] > 70
+                })
+                .count()
+        };
+
+        let _ = app.update(Msg::SelectLocation(gab_id.clone()));
+        (app.expanded_alert_idx, app.selected_day_idx, app.last_error) =
+            (Some(0), Some(2), Some("stale".into()));
+        pump(&mut app, 15, 60, false);
+        let gab_img = h.render(&mut app, &[], Some("01_bento_gaborone"));
+        if app.bundles.contains_key(&gab_id) {
+            assert!(
+                count_badge_blue(&gab_img, 720) >= 80,
+                "expected city badge on Gaborone mini-map"
+            );
+        }
+        let _ = app.update(Msg::SelectLocation(brk_id.clone()));
+        assert_eq!(
+            (
+                app.expanded_alert_idx,
+                app.selected_day_idx,
+                app.last_error.as_ref()
+            ),
+            (None, None, None)
+        );
+        let _ = h.render(&mut app, &[], Some("02_bento_berkeley_immediate"));
+        pump(&mut app, 15, 60, false);
+        let brk_img = h.render(&mut app, &[], Some("03_bento_berkeley_settled"));
+        if app.bundles.contains_key(&brk_id) {
+            assert!(
+                count_badge_blue(&brk_img, 820) >= 80,
+                "expected city badge on Berkeley mini-map"
+            );
+        }
+        let _ = app.update(Msg::SelectLocation(gab_id.clone()));
+        let _ = h.render(&mut app, &[], Some("04_bento_gaborone_immediate"));
+        pump(&mut app, 15, 60, false);
+        let _ = h.render(&mut app, &[], Some("05_bento_gaborone_settled"));
+
+        let _ = app.update(Msg::Map(MapMsg::ExpandMap));
+        pump(&mut app, 15, 60, false);
+        let _ = h.render(&mut app, &[], Some("06_split_gaborone"));
+        for (id, exp_lat, tag) in [
+            (&brk_id, 37.872, "berkeley"),
+            (&gab_id, -24.653, "gaborone"),
+        ] {
+            let _ = app.update(Msg::SelectLocation(id.clone()));
+            assert!(
+                (app.map.center_lat - exp_lat).abs() < 0.25 && !app.map.is_flying(),
+                "expected intercontinental jump to {tag} to snap, got lat={}",
+                app.map.center_lat
+            );
+            let _ = h.render(&mut app, &[], Some(&format!("split_{tag}_t0")));
+            for step in 1..=6 {
+                std::thread::sleep(Duration::from_millis(80));
+                let _ = app.update(Msg::Tick);
+                let _ = h.render(&mut app, &[], Some(&format!("split_{tag}_step{step}")));
+            }
+        }
+    }
+
+    #[test]
+    fn app_state_transitions_and_cleanup() {
+        ensure_fonts_loaded();
+        let (mut app, _) = WeatherApp::boot();
+        let tokyo = mk_loc("Tokyo", 35.676, 139.650, "Asia/Tokyo", false);
+        let tid = tokyo.id.clone();
+        let _ = app.add_or_select_location(tokyo);
+        assert_eq!(
+            app.settings.selected_location_id.as_deref(),
+            Some(tid.as_str())
+        );
+        (app.expanded_alert_idx, app.selected_day_idx, app.last_error) =
+            (Some(0), Some(3), Some("err".into()));
+        let (first_id, first_lat) = (
+            app.settings.saved_locations[0].id.clone(),
+            app.settings.saved_locations[0].lat,
+        );
+
+        let _ = app.update(Msg::RemoveLocation(tid));
+        assert_eq!(
+            app.settings.selected_location_id.as_deref(),
+            Some(first_id.as_str())
+        );
+        assert_eq!(
+            (
+                app.expanded_alert_idx,
+                app.selected_day_idx,
+                app.last_error.as_ref()
+            ),
+            (None, None, None)
+        );
+        assert!((app.map.center_lat - first_lat).abs() < 0.25);
+
+        let _ = app.update(Msg::Map(MapMsg::ExpandMap));
+        let _ = app.update(Msg::Map(MapMsg::ToggleRadarPlay));
+        assert!(app.map_expanded && app.map.radar_playing);
+        let _ = app.update(Msg::Escape);
+        assert!(!app.map_expanded && !app.map.radar_playing);
+
+        let _ = app.update(Msg::SearchChanged("London".into()));
+        let _ = app.update(Msg::TogglePreferences);
+        assert!(app.show_preferences && app.search_query.is_empty());
+
+        let cur_sf = mk_loc(
+            "San Francisco",
+            37.775,
+            -122.419,
+            "America/Los_Angeles",
+            true,
+        );
+        let saved_brk = mk_loc("Berkeley", 37.872, -122.273, "America/Los_Angeles", false);
+        let brk_id = saved_brk.id.clone();
+        app.settings.saved_locations = vec![cur_sf, saved_brk];
+        let _ = app.select_location("current_location".into(), true);
+
+        let cur_brk = mk_loc("Berkeley", 37.892, -122.264, "America/Los_Angeles", true);
+        app.apply_detected_location(cur_brk.clone(), false);
+        assert_eq!(app.settings.saved_locations[0].name, "Berkeley");
+        assert!(app.settings.saved_locations[0].is_current_location);
+        assert!(app.settings.saved_locations.iter().any(|l| l.id == brk_id));
+        assert!((app.map.center_lat - 37.892).abs() < 0.05);
+
+        // Background re-check at the SAME location must be a no-op.
+        (app.selected_day_idx, app.map.center_lat) = (Some(2), 10.0);
+        app.apply_detected_location(cur_brk.clone(), false);
+        assert_eq!(app.selected_day_idx, Some(2));
+        assert!((app.map.center_lat - 10.0).abs() < 0.05);
+
+        // Explicit Locate jumps back to My Location.
+        app.detect_focus_pending = true;
+        app.apply_detected_location(cur_brk.clone(), false);
+        assert!((app.map.center_lat - 37.892).abs() < 0.05);
+        assert_eq!(app.selected_day_idx, None);
+
+        // Wi-Fi refinement updates coords & inherits timezone; coarse IP fallback must NOT downgrade.
+        let cur_wifi = mk_loc("Berkeley", 37.8781, -122.2668, "", true);
+        app.apply_detected_location(cur_wifi, true);
+        assert!((app.settings.saved_locations[0].lat - 37.8781).abs() < 0.0005);
+        assert_eq!(
+            app.settings.saved_locations[0].timezone,
+            "America/Los_Angeles"
+        );
+        app.apply_detected_location(cur_brk, false);
+        assert!((app.settings.saved_locations[0].lat - 37.8781).abs() < 0.0005);
     }
 }

@@ -12,13 +12,12 @@ mod style;
 
 use iced::{Size, window};
 use std::env;
-use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
 mod linux_display {
     use std::ffi::{CString, c_char, c_int, c_void};
     use std::path::PathBuf;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     type Open = unsafe extern "C" fn(*const c_char) -> *mut c_void;
     type Query = unsafe extern "C" fn(
@@ -59,17 +58,9 @@ mod linux_display {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             // SAFETY: NUL-terminated static C symbols, null-checked before calls, display & lib closed.
-            let found = unsafe { probe_x11_dri3(&dpy) };
-            let _ = tx.send(found);
+            let _ = tx.send(unsafe { probe_x11_dri3(&dpy) });
         });
-        let t0 = Instant::now();
-        while t0.elapsed() < Duration::from_millis(250) {
-            if let Ok(v) = rx.try_recv() {
-                return v;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        false
+        rx.recv_timeout(Duration::from_millis(250)).unwrap_or(false)
     }
 
     unsafe fn probe_x11_dri3(dpy: &CString) -> bool {
@@ -103,6 +94,28 @@ mod linux_display {
 fn configure_display() {
     #[cfg(target_os = "linux")]
     {
+        if env::var_os("NO_AT_BRIDGE").is_none() {
+            // SAFETY: single-threaded startup before Iced/winit or GTK preload threads spawn.
+            // Prevents offscreen GTK3 titlebar rendering from registering an unpumped AT-SPI bridge.
+            unsafe { env::set_var("NO_AT_BRIDGE", "1") };
+        }
+        if let Some(tok) = env::var("XDG_ACTIVATION_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                env::var("DESKTOP_STARTUP_ID")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            })
+        {
+            sctk_adwaita::set_activation_token(tok);
+            // SAFETY: single-threaded startup before Iced/winit or GTK preload threads spawn.
+            // Prevents libgtk-3 from swallowing the token without mapping a GTK window.
+            unsafe {
+                env::remove_var("XDG_ACTIVATION_TOKEN");
+                env::remove_var("DESKTOP_STARTUP_ID");
+            }
+        }
         if env::var_os("WAYLAND_DISPLAY").is_some() && !linux_display::wayland_live() {
             // SAFETY: single-threaded startup before Iced/winit or worker threads spawn.
             unsafe { env::remove_var("WAYLAND_DISPLAY") };
@@ -167,8 +180,10 @@ fn build_app_icon() -> Option<window::Icon> {
 
 fn main() -> iced::Result {
     configure_display();
-    style::ensure_fonts_loaded();
-    let app_icon = Arc::new(build_app_icon());
+    #[cfg(target_os = "linux")]
+    sctk_adwaita::preload();
+    style::preload_fonts();
+    icons::preload_cloud_tex();
     iced::application(
         app::WeatherApp::boot,
         app::WeatherApp::update,
@@ -182,7 +197,7 @@ fn main() -> iced::Result {
         size: Size::new(1180.0, 760.0),
         min_size: Some(Size::new(720.0, 520.0)),
         exit_on_close_request: false,
-        icon: (*app_icon).clone(),
+        icon: build_app_icon(),
         #[cfg(target_os = "linux")]
         platform_specific: window::settings::PlatformSpecific {
             application_id: "weather-rs".into(),

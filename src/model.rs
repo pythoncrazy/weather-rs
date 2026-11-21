@@ -44,7 +44,21 @@ impl Location {
         }
     }
     pub fn is_same_place(&self, o: &Self) -> bool {
-        self.id == o.id || ((self.lat - o.lat).abs() < 0.08 && (self.lon - o.lon).abs() < 0.08)
+        if self.id == o.id {
+            return true;
+        }
+        let dlat = (self.lat - o.lat).abs();
+        let mut dlon = (self.lon - o.lon).abs();
+        if dlon > 180.0 {
+            dlon = 360.0 - dlon;
+        }
+        if dlat < 0.02 && dlon < 0.02 {
+            return true;
+        }
+        !self.name.is_empty()
+            && self.name.eq_ignore_ascii_case(&o.name)
+            && dlat < 0.15
+            && dlon < 0.15
     }
     pub fn subtitle(&self) -> String {
         match (self.region.is_empty(), self.country.is_empty()) {
@@ -227,23 +241,26 @@ pub struct AirQuality {
 }
 
 impl AirQuality {
-    pub fn category(&self) -> &'static str {
+    pub fn info(&self) -> (&'static str, &'static str) {
         match self.us_aqi {
-            ..=50 => "Good",
-            51..=100 => "Moderate",
-            101..=150 => "Sensitive",
-            151..=200 => "Unhealthy",
-            201..=300 => "Very Unhealthy",
-            _ => "Hazardous",
-        }
-    }
-    pub fn summary(&self) -> &'static str {
-        match self.us_aqi {
-            ..=50 => "Air quality is clean and ideal for outdoor activity.",
-            51..=100 => "Air quality is acceptable for most people.",
-            101..=150 => "Sensitive groups should limit prolonged exertion.",
-            151..=200 => "Reduce prolonged or heavy outdoor exertion.",
-            _ => "Avoid outdoor exertion due to poor air quality.",
+            ..=50 => (
+                "Good",
+                "Air quality is clean and ideal for outdoor activity.",
+            ),
+            51..=100 => ("Moderate", "Air quality is acceptable for most people."),
+            101..=150 => (
+                "Sensitive",
+                "Sensitive groups should limit prolonged exertion.",
+            ),
+            151..=200 => ("Unhealthy", "Reduce prolonged or heavy outdoor exertion."),
+            201..=300 => (
+                "Very Unhealthy",
+                "Avoid outdoor exertion due to poor air quality.",
+            ),
+            _ => (
+                "Hazardous",
+                "Avoid outdoor exertion due to poor air quality.",
+            ),
         }
     }
 }
@@ -362,22 +379,22 @@ impl Default for Settings {
 
 impl Settings {
     pub fn deduplicate_locations(&mut self) {
-        if let Some(cur) = self
-            .saved_locations
-            .iter()
-            .find(|l| l.is_current_location)
-            .cloned()
-        {
-            self.saved_locations
-                .retain(|l| l.is_current_location || !l.is_same_place(&cur));
-        }
-        let mut seen: Vec<Location> = Vec::with_capacity(self.saved_locations.len());
+        let mut seen_current = false;
+        let mut out: Vec<Location> = Vec::with_capacity(self.saved_locations.len());
         for loc in self.saved_locations.drain(..) {
-            if !seen.iter().any(|e| e.is_same_place(&loc)) {
-                seen.push(loc);
+            if loc.is_current_location {
+                if !seen_current {
+                    seen_current = true;
+                    out.insert(0, loc);
+                }
+            } else if !out
+                .iter()
+                .any(|e| !e.is_current_location && e.is_same_place(&loc))
+            {
+                out.push(loc);
             }
         }
-        self.saved_locations = seen;
+        self.saved_locations = out;
         if self
             .selected_location_id
             .as_ref()
@@ -394,8 +411,11 @@ impl Settings {
         }
     }
     pub fn format_temp(&self, c: f64) -> String {
+        format!("{}°", self.format_temp_bare(c))
+    }
+    pub fn format_temp_bare(&self, c: f64) -> String {
         let r = self.convert_temp(c).round();
-        format!("{:.0}°", if r.abs() < 0.5 { 0.0 } else { r })
+        format!("{:.0}", if r.abs() < 0.5 { 0.0 } else { r })
     }
     pub fn format_wind(&self, mps: f64) -> String {
         let (v, u) = self.wind_value_and_unit(mps);
@@ -416,17 +436,24 @@ impl Settings {
         }
     }
     pub fn format_precip(&self, mm: f64) -> String {
+        let mm = mm.max(0.0);
         match self.precip_unit {
-            PrecipUnit::Mm if mm < 1.0 && mm > 0.05 => format!("{mm:.1} mm"),
+            PrecipUnit::Mm if (0.05..0.95).contains(&mm) => format!("{mm:.1} mm"),
             PrecipUnit::Mm => format!("{:.0} mm", mm.round()),
             PrecipUnit::Inches => format!("{:.2}\"", mm / 25.4),
         }
     }
     pub fn format_visibility(&self, m: f64) -> String {
-        if self.wind_unit == WindUnit::Mph {
-            format!("{:.0} mi", (m / 1609.34).clamp(0.1, 99.0))
+        let (div, u) = if self.wind_unit == WindUnit::Mph {
+            (1609.34, "mi")
         } else {
-            format!("{:.0} km", (m / 1000.0).clamp(0.1, 99.0))
+            (1000.0, "km")
+        };
+        let v = (m.max(0.0) / div).clamp(0.1, 99.0);
+        if v < 1.0 {
+            format!("{v:.1} {u}")
+        } else {
+            format!("{v:.0} {u}")
         }
     }
 }
@@ -452,28 +479,30 @@ pub fn dew_point_from_rh(t: f64, rh: f64) -> f64 {
     (243.04 * a) / (17.625 - a)
 }
 pub fn apparent_temperature_c(t: f64, rh: f64, ws: f64) -> f64 {
+    let (rh, ws) = (rh.clamp(1.0, 100.0), ws.max(0.0));
     let kmh = ws * 3.6;
     if t <= 10.0 && kmh > 4.8 {
+        // NOAA / Environment Canada Wind Chill index.
         13.12 + 0.6215 * t - 11.37 * kmh.powf(0.16) + 0.3965 * t * kmh.powf(0.16)
+    } else if t >= 26.7 && rh >= 40.0 {
+        // Rothfusz NOAA Heat Index (computed in °F, returned in °C).
+        let tf = t * 9.0 / 5.0 + 32.0;
+        let hi_f = -42.379 + 2.049_015_23 * tf + 10.143_331_27 * rh
+            - 0.224_755_41 * tf * rh
+            - 6.837_83e-3 * tf * tf
+            - 5.481_717e-2 * rh * rh
+            + 1.228_74e-3 * tf * tf * rh
+            + 8.528_2e-4 * tf * rh * rh
+            - 1.99e-6 * tf * tf * rh * rh;
+        (hi_f - 32.0) * 5.0 / 9.0
     } else {
-        t + 0.33 * (rh.clamp(1.0, 100.0) / 100.0) * 6.105 * ((17.27 * t) / (237.7 + t)).exp()
-            - 0.70 * ws
-            - 4.0
+        // Mild conditions: gentle breeze cooling without Steadman's -4°C shade offset.
+        t - (ws - 2.0).max(0.0) * 0.28
     }
 }
 
 pub fn default_locations() -> Vec<Location> {
-    type City = (
-        &'static str,
-        &'static str,
-        &'static str,
-        &'static str,
-        f64,
-        f64,
-        &'static str,
-        f64,
-    );
-    const CITIES: [City; 4] = [
+    [
         (
             "New York",
             "New York",
@@ -514,14 +543,13 @@ pub fn default_locations() -> Vec<Location> {
             "Europe/Oslo",
             23.0,
         ),
-    ];
-    CITIES
-        .into_iter()
-        .map(|(n, r, c, cc, la, lo, tz, el)| Location {
-            elevation_m: Some(el),
-            ..Location::new(n, r, c, cc, la, lo, tz)
-        })
-        .collect()
+    ]
+    .into_iter()
+    .map(|(n, r, c, cc, la, lo, tz, el)| Location {
+        elevation_m: Some(el),
+        ..Location::new(n, r, c, cc, la, lo, tz)
+    })
+    .collect()
 }
 
 #[cfg(test)]
@@ -562,5 +590,21 @@ mod tests {
             [0.0, 90.0, 225.0, 359.0].map(compass_direction),
             ["N", "E", "SW", "N"]
         );
+        // Distinct neighboring cities (Oakland vs Berkeley) must NOT collapse together.
+        let brk = Location::new("Berkeley", "CA", "US", "US", 37.872, -122.273, "");
+        let oak = Location::new("Oakland", "CA", "US", "US", 37.804, -122.271, "");
+        assert!(!brk.is_same_place(&oak));
+        // Same city with slightly offset coordinates (e.g. IP geoloc vs geocoder) DOES match.
+        let brk2 = Location::new("Berkeley", "CA", "US", "US", 37.868, -122.269, "");
+        assert!(brk.is_same_place(&brk2));
+        // Mild 53°F (11.7°C) with 5 mph (2.2 m/s) breeze must feel near actual temp (~11.6°C).
+        assert!((apparent_temperature_c(11.7, 55.0, 2.2) - 11.7).abs() < 0.5);
+        // Dense fog visibility must not format as "0 km" or "0 mi".
+        assert_eq!(s.format_visibility(200.0), "0.2 km");
+        s.wind_unit = WindUnit::Mph;
+        assert_eq!(s.format_visibility(200.0), "0.1 mi");
+        // No negative zero in temp formatting.
+        assert_eq!(s.format_temp(-0.2), "0°");
+        assert_eq!(s.format_temp_bare(-0.2), "0");
     }
 }
