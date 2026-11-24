@@ -444,12 +444,13 @@ pub(super) fn eccc_tier_weight(model: EcccModel, outside_hrrr: bool, la: f64, lo
     }
 }
 
-/// Geographic window `(lat_min, lat_max, lon_min, lon_max)` covering viewport `vp` plus a pan margin, snapped outward
-/// to whole degrees so it stays stable (cacheable) during small pans. `None` when the view wraps the antimeridian.
+/// Geographic window `(lat_min, lat_max, lon_min, lon_max)` covering exactly viewport `vp`, snapped outward to whole
+/// degrees so it stays stable (cacheable) during small pans. No extra pan margin: a model tier that only the margin
+/// would touch costs a whole raster for every forecast hour. `None` when the view wraps the antimeridian.
 pub(super) fn viewport_geo_window((bounds, lat, lon, zoom): MapVp) -> Option<(f64, f64, f64, f64)> {
     let ws = 256.0 * 2.0_f64.powf(zoom);
     let (cwx, cwy) = lat_lon_to_world_px(lat, lon, zoom);
-    let (hw, hh) = (bounds.width as f64 * 0.62, bounds.height as f64 * 0.62);
+    let (hw, hh) = (bounds.width as f64 * 0.5, bounds.height as f64 * 0.5);
     if cwx - hw < 0.0 || cwx + hw > ws {
         return None;
     }
@@ -1020,22 +1021,27 @@ impl MapEngine {
         &self, vp: MapVp, base_style: BaseMapStyle, ts_unix: i64,
     ) -> Option<(adv_image::Handle, Rectangle, f32)> {
         let (bounds, lat, lon, zoom) = vp;
-        if !self.show_terminator || zoom > 7.8 {
+        if zoom > 7.8 {
             return None;
         }
         let zoom_fade = ((7.8 - zoom) / 1.2).clamp(0.0, 1.0) as f32;
         let dark_base = matches!(base_style, BaseMapStyle::AppleDark | BaseMapStyle::Satellite);
-        let bucket = (ts_unix / 1800) as u64;
-        let meta_sig = hash_u64(&[bucket, u64::from(dark_base)]);
+        let meta_sig = u64::from(dark_base);
         let (cwx, cwy) = lat_lon_to_world_px(lat, lon, zoom);
         let ws = 256.0 * 2.0_f64.powf(zoom);
+        // The night side keeps its shape and simply travels west at 15° of longitude per hour (the sun's declination
+        // moves under 0.02° in that time), and longitude is linear in Web-Mercator x. So a texture computed for one
+        // instant is slid sideways to show any nearby instant exactly, instead of snapping to a new one every half hour
+        // — which made the whole map's shading jump twice a second during forecast playback.
         if let Ok(g) = self.terminator_tex.lock()
-            && let Some(c) = g.as_ref()
+            && let Some((anchor_ts, c)) = g.as_ref()
             && c.meta_sig == meta_sig
             && (zoom - c.zoom).abs() <= 0.55
+            && (ts_unix - anchor_ts).abs() <= 3 * 3600
         {
             let sc = 2.0_f64.powf(zoom - c.zoom);
-            let (mut x0, mut x1, y0, y1) = (c.wx0 * sc, c.wx1 * sc, c.wy0 * sc, c.wy1 * sc);
+            let drift = -((ts_unix - anchor_ts) as f64 / 86_400.0) * ws;
+            let (mut x0, mut x1, y0, y1) = (c.wx0 * sc + drift, c.wx1 * sc + drift, c.wy0 * sc, c.wy1 * sc);
             let mid = (x0 + x1) * 0.5;
             if mid - cwx > ws * 0.5 {
                 (x0, x1) = (x0 - ws, x1 - ws);
@@ -1077,7 +1083,7 @@ impl MapEngine {
         }
         let handle = adv_image::Handle::from_rgba(fw as u32, fh as u32, rgba);
         let _ = self.terminator_tex.lock().map(|mut g| {
-            *g = Some(ScalarCache { meta_sig, zoom, wx0, wy0, wx1, wy1, handle: handle.clone() });
+            *g = Some((ts_unix, ScalarCache { meta_sig, zoom, wx0, wy0, wx1, wy1, handle: handle.clone() }));
         });
         let dst = Rectangle {
             x: (bounds.width as f64 * 0.5 - ov_w * 0.5) as f32,

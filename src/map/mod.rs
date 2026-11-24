@@ -9,7 +9,8 @@ pub use tiles::TileKey;
 use crate::icons::wind_to_color;
 use crate::model::{AlertSeverity, Location, Settings, TempUnit, WeatherBundle};
 use crate::providers::{
-    EcccModel, GridWeatherPoint, RadarFrameSource, RainViewerFrame, RainViewerManifest, SatelliteFrame, WeatherClient, wind_uv,
+    ECCC_SUBSTEPS, EcccModel, GridWeatherPoint, RadarFrameSource, RainViewerFrame, RainViewerManifest, SatelliteFrame, WeatherClient,
+    forecast_interpolation, wind_uv,
 };
 use crate::storage::is_shutting_down;
 use crate::style::{fw, rgb8, rgba8};
@@ -214,19 +215,24 @@ pub(super) struct RadarState {
     pub play_pos: f32,
     pub target_pos: f32,
     pub loop_hold: f32,
+    /// Seconds spent in the current pre-roll (see `preroll`).
     pub stall_secs: f32,
+    /// True while playback is waiting in its one pre-roll; shown as the HUD's loading state.
     pub buffering: bool,
-    pub skip_stall_idx: Option<usize>,
+    /// Set when Play is pressed: playback waits once for the first stretch of frames, then never pauses again.
+    pub preroll: bool,
+    /// True for a pre-roll the app started by itself when the map opened: it shows the live frame without a
+    /// "Buffering…" label, because the user has not asked for anything yet.
+    pub quiet_preroll: bool,
 }
 impl RadarState {
     fn snap(&mut self, idx: usize) {
-        (self.frame_idx, self.play_pos, self.target_pos, self.stall_secs, self.buffering, self.skip_stall_idx) =
-            (idx, idx as f32, idx as f32, 0.0, false, None);
+        (self.frame_idx, self.play_pos, self.target_pos, self.stall_secs, self.buffering) = (idx, idx as f32, idx as f32, 0.0, false);
     }
     fn snap_pos(&mut self, pos: f32, max_i: usize) {
         let c = pos.clamp(0.0, max_i as f32);
-        (self.frame_idx, self.play_pos, self.target_pos, self.stall_secs, self.buffering, self.skip_stall_idx) =
-            ((c.round() as usize).min(max_i), c, c, 0.0, false, None);
+        (self.frame_idx, self.play_pos, self.target_pos, self.stall_secs, self.buffering) =
+            ((c.round() as usize).min(max_i), c, c, 0.0, false);
     }
 }
 
@@ -344,7 +350,10 @@ pub struct MapEngine {
     motion: CamMotion,
     pub(super) manifest: Option<RainViewerManifest>,
     /// Pre-interned `[primary_ns_id, eccc_hrdps_id, eccc_rdps_id, eccc_gdps_id]` per manifest frame (0 String allocs per tick!).
-    manifest_ns_ids: Vec<[Option<u32>; 4]>,
+    /// Interned primary (radar / HRRR) tile namespace of every manifest frame.
+    manifest_ns_ids: Vec<Option<u32>>,
+    /// Interned tile namespaces `[hrdps, rdps, gdps]` of ECCC slots, keyed by `(outside_hrrr, hour, slot)`.
+    eccc_ids: std::cell::RefCell<tiles::FxHashMap<(bool, i64, u8), [u32; 3]>>,
     /// Pre-interned namespace IDs for `manifest.satellite` 12-hour global IR cloud frames.
     sat_ns_ids: Vec<u32>,
     last_manifest: Option<Instant>,
@@ -359,7 +368,8 @@ pub struct MapEngine {
     pub(super) grid_gen: u64,
     last_grid_poll: Option<Instant>,
     scalar_tex: Mutex<Option<ScalarCache>>,
-    terminator_tex: Mutex<Option<ScalarCache>>,
+    /// Day/night shading texture and the instant it was computed for.
+    terminator_tex: Mutex<Option<(i64, ScalarCache)>>,
     isobar_cache: Mutex<Option<IsobarCache>>,
     pub(super) wind_grid: Option<(u64, WindGrid)>,
     pub(super) inspect: InspectState,
@@ -402,7 +412,8 @@ impl MapEngine {
             overlay: WeatherOverlay::RadarTimeline,
             show_layer_menu: false,
             full_screen: false,
-            show_terminator: true,
+            // Off by default, as in Apple Weather's maps; the layers menu turns it on.
+            show_terminator: false,
             legend_collapsed: false,
             playback_speed: 1.0,
             overlay_opacity: 0.85,
@@ -413,6 +424,7 @@ impl MapEngine {
             motion: CamMotion::Idle,
             manifest: None,
             manifest_ns_ids: Vec::new(),
+            eccc_ids: std::cell::RefCell::new(tiles::FxHashMap::default()),
             sat_ns_ids: Vec::new(),
             last_manifest: None,
             last_prewarmed_strip: None,
@@ -482,16 +494,8 @@ impl MapEngine {
     }
 
     fn set_manifest(&mut self, m: RainViewerManifest) {
-        let (next_ids, next_sat): (Vec<[Option<u32>; 4]>, Vec<u32>) = if let Ok(mut pool) = self.pool.lock() {
-            let fids = m
-                .frames
-                .iter()
-                .map(|f| {
-                    let p = f.tile_namespace().map(|s| pool.intern(&s));
-                    let [h, r, g] = f.eccc_tier_namespaces().map_or([None; 3], |t| t.map(|s| Some(pool.intern(&s))));
-                    [p, h, r, g]
-                })
-                .collect();
+        let (next_ids, next_sat): (Vec<Option<u32>>, Vec<u32>) = if let Ok(mut pool) = self.pool.lock() {
+            let fids = m.frames.iter().map(|f| f.tile_namespace().map(|s| pool.intern(&s))).collect();
             let sids = m.satellite.iter().map(|s| pool.intern(&s.tile_namespace())).collect();
             (fids, sids)
         } else {
@@ -779,6 +783,11 @@ impl MapEngine {
             m.frames.iter().enumerate().map(|(i, f)| (i, f.time_unix, format!("{:?} nowcast={}", f.source, f.is_nowcast))).collect()
         })
     }
+    /// Test-only: current fractional playback position.
+    #[cfg(test)]
+    pub fn debug_play_pos(&self) -> f32 {
+        self.radar.play_pos
+    }
     /// Test-only: pins the exact fractional playback position with the continuous-playback (`playing`) blend curve.
     #[cfg(test)]
     pub fn debug_set_play(&mut self, pos: f32, playing: bool) {
@@ -953,6 +962,13 @@ fn eccc_tier_tile_needed(model: EcccModel, outside_hrrr: bool, z: u8, x: u32, y:
     overlays::eccc_tier_needed_in(model, outside_hrrr, z, x, y, overlays::viewport_geo_window(vp))
 }
 
+/// UTC hours of the ECCC model rasters a frame at `time_unix` is built from: its own hour, plus the next one unless
+/// the frame sits exactly on the hour.
+fn eccc_source_hours(time_unix: i64) -> [Option<i64>; 2] {
+    let h0 = time_unix.div_euclid(3600) * 3600;
+    [Some(h0), (time_unix != h0).then_some(h0 + 3600)]
+}
+
 #[derive(Debug, Clone, Copy)]
 struct FrameReadiness {
     /// True iff 100% of visible viewport tiles (core + border + offshore ECCC tiers) are settled at native target zoom `tz`.
@@ -980,39 +996,33 @@ fn visible_tile_bounds((bounds, lat, lon, zoom): MapVp, max_z: u8) -> (u8, i64, 
 /// (`core_ready`, where 100% of inner core tiles `d2 <= 2.25` are fresh/zoom-covered and any missing outer border
 /// sliver is seamlessly bridged by an adjacent temporal frame already in RAM via `temporal_fallbacks`!).
 fn radar_frame_readiness_ids(
-    f: &RainViewerFrame, ids: Option<[Option<u32>; 4]>, temporal_primary: [Option<u32>; 2], pool: &SharedTilePool, vp: MapVp,
+    f: &RainViewerFrame, primary: Option<u32>, temporal_primary: [Option<u32>; 2], pool: &SharedTilePool, vp: MapVp,
 ) -> FrameReadiness {
     let mut all_ready = true;
     let mut visually_covered = true;
     let mut core_miss = false;
     let (mut total_req, mut covered_req) = (0_u32, 0_u32);
-    let [primary_id, hrdps_id, rdps_id, gdps_id] = match ids {
-        Some(arr) => arr,
-        None => {
-            let p = f.tile_namespace().and_then(|ns| pool.lookup_ns(&ns));
-            let [h, r, g] = f.eccc_tier_namespaces().map_or([None; 3], |t| t.map(|ns| pool.lookup_ns(&ns)));
-            [p, h, r, g]
-        }
-    };
+    let primary_id = primary.or_else(|| f.tile_namespace().and_then(|ns| pool.lookup_ns(&ns)));
     let is_hrrr = matches!(f.source, RadarFrameSource::NoaaHrrr(..));
     let has_eccc = matches!(f.source, RadarFrameSource::NoaaHrrr(..) | RadarFrameSource::EcccNwp);
     if has_eccc {
-        for (model, tid) in EcccModel::ALL.into_iter().zip([hrdps_id, rdps_id, gdps_id]) {
-            let max_z = model.max_native_zoom();
-            for_each_visible_tile_biased(vp, max_z, model.zoom_bias(), |z, x, y, d2| {
+        // A model frame can be drawn as soon as the hourly ECCC rasters it is interpolated from have arrived: the
+        // interpolated tiles themselves are built off-network just ahead of the playhead.
+        for model in EcccModel::ALL {
+            let src_ids = eccc_source_hours(f.time_unix).map(|h| h.and_then(|h| pool.lookup_ns(&eccc::source_ns(model, h))));
+            for_each_visible_tile_biased(vp, model.max_native_zoom(), model.zoom_bias(), |z, x, y, d2| {
                 if eccc_tier_tile_needed(model, is_hrrr, z, x, y, vp) {
-                    total_req += 1;
-                    if tid.is_some_and(|id| pool.is_settled_id(id, (z, x, y))) {
-                        covered_req += 1;
-                    } else {
-                        all_ready = false;
-                        if tid.is_some_and(|id| pool.has_zoom_fallback_id(id, (z, x, y), max_z)) {
+                    let sc = eccc::source_coord(model, (z, x, y));
+                    for (hour, sid) in eccc_source_hours(f.time_unix).into_iter().zip(src_ids) {
+                        if hour.is_none() {
+                            continue;
+                        }
+                        total_req += 1;
+                        if sid.is_some_and(|id| pool.is_settled_id(id, sc)) {
                             covered_req += 1;
                         } else {
-                            visually_covered = false;
-                            if d2 <= 2.25 {
-                                core_miss = true;
-                            }
+                            (all_ready, visually_covered) = (false, false);
+                            core_miss |= d2 <= 2.25;
                         }
                     }
                 }
@@ -1092,19 +1102,28 @@ fn ensure_radar_frame_visible(pool: &mut SharedTilePool, host: &str, f: &RainVie
     }
     let mut ok = true;
     let is_hrrr = matches!(f.source, RadarFrameSource::NoaaHrrr(..));
-    // Always enqueue slower ECCC GeoMet WMS tiers BEFORE primary HRRR/LibreWXR so they launch in parallel immediately!
-    // Each tier tile is one interpolation slot; its job fetches (or reuses) the bracketing hourly rasters itself.
-    if let Some(tiers) = f.eccc_tier_namespaces() {
-        let (h0, q) = f.eccc_slot();
-        for (model, ns) in EcccModel::ALL.into_iter().zip(tiers) {
-            ok &= enqueue_layer(
-                pool,
-                vp,
-                &ns,
-                (model.max_native_zoom(), model.zoom_bias(), prio, mark_wanted),
-                |z, x, y| eccc_tier_tile_needed(model, is_hrrr, z, x, y, vp),
-                |_, _, _| eccc::job_spec(model, h0, q),
-            );
+    // Always enqueue the slower ECCC GeoMet rasters BEFORE primary HRRR/LibreWXR so they launch in parallel immediately.
+    // Only the hourly model rasters are downloaded; every interpolated frame is derived from them off-network.
+    if matches!(f.source, RadarFrameSource::NoaaHrrr(..) | RadarFrameSource::EcccNwp) {
+        for model in EcccModel::ALL {
+            for hour in eccc_source_hours(f.time_unix).into_iter().flatten() {
+                let ns_id = pool.intern(&eccc::source_ns(model, hour));
+                let mut reqs: Vec<(eccc::SourceReq, f64)> = Vec::new();
+                for_each_visible_tile_biased(vp, model.max_native_zoom(), model.zoom_bias(), |z, x, y, d2| {
+                    if eccc_tier_tile_needed(model, is_hrrr, z, x, y, vp)
+                        && let Some(r) = eccc::source_req(model, hour, (z, x, y))
+                        && !pool.is_settled_id(ns_id, r.coord)
+                        && !reqs.iter().any(|(q, _)| q.coord == r.coord)
+                    {
+                        reqs.push((r, d2));
+                    }
+                    true
+                });
+                reqs.sort_by(|a, b| a.1.total_cmp(&b.1));
+                for (r, _) in reqs {
+                    ok &= pool.ensure_id_prio(ns_id, r.coord, || r.url, Duration::from_secs(3600), prio, true);
+                }
+            }
         }
     }
     if let Some(ns) = f.tile_namespace() {
@@ -1182,6 +1201,93 @@ impl MapEngine {
             p.store_gpu_pins(pins);
         }
     }
+    /// Interned tile namespaces `[hrdps, rdps, gdps]` of the ECCC slot `key = (outside_hrrr, hour, slot)`.
+    fn eccc_slot_ids(&self, pool: &mut SharedTilePool, key: (bool, i64, u8)) -> [u32; 3] {
+        if let Some(ids) = self.eccc_ids.borrow().get(&key) {
+            return *ids;
+        }
+        let ids = RainViewerFrame::eccc_slot_namespaces(key.0, (key.1, key.2)).map(|ns| pool.intern(&ns));
+        let mut memo = self.eccc_ids.borrow_mut();
+        if memo.len() > 2048 {
+            memo.clear();
+        }
+        memo.insert(key, ids);
+        ids
+    }
+
+    /// Whether timeline frame `idx` of the active overlay can be drawn in full at viewport `vp`; anything still
+    /// missing is (re-)requested at top priority.
+    fn timeline_frame_ready(&self, pool: &mut SharedTilePool, idx: usize, vp: MapVp) -> bool {
+        let Some(m) = &self.manifest else { return true };
+        let playable = |r: FrameReadiness| r.all_ready || r.visually_covered || r.core_ready;
+        match self.overlay {
+            WeatherOverlay::RadarTimeline => m.frames.get(idx).is_none_or(|f| {
+                let r = radar_frame_readiness_ids(f, self.manifest_ns_ids.get(idx).copied().flatten(), [None; 2], pool, vp);
+                if !r.all_ready {
+                    let _ = ensure_radar_frame_visible(pool, &m.host, f, vp, PRIO_MAX, true);
+                }
+                playable(r)
+            }),
+            WeatherOverlay::InfraredClouds => m.satellite.get(idx).zip(self.sat_ns_ids.get(idx)).is_none_or(|(f, &id)| {
+                let r = sat_frame_readiness_id(id, [None; 2], pool, vp);
+                if !r.all_ready {
+                    let _ = ensure_sat_frame_visible(pool, &m.host, f, vp, PRIO_MAX, true);
+                }
+                playable(r)
+            }),
+            _ => true,
+        }
+    }
+
+    /// Keeps the interpolated ECCC frames flowing: builds the slots just ahead of the playhead (off-network, from the
+    /// hourly rasters already downloaded) and forgets every slot the playhead has left behind, so a 12-hour loop of
+    /// 7.5-minute frames never holds more than about an hour of them in memory.
+    fn stream_eccc_slots(&mut self) {
+        const AHEAD: i64 = ECCC_SUBSTEPS as i64;
+        let (Some(m), Some(tl)) = (self.manifest.as_ref(), self.active_timeline()) else { return };
+        let is_model = |f: &RainViewerFrame| !matches!(f.source, RadarFrameSource::Tile(..));
+        let pos = self.radar.play_pos.clamp(0.0, tl.max_idx() as f32);
+        let near = m.frames.get((pos.ceil() as usize).min(m.frames.len() - 1)).filter(|f| is_model(f));
+        let mut want: Vec<(bool, i64, u8)> = Vec::new();
+        if let (Some(f), Some(first)) = (near, m.frames.iter().find(|f| is_model(f))) {
+            let (outside, interp, step) =
+                (matches!(f.source, RadarFrameSource::NoaaHrrr(..)), forecast_interpolation(), 3600 / ECCC_SUBSTEPS as i64);
+            let ts = tl.ts_at_pos(pos).max(first.time_unix);
+            for j in 0..=(if self.radar.playing { AHEAD } else { 1 }) {
+                let (s0, next) = RainViewerFrame::eccc_blend_at(ts + j * step, interp);
+                for slot in std::iter::once(s0).chain(next.map(|n| n.0)) {
+                    if !want.contains(&(outside, slot.0, slot.1)) {
+                        want.push((outside, slot.0, slot.1));
+                    }
+                }
+            }
+        }
+        let vp = (self.viewport_size(), self.center_lat, self.center_lon, self.zoom);
+        let Ok(mut pool) = self.pool.lock() else { return };
+        let mut keep: Vec<u32> = Vec::with_capacity(want.len() * 3);
+        for (rank, &key) in want.iter().enumerate() {
+            let ids = self.eccc_slot_ids(&mut pool, key);
+            keep.extend(ids);
+            for (model, id) in EcccModel::ALL.into_iter().zip(ids) {
+                for_each_visible_tile_biased(vp, model.max_native_zoom(), model.zoom_bias(), |z, x, y, _| {
+                    if eccc_tier_tile_needed(model, key.0, z, x, y, vp) {
+                        let prio = PRIO_MAX.saturating_sub(rank.min(8) as u8);
+                        let _ = pool.ensure_id_prio(
+                            id,
+                            (z, x, y),
+                            || eccc::job_spec(model, key.1, key.2),
+                            Duration::from_secs(3600),
+                            prio,
+                            true,
+                        );
+                    }
+                    true
+                });
+            }
+        }
+        pool.drop_tiles_where(|id, name| name.starts_with("eccc_") && !eccc::is_source_ns(name) && !keep.contains(&id));
+    }
+
     fn prewarm_radar_frame(&self, host: &str, f: &RainViewerFrame, prio: u8) -> bool {
         let Ok(mut p) = self.pool.lock() else { return true };
         let vp = (self.viewport_size(), self.center_lat, self.center_lon, self.zoom);
@@ -1441,6 +1547,9 @@ impl MapEngine {
         if matches!(self.overlay, WeatherOverlay::RadarTimeline | WeatherOverlay::InfraredClouds) && (self.radar.playing || radar_idle) {
             self.prewarm_timeline_strip();
         }
+        if self.overlay == WeatherOverlay::RadarTimeline {
+            self.stream_eccc_slots();
+        }
         if self.radar.playing
             && let Some(tl) = self.active_timeline()
             && tl.times.len() > 1
@@ -1457,137 +1566,60 @@ impl MapEngine {
                 }
             } else {
                 self.radar.loop_hold = 0.0;
-                let ni = (ci + 1).min(max_i);
-                let n2 = (ci + 2).min(max_i);
-                // Smooth media-player readiness & hysteresis buffer gate:
-                // - A frame is playback-ready as soon as `all_ready || visually_covered || core_ready` (100% of core
-                //   viewport settled & >=80% total settled; any far-outer corner sliver is filled seamlessly via
-                //   `temporal_fallbacks` with ZERO stop-start edge-tile stutter!).
-                // - Only pause to buffer when the CORE viewport is actually missing tiles; once buffering, hold cleanly
-                //   until `ci` + `ni` (plus `n2` during short initial buffer) are ready so playback resumes smoothly
-                //   without start-stop chugging, capped at 0.85s with `skip_stall_idx` preventing double-stalls!
-                let full_ready = FrameReadiness { all_ready: true, visually_covered: true, core_ready: true };
-                let (r0, r1, r2) = if self.overlay == WeatherOverlay::RadarTimeline
-                    && let Some(m) = &self.manifest
-                    && let Ok(mut pool) = self.pool.lock()
-                {
-                    let vp = (self.viewport_size(), self.center_lat, self.center_lon, self.zoom);
-                    let temp_pair = |idx: usize| -> [Option<u32>; 2] {
-                        let same = |k: Option<usize>| {
-                            let f = m.frames.get(idx)?;
-                            let nf = m.frames.get(k?)?;
-                            (matches!(nf.source, RadarFrameSource::NoaaHrrr(..)) == matches!(f.source, RadarFrameSource::NoaaHrrr(..)))
-                                .then(|| self.manifest_ns_ids.get(k?).and_then(|a| a[0]))
-                                .flatten()
-                        };
-                        [same(idx.checked_sub(1)), same((idx + 1 < m.frames.len()).then_some(idx + 1))]
-                    };
-                    let r0 = m.frames.get(ci).map_or(full_ready, |f| {
-                        radar_frame_readiness_ids(f, self.manifest_ns_ids.get(ci).copied(), temp_pair(ci), &pool, vp)
-                    });
-                    let r1 = m.frames.get(ni).map_or(full_ready, |f| {
-                        radar_frame_readiness_ids(f, self.manifest_ns_ids.get(ni).copied(), temp_pair(ni), &pool, vp)
-                    });
-                    let r2 = if n2 != ni {
-                        m.frames.get(n2).map_or(full_ready, |f| {
-                            radar_frame_readiness_ids(f, self.manifest_ns_ids.get(n2).copied(), temp_pair(n2), &pool, vp)
-                        })
-                    } else {
-                        full_ready
-                    };
-                    if !r0.all_ready
-                        && let Some(f) = m.frames.get(ci)
-                    {
-                        let _ = ensure_radar_frame_visible(&mut pool, &m.host, f, vp, PRIO_MAX, true);
+                // Seconds of wall-clock time the step from frame `i` to `i + 1` takes at 1×. Observed radar keeps its
+                // established 0.38 s per 10-minute step; model frames run at a constant 60 minutes of forecast per
+                // second, so the loop never changes pace as it moves through the hours.
+                let step_secs = |i: usize| -> f32 {
+                    let j = (i + 1).min(max_i);
+                    match self.overlay {
+                        WeatherOverlay::RadarTimeline => {
+                            let model = self.manifest.as_ref().is_some_and(|m| {
+                                [i, j].iter().all(|&k| m.frames.get(k).is_some_and(|f| !matches!(f.source, RadarFrameSource::Tile(..))))
+                            });
+                            if model { (tl.times[j] - tl.times[i]).max(300) as f32 / 3600.0 } else { 0.38 }
+                        }
+                        // 12 hourly global IR frames (~6.2s per smooth loop at 1×).
+                        WeatherOverlay::InfraredClouds => 0.52,
+                        _ => 0.25,
                     }
-                    if !r1.all_ready
-                        && let Some(f) = m.frames.get(ni)
-                    {
-                        let _ = ensure_radar_frame_visible(&mut pool, &m.host, f, vp, PRIO_MAX - 1, true);
-                    }
-                    (r0, r1, r2)
-                } else if self.overlay == WeatherOverlay::InfraredClouds
-                    && let Some(m) = &self.manifest
-                    && !m.satellite.is_empty()
-                    && let Ok(mut pool) = self.pool.lock()
-                {
-                    let vp = (self.viewport_size(), self.center_lat, self.center_lon, self.zoom);
-                    let sat_pair = |idx: usize| -> [Option<u32>; 2] {
-                        [idx.checked_sub(1).and_then(|k| self.sat_ns_ids.get(k).copied()), self.sat_ns_ids.get(idx + 1).copied()]
-                    };
-                    let r0 = self.sat_ns_ids.get(ci).copied().map_or(full_ready, |id| sat_frame_readiness_id(id, sat_pair(ci), &pool, vp));
-                    let r1 = self.sat_ns_ids.get(ni).copied().map_or(full_ready, |id| sat_frame_readiness_id(id, sat_pair(ni), &pool, vp));
-                    let r2 = if n2 != ni {
-                        self.sat_ns_ids.get(n2).copied().map_or(full_ready, |id| sat_frame_readiness_id(id, sat_pair(n2), &pool, vp))
-                    } else {
-                        full_ready
-                    };
-                    if !r0.all_ready
-                        && let Some(f) = m.satellite.get(ci)
-                    {
-                        let _ = ensure_sat_frame_visible(&mut pool, &m.host, f, vp, PRIO_MAX, true);
-                    }
-                    if !r1.all_ready
-                        && let Some(f) = m.satellite.get(ni)
-                    {
-                        let _ = ensure_sat_frame_visible(&mut pool, &m.host, f, vp, PRIO_MAX - 1, true);
-                    }
-                    (r0, r1, r2)
-                } else {
-                    (full_ready, full_ready, full_ready)
                 };
-                let playable = |r: FrameReadiness| r.all_ready || r.visually_covered || r.core_ready;
-                let r0_ok = playable(r0) || self.radar.skip_stall_idx == Some(ci);
-                let r1_ok = playable(r1) || self.radar.skip_stall_idx == Some(ni);
-                let r2_ok = playable(r2);
-                let frac = (base - ci as f32).clamp(0.0, 1.0);
-                let trigger_wait = !r0_ok || (frac >= 0.90 && !r1_ok);
-                if trigger_wait {
-                    self.radar.buffering = true;
-                } else if self.radar.buffering {
-                    let runway_ready = r0_ok && r1_ok && (r2_ok || self.radar.stall_secs >= 0.45);
-                    if runway_ready {
-                        self.radar.buffering = false;
-                        self.radar.stall_secs = 0.0;
+                // Playback never pauses mid-loop. Pressing Play pre-rolls once: it waits (at most `PREROLL_CAP` seconds)
+                // until the frames for the next `RUNWAY_SECS` of playback are loaded. Loading then stays ahead of the
+                // playhead (frames arrive several times faster than they are shown), and a tile that is still late when
+                // its frame comes up is bridged by its neighbor in time.
+                const RUNWAY_SECS: f32 = 2.0;
+                const PREROLL_CAP: f32 = 3.0;
+                if self.radar.preroll {
+                    let vp = (self.viewport_size(), self.center_lat, self.center_lon, self.zoom);
+                    let (mut last, mut runway) = (ci, 0.0_f32);
+                    while last < max_i && runway < RUNWAY_SECS {
+                        runway += step_secs(last);
+                        last += 1;
+                    }
+                    // Every frame of the runway is checked (and, if incomplete, requested) — no short-circuit.
+                    let mut ready = true;
+                    if let Ok(mut pool) = self.pool.lock() {
+                        for i in ci..=last {
+                            ready &= self.timeline_frame_ready(&mut pool, i, vp);
+                        }
+                    }
+                    if ready || self.radar.stall_secs >= PREROLL_CAP {
+                        (self.radar.preroll, self.radar.quiet_preroll, self.radar.buffering, self.radar.stall_secs) =
+                            (false, false, false, 0.0);
+                    } else {
+                        self.radar.buffering = true;
+                        self.radar.stall_secs += dt;
                     }
                 }
-                const STALL_CAP: f32 = 0.85;
-                if self.radar.buffering && self.radar.stall_secs < STALL_CAP {
-                    self.radar.stall_secs += dt;
-                } else {
-                    if self.radar.buffering {
-                        // Safety cap reached: skip re-stalling on the exact same frame when stepping across `ni`!
-                        self.radar.skip_stall_idx = Some(if !r0_ok { ci } else { ni });
-                        self.radar.buffering = false;
-                        self.radar.stall_secs = 0.0;
-                    }
-                    let dur = if self.overlay == WeatherOverlay::RadarTimeline {
-                        let mins = (tl.times[ni] - tl.times[ci]).max(300) as f32 / 60.0;
-                        if mins <= 15.0 {
-                            0.38
-                        } else if mins <= 30.0 {
-                            0.48
-                        } else {
-                            0.58
-                        }
-                    } else if self.overlay == WeatherOverlay::InfraredClouds {
-                        // 12 hourly global IR frames (~6.2s per smooth loop at 1×).
-                        0.52
-                    } else {
-                        // Uniform 12-hour forecast playback (~6.0s per loop at 1×).
-                        0.25
-                    } / self.playback_speed.clamp(0.5, 2.0);
+                if !self.radar.preroll {
+                    let dur = step_secs(ci) / self.playback_speed.clamp(0.5, 2.0);
                     let np = (base + dt / dur).min(max_i as f32);
-                    let new_ci = (np.floor() as usize).min(max_i);
-                    if new_ci != ci && self.radar.skip_stall_idx == Some(ci) {
-                        self.radar.skip_stall_idx = None;
-                    }
-                    (self.radar.play_pos, self.radar.target_pos, self.radar.frame_idx) = (np, np, new_ci);
+                    (self.radar.play_pos, self.radar.target_pos, self.radar.frame_idx) = (np, np, (np.floor() as usize).min(max_i));
                 }
             }
             dirty = true;
         } else if self.overlay.has_timeline() {
-            (self.radar.stall_secs, self.radar.buffering, self.radar.skip_stall_idx) = (0.0, false, None);
+            (self.radar.stall_secs, self.radar.buffering) = (0.0, false);
             let diff = self.radar.target_pos - self.radar.play_pos;
             if diff.abs() > 0.006 {
                 if diff.abs() > 1.5 {
@@ -1697,10 +1729,9 @@ impl MapEngine {
             self.radar.loop_hold,
             self.radar.stall_secs,
             self.radar.buffering,
-            self.radar.skip_stall_idx,
             self.radar.frame_idx,
             self.radar.target_pos,
-        ) = (false, 0.0, 0.0, false, None, clamped, clamped as f32);
+        ) = (false, 0.0, 0.0, false, clamped, clamped as f32);
         if self.overlay == WeatherOverlay::RadarTimeline
             && let Some(m) = &self.manifest
         {
@@ -1734,6 +1765,12 @@ impl MapEngine {
                     self.prewarm_viewport_base(self.base_style, self.zoom, (l.lat, l.lon), target_sz);
                 }
                 (self.last_prewarmed_strip, self.last_grid_poll) = (None, None);
+                // Like Apple Weather, the precipitation map animates as soon as it opens (Pause stops it). The loop's
+                // one pre-roll runs while the map is opening, so the user never waits after pressing a button.
+                if self.overlay == WeatherOverlay::RadarTimeline && !self.radar.playing {
+                    (self.radar.playing, self.radar.preroll, self.radar.quiet_preroll) = (true, true, true);
+                    (self.radar.loop_hold, self.radar.stall_secs, self.radar.buffering, self.last_tick) = (0.0, 0.0, false, Instant::now());
+                }
                 if matches!(self.overlay, WeatherOverlay::RadarTimeline | WeatherOverlay::InfraredClouds) {
                     self.prewarm_timeline_strip();
                 } else {
@@ -1754,8 +1791,7 @@ impl MapEngine {
                     self.radar.loop_hold,
                     self.radar.stall_secs,
                     self.radar.buffering,
-                    self.radar.skip_stall_idx,
-                ) = (CamMotion::Idle, false, false, None, false, 0.0, 0.0, false, None);
+                ) = (CamMotion::Idle, false, false, None, false, 0.0, 0.0, false);
                 return Some(MapExternalAction::SetExpanded(false));
             }
             MapMsg::ToggleFullScreen => {
@@ -1779,7 +1815,7 @@ impl MapEngine {
                     (ts, self.radar.play_pos <= tl.live_idx as f32 + 0.02 && self.radar.play_pos >= tl.live_idx as f32 - 0.02)
                 });
                 (self.overlay, self.show_layer_menu, self.context_menu, self.last_grid_poll) = (ov, false, None, None);
-                (self.radar.loop_hold, self.radar.stall_secs, self.radar.buffering, self.radar.skip_stall_idx) = (0.0, 0.0, false, None);
+                (self.radar.loop_hold, self.radar.stall_secs, self.radar.buffering) = (0.0, 0.0, false);
                 self.last_rendered_radar_idx.set(None);
                 if !ov.has_timeline() {
                     self.radar.playing = false;
@@ -1942,14 +1978,10 @@ impl MapEngine {
             }
             MapMsg::ToggleRadarPlay => {
                 if self.overlay.has_timeline() {
-                    (
-                        self.radar.playing,
-                        self.radar.loop_hold,
-                        self.radar.stall_secs,
-                        self.radar.buffering,
-                        self.radar.skip_stall_idx,
-                        self.last_tick,
-                    ) = (!self.radar.playing, 0.0, 0.0, false, None, Instant::now());
+                    (self.radar.playing, self.radar.loop_hold, self.radar.stall_secs, self.radar.buffering, self.last_tick) =
+                        (!self.radar.playing, 0.0, 0.0, false, Instant::now());
+                    // Every press of Play gets one pre-roll; after it playback never pauses.
+                    (self.radar.preroll, self.radar.quiet_preroll) = (self.radar.playing, false);
                     if self.radar.playing {
                         if let Some(tl) = self.active_timeline()
                             && self.radar.play_pos >= tl.max_idx() as f32 - 0.05
@@ -1994,8 +2026,7 @@ impl MapEngine {
             }
             MapMsg::ScrubRadar(idx) => self.jump_radar_idx(idx, true),
             MapMsg::ScrubRadarPos(pos) => {
-                (self.radar.playing, self.radar.loop_hold, self.radar.stall_secs, self.radar.buffering, self.radar.skip_stall_idx) =
-                    (false, 0.0, 0.0, false, None);
+                (self.radar.playing, self.radar.loop_hold, self.radar.stall_secs, self.radar.buffering) = (false, 0.0, 0.0, false);
                 if let Some(tl) = self.active_timeline() {
                     let mx = tl.max_idx();
                     let c = pos.clamp(0.0, mx as f32);
@@ -2205,13 +2236,19 @@ impl<M> MapCanvas<'_, M> {
         }
         let pos = self.engine.radar.play_pos.clamp(0.0, (len - 1) as f32);
         let (a, rf) = ((pos.floor() as usize).min(len - 1), (pos - pos.floor()).clamp(0.0, 1.0));
-        if rf > 0.02 && a + 1 < len {
-            if rf >= 0.98 {
-                return (a + 1, None, 0.0);
-            }
-            // Constant-velocity linear crossfade during continuous playback (zero frame-boundary pulsing!); smooth ease when manually scrubbing.
-            let b = if self.engine.radar.playing { rf } else { rf * rf * (3.0 - 2.0 * rf) };
-            (a, Some(a + 1), b)
+        if a + 1 >= len || rf <= 0.0 {
+            return (a, None, 0.0);
+        }
+        if self.engine.radar.playing {
+            // Continuous playback blends at constant velocity with no dead zone around each frame: snapping to a
+            // single frame near the ends of every interval made the incoming frame pop in.
+            return (a, Some(a + 1), rf);
+        }
+        // Manual scrubbing eases between frames and settles exactly on the nearest one.
+        if rf >= 0.98 {
+            (a + 1, None, 0.0)
+        } else if rf > 0.02 {
+            (a, Some(a + 1), rf * rf * (3.0 - 2.0 * rf))
         } else {
             (a, None, 0.0)
         }
@@ -2261,173 +2298,173 @@ impl<M> MapCanvas<'_, M> {
         let Some(m) = self.engine.manifest.as_ref().filter(|m| !m.frames.is_empty()) else { return };
         let (i0, i1_opt, blend) = self.radar_blend(m);
         let rf0 = &m.frames[i0];
-        let ids_of = |idx: usize| self.engine.manifest_ns_ids.get(idx).copied();
-        let resolve_ids = |p: &mut SharedTilePool, idx: usize, rf: &RainViewerFrame| -> [Option<u32>; 4] {
-            let cached = ids_of(idx).unwrap_or([None; 4]);
-            let pid = cached[0].or_else(|| rf.tile_namespace().map(|ns| p.intern(&ns)));
-            let tiers = rf.eccc_tier_namespaces();
-            let h = cached[1].or_else(|| tiers.as_ref().map(|t| p.intern(&t[0])));
-            let r = cached[2].or_else(|| tiers.as_ref().map(|t| p.intern(&t[1])));
-            let g = cached[3].or_else(|| tiers.as_ref().map(|t| p.intern(&t[2])));
-            [pid, h, r, g]
-        };
-        let ids0 = resolve_ids(pool, i0, rf0);
         let rf1 = i1_opt.and_then(|i| m.frames.get(i).map(|f| (i, f)));
-        let ids1 = rf1.map_or([None; 4], |(i, f)| resolve_ids(pool, i, f));
-        pool.set_active_weather_ns([ids0[0], ids0[1], ids0[2], ids0[3], ids1[0], ids1[1], ids1[2], ids1[3]]);
+        let is_model = |f: &RainViewerFrame| !matches!(f.source, RadarFrameSource::Tile(..));
+        let primary_of = |p: &mut SharedTilePool, idx: usize, rf: &RainViewerFrame| -> Option<u32> {
+            self.engine.manifest_ns_ids.get(idx).copied().flatten().or_else(|| rf.tile_namespace().map(|ns| p.intern(&ns)))
+        };
+        let (pid0, pid1) = (primary_of(pool, i0, rf0), rf1.and_then(|(i, f)| primary_of(pool, i, f)));
+        let interp = forecast_interpolation();
+        // Model time being shown: ECCC is drawn from the interpolation slots around this instant, independently of the
+        // timeline's quarter-hour frames, so rain keeps travelling smoothly between them.
+        let model_ts = match rf1 {
+            Some((_, f1)) if is_model(rf0) && is_model(f1) => {
+                Some(rf0.time_unix + ((f1.time_unix - rf0.time_unix) as f64 * blend as f64).round() as i64)
+            }
+            Some((_, f1)) if is_model(f1) => Some(f1.time_unix),
+            _ => is_model(rf0).then_some(rf0.time_unix),
+        };
+        let outside_hrrr = [Some(rf0), rf1.map(|x| x.1)].into_iter().flatten().any(|f| matches!(f.source, RadarFrameSource::NoaaHrrr(..)));
+        let slots = model_ts.map(|ts| RainViewerFrame::eccc_blend_at(ts, interp));
+        let slot_ids = |p: &mut SharedTilePool, slot: (i64, u8)| self.engine.eccc_slot_ids(p, (outside_hrrr, slot.0, slot.1));
+        let (e0, e1) = match slots {
+            Some((s0, next)) => (Some(slot_ids(pool, s0)), next.map(|(s1, _)| slot_ids(pool, s1))),
+            None => (None, None),
+        };
+        let tier = |e: Option<[u32; 3]>, t: usize| e.map(|a| a[t]);
+        pool.set_active_weather_ns([pid0, pid1, tier(e0, 0), tier(e0, 1), tier(e0, 2), tier(e1, 0), tier(e1, 1), tier(e1, 2)]);
 
-        // Draws one complete timeline frame: its ECCC tiers (coarsest first) under its primary radar / HRRR layer.
-        // A tile that hit a transient network error is bridged by the same tile of an adjacent same-source frame.
-        let draw_rf_single = |fr: &mut Frame, p: &mut SharedTilePool, idx: usize, rf: &RainViewerFrame, op: f32, shift: (f32, f32)| {
+        // ECCC tiers (coarsest first) of one interpolation slot. A tile that is not built yet is bridged by the same
+        // tile of the other slot being drawn, which is at most 7.5 minutes of storm travel away.
+        let draw_eccc_slot = |fr: &mut Frame, p: &mut SharedTilePool, slot: (i64, u8), ids: [u32; 3], other: Option<[u32; 3]>, op: f32| {
             if op <= 0.015 {
                 return;
             }
-            let ids = resolve_ids(p, idx, rf);
-            let is_hrrr = matches!(rf.source, RadarFrameSource::NoaaHrrr(..));
-            let neighbor = |j: Option<usize>| -> Option<[Option<u32>; 4]> {
-                let k = j?;
-                let nf = m.frames.get(k)?;
-                (std::mem::discriminant(&nf.source) == std::mem::discriminant(&rf.source)).then(|| ids_of(k)).flatten()
-            };
-            let nb = [neighbor(idx.checked_sub(1)), neighbor(Some(idx + 1))];
-            if matches!(rf.source, RadarFrameSource::NoaaHrrr(..) | RadarFrameSource::EcccNwp) {
-                let (h0, q) = rf.eccc_slot();
-                for (slot, model) in [(3, EcccModel::Gdps), (2, EcccModel::Rdps), (1, EcccModel::Hrdps)] {
-                    let Some(eid) = ids[slot] else { continue };
-                    let el = TileLayer::overlay(
-                        "",
-                        TileLayerKind::Weather,
-                        model.max_native_zoom(),
-                        op,
-                        Duration::from_secs(3600),
-                        allow_fetch,
-                        false,
-                    )
-                    .with_zoom_bias(model.zoom_bias())
-                    .with_temporal_fallbacks(nb.map(|n| n.and_then(|a| a[slot])))
-                    .with_shift_px(shift);
-                    draw_tile_layer_filtered(
-                        fr,
-                        p,
-                        eid,
-                        vp,
-                        el,
-                        |z, x, y| eccc_tier_tile_needed(model, is_hrrr, z, x, y, vp),
-                        |_, _, _| eccc::job_spec(model, h0, q),
-                    );
-                }
+            for (t, model) in [(2, EcccModel::Gdps), (1, EcccModel::Rdps), (0, EcccModel::Hrdps)] {
+                let el = TileLayer::overlay(
+                    "",
+                    TileLayerKind::Weather,
+                    model.max_native_zoom(),
+                    op,
+                    Duration::from_secs(3600),
+                    allow_fetch,
+                    false,
+                )
+                .with_zoom_bias(model.zoom_bias())
+                .with_temporal_fallbacks([other.map(|o| o[t]), None]);
+                draw_tile_layer_filtered(
+                    fr,
+                    p,
+                    ids[t],
+                    vp,
+                    el,
+                    |z, x, y| eccc_tier_tile_needed(model, outside_hrrr, z, x, y, vp),
+                    |_, _, _| eccc::job_spec(model, slot.0, slot.1),
+                );
             }
-            let Some(pid) = ids[0] else { return };
-            let l = TileLayer::overlay("", TileLayerKind::Weather, rf.max_native_zoom(), op, Duration::from_secs(3600), allow_fetch, false)
-                .with_zoom_bias(rf.primary_zoom_bias())
-                .with_temporal_fallbacks(nb.map(|n| n.and_then(|a| a[0])))
-                .with_shift_px(shift);
-            draw_tile_layer_filtered(
-                fr,
-                p,
-                pid,
-                vp,
-                l,
-                |z, x, y| !is_hrrr || overlays::tile_intersects_hrrr(z, x, y),
-                |z, x, y| rf.tile_url(&m.host, z, x, y).unwrap_or_default(),
-            );
         };
-        // Prefer 100% settled/zoom-covered frames; if only a far-outer corner sliver is still loading (`core_ready`),
-        // allow seamless rendering via `temporal_fallbacks` so 1 slow corner tile NEVER freezes the map!
-        let temp_pair = |idx: usize| -> [Option<u32>; 2] {
-            let same = |k: Option<usize>| {
-                let f = m.frames.get(idx)?;
-                let nf = m.frames.get(k?)?;
-                (matches!(nf.source, RadarFrameSource::NoaaHrrr(..)) == matches!(f.source, RadarFrameSource::NoaaHrrr(..)))
-                    .then(|| ids_of(k?).and_then(|a| a[0]))
-                    .flatten()
+        let draw_eccc = |fr: &mut Frame, p: &mut SharedTilePool, op: f32| match (slots, e0, e1) {
+            (Some((s0, Some((s1, f)))), Some(a), Some(b)) => {
+                draw_eccc_slot(fr, p, s0, a, Some(b), op * (1.0 - f).powf(NWP_DISSOLVE_EXP));
+                draw_eccc_slot(fr, p, s1, b, Some(a), op * f.powf(NWP_DISSOLVE_EXP));
+            }
+            (Some((s0, _)), Some(a), _) => draw_eccc_slot(fr, p, s0, a, None, op),
+            _ => {}
+        };
+        // Primary radar / HRRR layer of one timeline frame; a tile that hit a transient network error is bridged by
+        // the same tile of an adjacent same-source frame.
+        let draw_primary =
+            |fr: &mut Frame, p: &mut SharedTilePool, idx: usize, rf: &RainViewerFrame, pid: Option<u32>, op: f32, shift: (f32, f32)| {
+                let Some(pid) = pid.filter(|_| op > 0.015) else { return };
+                let is_hrrr = matches!(rf.source, RadarFrameSource::NoaaHrrr(..));
+                let neighbor = |j: Option<usize>| -> Option<u32> {
+                    let k = j?;
+                    let nf = m.frames.get(k)?;
+                    (std::mem::discriminant(&nf.source) == std::mem::discriminant(&rf.source))
+                        .then(|| self.engine.manifest_ns_ids.get(k).copied().flatten())
+                        .flatten()
+                };
+                let l =
+                    TileLayer::overlay("", TileLayerKind::Weather, rf.max_native_zoom(), op, Duration::from_secs(3600), allow_fetch, false)
+                        .with_zoom_bias(rf.primary_zoom_bias())
+                        .with_temporal_fallbacks([neighbor(idx.checked_sub(1)), neighbor(Some(idx + 1))])
+                        .with_shift_px(shift);
+                draw_tile_layer_filtered(
+                    fr,
+                    p,
+                    pid,
+                    vp,
+                    l,
+                    |z, x, y| !is_hrrr || overlays::tile_intersects_hrrr(z, x, y),
+                    |z, x, y| rf.tile_url(&m.host, z, x, y).unwrap_or_default(),
+                );
             };
-            [same(idx.checked_sub(1)), same((idx + 1 < m.frames.len()).then_some(idx + 1))]
+        let frame_ready = |p: &SharedTilePool, idx: usize, f: &RainViewerFrame| {
+            let r = radar_frame_readiness_ids(f, self.engine.manifest_ns_ids.get(idx).copied().flatten(), [None; 2], p, vp);
+            (r.all_ready, r.all_ready || r.visually_covered || r.core_ready)
         };
-        let r0 = radar_frame_readiness_ids(rf0, Some(ids0), temp_pair(i0), pool, vp);
-        let r1 = rf1.map(|(i, f)| radar_frame_readiness_ids(f, Some(ids1), temp_pair(i), pool, vp));
-        let rf0_ready = r0.all_ready || r0.visually_covered || r0.core_ready;
-        let next_ok = r1.is_some_and(|r| r.all_ready || r.visually_covered || r.core_ready);
+        let (r0_all, r0_ok) = frame_ready(pool, i0, rf0);
+        let r1 = rf1.map(|(i, f)| frame_ready(pool, i, f));
         if allow_fetch {
-            if !r0.all_ready {
+            if !r0_all {
                 let _ = ensure_radar_frame_visible(pool, &m.host, rf0, vp, PRIO_MAX, true);
             }
-            if let (Some((_, f1)), Some(r1s)) = (rf1, r1)
-                && !r1s.all_ready
-            {
+            if let (Some((_, f1)), Some((false, _))) = (rf1, r1) {
                 let _ = ensure_radar_frame_visible(pool, &m.host, f1, vp, PRIO_MAX - 1, true);
             }
         }
         let base_op = self.engine.overlay_opacity.clamp(0.4, 1.0);
-        if !rf0_ready {
-            if self.interactive {
-                // Hold the exact last complete frame while `rf0` finishes downloading — never jump backwards & forwards in time!
-                let frame_ok = |idx: usize, f: &RainViewerFrame| {
-                    let r = radar_frame_readiness_ids(f, ids_of(idx), temp_pair(idx), pool, vp);
-                    r.all_ready || r.visually_covered || r.core_ready
-                };
-                if let Some(prev_i) = self.engine.last_rendered_radar_idx.get()
-                    && let Some(prev_f) = m.frames.get(prev_i)
-                    && frame_ok(prev_i, prev_f)
-                {
-                    draw_rf_single(frame, pool, prev_i, prev_f, base_op, (0.0, 0.0));
-                    return;
+        let playing = self.engine.radar.playing;
+        if !r0_ok && self.interactive && !playing {
+            // Scrubbed onto a frame that is still downloading: keep showing the last complete frame rather than a
+            // half-loaded one. (During playback frames are never held back — late tiles are bridged in place.)
+            if let Some((pi, pf)) = self
+                .engine
+                .last_rendered_radar_idx
+                .get()
+                .into_iter()
+                .chain((1..=10_usize).filter_map(|d| i0.checked_sub(d)))
+                .filter_map(|i| m.frames.get(i).map(|f| (i, f)))
+                .find(|&(i, f)| frame_ready(pool, i, f).1)
+            {
+                self.engine.last_rendered_radar_idx.set(Some(pi));
+                if is_model(pf) {
+                    let (s, _) = RainViewerFrame::eccc_blend_at(pf.time_unix, interp);
+                    let ids = self.engine.eccc_slot_ids(pool, (matches!(pf.source, RadarFrameSource::NoaaHrrr(..)), s.0, s.1));
+                    draw_eccc_slot(frame, pool, s, ids, None, base_op);
                 }
-                if let Some((fbi, fb)) = (1..=10_usize)
-                    .find_map(|d| i0.checked_sub(d).and_then(|i| m.frames.get(i).map(|f| (i, f))).filter(|&(i, f)| frame_ok(i, f)))
-                {
-                    self.engine.last_rendered_radar_idx.set(Some(fbi));
-                    draw_rf_single(frame, pool, fbi, fb, base_op, (0.0, 0.0));
-                    return;
-                }
+                let pid = primary_of(pool, pi, pf);
+                draw_primary(frame, pool, pi, pf, pid, base_op, (0.0, 0.0));
+                return;
             }
-            // Initial cold load before any earlier frame is viewport-ready: progressively draw `rf0` as tiles arrive.
-            draw_rf_single(frame, pool, i0, rf0, base_op, (0.0, 0.0));
-            return;
         }
-        if self.interactive {
+        if self.interactive && r0_ok {
             self.engine.last_rendered_radar_idx.set(Some(i0));
         }
-        let Some((i1, f1)) = rf1.filter(|_| next_ok && blend > 0.015) else {
-            draw_rf_single(frame, pool, i0, rf0, base_op, (0.0, 0.0));
+        // While scrubbing, wait for the next frame before blending toward it; while playing, always blend.
+        let Some((i1, f1)) = rf1.filter(|_| blend > 0.0 && (playing || r1.is_some_and(|r| r.1))) else {
+            if is_model(rf0) {
+                draw_eccc(frame, pool, base_op);
+            }
+            draw_primary(frame, pool, i0, rf0, pid0, base_op, (0.0, 0.0));
             return;
         };
-        let nwp0 = matches!(rf0.source, RadarFrameSource::NoaaHrrr(..) | RadarFrameSource::EcccNwp);
-        let nwp1 = matches!(f1.source, RadarFrameSource::NoaaHrrr(..) | RadarFrameSource::EcccNwp);
-        if nwp0 != nwp1 {
-            // Cross-source handoff (`LibreWXR` observed/nowcast radar <-> `HRRR`/`ECCC` NWP model):
-            // Use a clean linear cross-dissolve (sum = base_op, zero brightness surge!) with zero cross-source
-            // optical-flow shift so radar coverage dissolves smoothly into full-domain NWP forecast without warping.
-            let w0 = base_op * (1.0 - blend);
-            let w1 = base_op * blend;
-            draw_rf_single(frame, pool, i0, rf0, w0, (0.0, 0.0));
-            draw_rf_single(frame, pool, i1, f1, w1, (0.0, 0.0));
-        } else {
-            // Same-family frames (radar -> radar, or model -> model) are at most 30 minutes of storm travel apart
-            // (hourly ECCC rasters are already motion-interpolated per frame), so a single viewport-wide optical-flow
-            // shift removes the small residual displacement while the two frames cross-dissolve.
-            let layers = |ids: [Option<u32>; 4], f: &RainViewerFrame| -> Vec<(u32, u8, f64)> {
-                let mut v: Vec<(u32, u8, f64)> = Vec::with_capacity(4);
-                if let Some(pid) = ids[0] {
-                    v.push((pid, f.max_native_zoom(), f.primary_zoom_bias()));
+        match (is_model(rf0), is_model(f1)) {
+            (false, true) => {
+                // Hand-off from observed / nowcast radar to the model forecast: a plain linear cross-dissolve, with no
+                // motion shift between two different sources.
+                draw_primary(frame, pool, i0, rf0, pid0, base_op * (1.0 - blend), (0.0, 0.0));
+                draw_eccc(frame, pool, base_op * blend);
+                draw_primary(frame, pool, i1, f1, pid1, base_op * blend, (0.0, 0.0));
+            }
+            (model, _) => {
+                // Same-family frames: ECCC follows its own interpolation slots; the primary layer cross-dissolves
+                // between the two frames with a single viewport-wide optical-flow shift for the residual displacement.
+                let layer = |pid: Option<u32>, f: &RainViewerFrame| pid.map(|id| (id, f.max_native_zoom(), f.primary_zoom_bias()));
+                let (dx, dy) = match (layer(pid0, rf0), layer(pid1, f1)) {
+                    (Some(a), Some(b)) => self.cached_flow_px(pool, &[a], &[b], vp),
+                    _ => (0.0, 0.0),
+                };
+                // Two translucent layers composited source-over are brighter than either alone, so the dissolve
+                // weights must sum to more than 1 without overshooting. Measured on rendered frames, `t^0.8` holds total
+                // model-overlay brightness constant through the dissolve; observed radar keeps its established `sqrt`.
+                let p = if model { NWP_DISSOLVE_EXP } else { 0.5 };
+                if model {
+                    draw_eccc(frame, pool, base_op);
                 }
-                for (slot, model) in [(1, EcccModel::Hrdps), (2, EcccModel::Rdps), (3, EcccModel::Gdps)] {
-                    if let Some(eid) = ids[slot] {
-                        v.push((eid, model.max_native_zoom(), model.zoom_bias()));
-                    }
-                }
-                v
-            };
-            let (dx, dy) = self.cached_flow_px(pool, &layers(ids0, rf0), &layers(ids1, f1), vp);
-            // Two translucent layers composited source-over are brighter than either alone, so the dissolve weights must
-            // sum to more than 1 without overshooting. Measured on rendered frames, `t^0.8` holds total model-overlay
-            // brightness constant through the dissolve (`sqrt` pulsed +8..12% between every pair of model frames);
-            // observed radar keeps its established `sqrt` curve.
-            let p = if nwp0 { NWP_DISSOLVE_EXP } else { 0.5 };
-            let w0 = base_op * (1.0 - blend).powf(p);
-            let w1 = base_op * blend.powf(p);
-            draw_rf_single(frame, pool, i0, rf0, w0, (blend * dx, blend * dy));
-            draw_rf_single(frame, pool, i1, f1, w1, (-(1.0 - blend) * dx, -(1.0 - blend) * dy));
+                draw_primary(frame, pool, i0, rf0, pid0, base_op * (1.0 - blend).powf(p), (blend * dx, blend * dy));
+                draw_primary(frame, pool, i1, f1, pid1, base_op * blend.powf(p), (-(1.0 - blend) * dx, -(1.0 - blend) * dy));
+            }
         }
     }
 
@@ -3183,8 +3220,10 @@ impl<M: Clone> canvas::Program<M> for MapCanvas<'_, M> {
         } else {
             None
         };
+        // Day/night shading follows the forecast instant exactly while scrubbing or playing, and the wall clock to the
+        // minute otherwise.
         let term_bucket =
-            (self.interactive && self.engine.show_terminator).then(|| fts.unwrap_or_else(|| chrono::Utc::now().timestamp()) / 1800);
+            (self.interactive && self.engine.show_terminator).then(|| fts.unwrap_or_else(|| chrono::Utc::now().timestamp() / 60 * 60));
         let dark_ocean = matches!(self.overlay, WeatherOverlay::WindFlow | WeatherOverlay::InfraredClouds)
             || matches!(self.base_style, BaseMapStyle::AppleDark | BaseMapStyle::Satellite);
         let vp = (size, self.cam.0, self.cam.1, self.cam.2);
@@ -3229,12 +3268,21 @@ impl<M: Clone> canvas::Program<M> for MapCanvas<'_, M> {
             }
         };
         let draw_weather = |frame: &mut Frame| {
+            // Rain is drawn in blues: on the light map's powder-blue sea, light rain all but disappears. Like Apple
+            // Weather's precipitation map, mute the basemap toward white under the rain layer (labels stay on top).
+            // The wash is a stretched white image, not a fill: within a layer the renderer draws every fill beneath every
+            // image, so a fill would end up under the basemap tiles.
+            if self.overlay == WeatherOverlay::RadarTimeline && self.base_style == BaseMapStyle::CleanLight {
+                static WHITE_PX: std::sync::LazyLock<adv_image::Handle> =
+                    std::sync::LazyLock::new(|| adv_image::Handle::from_rgba(4, 4, vec![255_u8; 64]));
+                let wash = adv_image::Image::new(WHITE_PX.clone()).filter_method(adv_image::FilterMethod::Linear).opacity(0.55_f32);
+                frame.with_clip(Rectangle::with_size(size), |fr| fr.draw_image(Rectangle::with_size(size), wash));
+            }
             // Draw day/night twilight terminator at the bottom of `weather_cache` (identical z-order: above basemap,
             // below radar/scalar & labels) so `base_cache` has ZERO invalidations across the entire 12-hour loop!
-            if let Some((th, tdst, tfade)) = self
-                .interactive
+            if let Some((th, tdst, tfade)) = (self.interactive && self.engine.show_terminator)
                 .then(|| {
-                    let ts = fts.unwrap_or_else(|| chrono::Utc::now().timestamp());
+                    let ts = fts.unwrap_or_else(|| chrono::Utc::now().timestamp() / 60 * 60);
                     self.engine.build_terminator_overlay_handle(vp, self.base_style, ts)
                 })
                 .flatten()
@@ -3529,6 +3577,13 @@ mod tests {
         let (th0, _, tf0) = eng.build_terminator_overlay_handle((sz, 35.0, -118.0, 4.5), BaseMapStyle::CleanLight, 1_795_200_000).unwrap();
         let (th1, _, tf1) = eng.build_terminator_overlay_handle((sz, 35.4, -117.5, 4.6), BaseMapStyle::CleanLight, 1_795_200_000).unwrap();
         assert_eq!(th0, th1, "expected terminator geo-anchored cache hit");
+        // Twenty minutes later the same texture is reused, slid 5° of longitude west — no snap to a new one.
+        let vp_t = (sz, 35.4, -117.5, 4.6);
+        let (_, r0, _) = eng.build_terminator_overlay_handle(vp_t, BaseMapStyle::CleanLight, 1_795_200_000).unwrap();
+        let (th2, r1, _) = eng.build_terminator_overlay_handle(vp_t, BaseMapStyle::CleanLight, 1_795_201_200).unwrap();
+        assert_eq!(th0, th2, "expected the terminator texture to be slid, not rebuilt");
+        let five_deg_px = 256.0 * 2.0_f32.powf(4.6) * 5.0 / 360.0;
+        assert!((r0.x - r1.x - five_deg_px).abs() < 0.5, "expected a {five_deg_px}px westward slide, got {}", r0.x - r1.x);
         assert!(tf0 > 0.9 && tf1 > 0.9);
         assert!(eng.build_terminator_overlay_handle((sz, 35.0, -118.0, 9.0), BaseMapStyle::CleanLight, 1_795_200_000).is_none());
         // Verify multi-city overview framing (including antimeridian-spanning Tokyo <-> San Francisco).
@@ -3680,15 +3735,21 @@ mod tests {
                     true
                 });
             }
-            if let Some(tiers) = f.eccc_tier_namespaces() {
-                for (model, ens) in EcccModel::ALL.into_iter().zip(tiers) {
-                    let id = pool.intern(&ens);
-                    for_each_visible_tile_biased(vp, model.max_native_zoom(), model.zoom_bias(), |z, x, y, _| {
-                        if eccc_tier_tile_needed(model, is_hrrr, z, x, y, vp) {
-                            pool.insert_ready_for_test(TileKey(id, z, x, y));
-                        }
-                        true
-                    });
+            if !matches!(f.source, RadarFrameSource::Tile(..)) {
+                // A model frame needs the hourly ECCC rasters it is interpolated from.
+                for model in EcccModel::ALL {
+                    for hour in eccc_source_hours(f.time_unix).into_iter().flatten() {
+                        let id = pool.intern(&eccc::source_ns(model, hour));
+                        for_each_visible_tile_biased(vp, model.max_native_zoom(), model.zoom_bias(), |z, x, y, _| {
+                            if eccc_tier_tile_needed(model, is_hrrr, z, x, y, vp) {
+                                // A raster that really is available to the tile builder (here: one with no rain in it).
+                                let (sz, sx, sy) = eccc::source_coord(model, (z, x, y));
+                                eccc::insert_dry_source_for_test(model, hour, (sz, sx, sy));
+                                pool.insert_ready_for_test(TileKey(id, sz, sx, sy));
+                            }
+                            true
+                        });
+                    }
                 }
             }
         };
@@ -3699,23 +3760,19 @@ mod tests {
             assert!(!is_radar_frame_viewport_ready(&f1, &pool, vp));
         }
 
-        // 4. Starting playback with f0 ready and f1 cold: playback glides smoothly across f0 up to frac >= 0.92
-        //    (giving f1 the full frame window to finish downloading!), then buffers cleanly before crossing into cold f1!
+        // 4. Pressing Play with f1 still cold: playback pre-rolls (holds at the start, shown as loading) instead of
+        //    starting and then stalling part-way.
         let bundles = HashMap::new();
         eng.radar.snap(0);
-        eng.radar.playing = true;
+        (eng.radar.playing, eng.radar.preroll) = (true, true);
         for _ in 0..20 {
             eng.last_tick = Instant::now() - Duration::from_millis(50);
             eng.tick(&bundles, true);
         }
-        assert!(eng.radar.stall_secs > 0.0, "expected playback to buffer at end of f0 while f1 is still unloaded");
-        assert!(
-            eng.radar.play_pos >= 0.90 && eng.radar.play_pos < 1.0,
-            "expected play_pos to glide across ready f0 and hold before crossing into cold f1, got {}",
-            eng.radar.play_pos
-        );
+        assert!(eng.radar.preroll && eng.radar.buffering && eng.radar.stall_secs > 0.0, "expected a pre-roll while f1 is unloaded");
+        assert_eq!(eng.radar.play_pos, 0.0, "playback must not start before its runway is loaded");
 
-        // 5. The moment f1's visible tiles finish settling, stall_secs resets to 0 and playback glides smoothly into f1!
+        // 5. The moment f1's tiles settle the pre-roll ends and playback runs.
         {
             let mut pool = eng.pool.lock().unwrap();
             settle_frame(&mut pool, &f1);
@@ -3725,8 +3782,20 @@ mod tests {
             eng.last_tick = Instant::now() - Duration::from_millis(50);
             eng.tick(&bundles, true);
         }
-        assert_eq!(eng.radar.stall_secs, 0.0);
-        assert!(eng.radar.play_pos >= 1.0, "expected smooth progression to frame 1 once settled, got {}", eng.radar.play_pos);
+        assert!(!eng.radar.preroll && !eng.radar.buffering && eng.radar.stall_secs == 0.0);
+        assert!(eng.radar.play_pos > 0.1, "expected playback to run once the runway is loaded, got {}", eng.radar.play_pos);
+
+        // 6. Once running, playback never pauses again — even through a frame whose tiles are not loaded.
+        let cold =
+            RainViewerFrame { time_unix: now + 7200, is_nowcast: true, source: RadarFrameSource::NoaaHrrr("202611231200".into(), 2, true) };
+        eng.set_manifest(RainViewerManifest { host: String::new(), frames: vec![f0.clone(), f1.clone(), cold], satellite: Vec::new() });
+        eng.radar.snap(1);
+        (eng.radar.playing, eng.radar.preroll) = (true, false);
+        for _ in 0..10 {
+            eng.last_tick = Instant::now() - Duration::from_millis(50);
+            eng.tick(&bundles, true);
+        }
+        assert!(!eng.radar.buffering && eng.radar.play_pos > 1.3, "playback stalled mid-loop at {}", eng.radar.play_pos);
     }
 
     #[test]
@@ -3901,20 +3970,21 @@ mod tests {
 
     #[test]
     fn optical_flow_advection_and_continuous_eccc_hours() {
-        // 1. Every forecast frame maps to one ECCC interpolation slot: `q` quarter-hours after UTC hour `h0`.
-        let slot = |t: i64| RainViewerFrame { time_unix: t, is_nowcast: true, source: RadarFrameSource::EcccNwp }.eccc_slot();
-        assert_eq!(slot(1_700_002_800), (1_700_002_800, 0));
-        assert_eq!(slot(1_700_002_800 + 900), (1_700_002_800, 1));
-        assert_eq!(slot(1_700_002_800 + 2700), (1_700_002_800, 3));
-        // Timestamps within 7.5 min of the next hour belong to that hour's own raster, never a 4th quarter.
-        assert_eq!(slot(1_700_002_800 + 3300), (1_700_006_400, 0));
-        // With interpolation switched off, every frame shows the nearest hour the model actually issued.
-        let issued = |t: i64| RainViewerFrame::eccc_slot_at(t, false);
-        assert_eq!((issued(1_700_002_800 + 900), issued(1_700_002_800 + 1800)), ((1_700_002_800, 0), (1_700_006_400, 0)));
-        assert_eq!(issued(1_700_002_800 + 2700), (1_700_006_400, 0));
-        let f =
-            RainViewerFrame { time_unix: 1_700_002_800 + 1800, is_nowcast: true, source: RadarFrameSource::NoaaHrrr("x".into(), 30, true) };
-        assert_eq!(f.eccc_tier_namespaces().unwrap()[1], "eccc_rdps_out_v7_1700002800_2");
+        // 1. Playback time maps onto ECCC interpolation slots, 7.5 minutes apart, so every quarter-hour frame lands on one.
+        const H: i64 = 1_700_002_800;
+        let at = |t: i64, interp: bool| RainViewerFrame::eccc_blend_at(t, interp);
+        assert_eq!((at(H, true), at(H + 900, true), at(H + 2700, true)), (((H, 0), None), ((H, 2), None), ((H, 6), None)));
+        // Between two slots both are drawn, weighted by how far along the playhead is; the last slot of an hour blends
+        // into the next hour's own raster.
+        let (first, next) = at(H + 3300, true);
+        let (second, frac) = next.expect("between slots");
+        assert_eq!((first, second), ((H, 7), (H + 3600, 0)));
+        assert!((frac - 150.0 / 450.0).abs() < 1e-4);
+        // "Model Frames" holds each issued hour and cross-fades to the next around the half hour.
+        assert_eq!((at(H + 900, false), at(H + 2700, false)), (((H, 0), None), ((H + 3600, 0), None)));
+        assert!(matches!(at(H + 1800, false), ((h0, 0), Some(((h1, 0), f))) if h0 == H && h1 == H + 3600 && (f - 0.5).abs() < 1e-4));
+        assert_eq!(at(H + 1800, true), ((H, 4), None));
+        assert_eq!(RainViewerFrame::eccc_slot_namespaces(true, (H, 4))[1], format!("eccc_rdps_out_v8_{H}_4"));
 
         // 2. Optical-flow estimator recovers a moving storm blob's screen-space displacement accurately!
         let (tx, _rx) = mpsc::channel();

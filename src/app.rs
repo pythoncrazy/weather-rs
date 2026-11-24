@@ -1727,9 +1727,13 @@ mod tests {
             (Some(first_id.as_str()), None, None, None)
         );
         assert!((app.map.center_lat - first_lat).abs() < 0.25);
+        // Opening the precipitation map starts the loop by itself; the Play / Pause control toggles it.
         let _ = app.update(Msg::Map(MapMsg::ExpandMap));
-        let _ = app.update(Msg::Map(MapMsg::ToggleRadarPlay));
         assert!(app.ui.map_expanded && app.map.radar_playing());
+        let _ = app.update(Msg::Map(MapMsg::ToggleRadarPlay));
+        assert!(!app.map.radar_playing());
+        let _ = app.update(Msg::Map(MapMsg::ToggleRadarPlay));
+        assert!(app.map.radar_playing());
         let _ = app.update(Msg::Escape);
         assert!(!app.ui.map_expanded && !app.map.radar_playing());
         let _ = app.update(Msg::SearchChanged("London".into()));
@@ -2169,7 +2173,8 @@ mod tests {
         );
         let step: f32 = std::env::var("WEATHER_RS_STRIP_STEP").ok().and_then(|s| s.parse().ok()).unwrap_or(0.25);
         let span: usize = std::env::var("WEATHER_RS_STRIP_SPAN").ok().and_then(|s| s.parse().ok()).unwrap_or(7);
-        let (first, last) = (live_i + 2, (live_i + 2 + span).min(frames.len().saturating_sub(1)));
+        let first_off: usize = std::env::var("WEATHER_RS_STRIP_FIRST").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+        let (first, last) = (live_i + first_off, (live_i + first_off + span).min(frames.len().saturating_sub(1)));
         for (name, lat, lon, zoom) in views {
             (app.map.center_lat, app.map.center_lon, app.map.zoom) = (lat, lon, zoom);
             // Two passes over every integer frame so all tiers / tiles of each frame are fully settled before capturing.
@@ -2189,6 +2194,60 @@ mod tests {
                 app.map.debug_set_play(pos, false);
             }
         }
+    }
+
+    /// Plays the precipitation timeline in real time, exactly as the user would see it, and saves a frame every
+    /// ~50 ms. Prints, per frame, the playhead and whether playback was waiting, so stalls and flicker are measurable.
+    #[test]
+    #[ignore = "visual audit: run with WEATHER_RS_PLAYBACK=/tmp/playback cargo test --release audit_precip_live_playback -- --ignored --nocapture"]
+    fn audit_precip_live_playback() {
+        ensure_fonts_loaded();
+        let mut h = Harness::new(Size::new(1360.0, 860.0), 1.0, iced::Point::new(10.0, 10.0), "WEATHER_RS_PLAYBACK");
+        let mut app = WeatherApp::boot().0;
+        let light = std::env::var("WEATHER_RS_PLAYBACK_THEME").is_ok_and(|t| t == "light");
+        let _ = app.update(Msg::Pref(Pref::Theme(if light { ThemeMode::Light } else { ThemeMode::Dark })));
+        pump(&mut app, 25, 100, true);
+        let _ = app.update(Msg::Map(MapMsg::ExpandMap));
+        let _ = app.update(Msg::Map(MapMsg::SelectOverlay(crate::map::WeatherOverlay::RadarTimeline)));
+        let _ = app.update(Msg::Map(MapMsg::ToggleFullScreen));
+        if let Some((lat, lon, zoom)) = std::env::var("WEATHER_RS_PLAYBACK_VIEW").ok().and_then(|v| {
+            let p: Vec<f64> = v.split(',').filter_map(|x| x.parse().ok()).collect();
+            (p.len() == 3).then(|| (p[0], p[1], p[2]))
+        }) {
+            (app.map.center_lat, app.map.center_lon, app.map.zoom) = (lat, lon, zoom);
+        }
+        if std::env::var_os("WEATHER_RS_PLAYBACK_MODEL_FRAMES").is_some() {
+            let _ = app.update(Msg::Pref(Pref::InterpolateForecast(false)));
+        }
+        // Give the map the same couple of seconds a user spends looking at it before pressing Play.
+        let settle_ms: u64 = std::env::var("WEATHER_RS_PLAYBACK_SETTLE_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(2000);
+        h.pump_render(&mut app, (settle_ms / 50) as usize, 50);
+        let secs: f32 = std::env::var("WEATHER_RS_PLAYBACK_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(16.0);
+        // The loop starts by itself when the map opens; press Play only if something paused it.
+        if !app.map.radar_playing() {
+            let _ = app.update(Msg::Map(MapMsg::ToggleRadarPlay));
+        }
+        let (t0, mut k, mut waited) = (Instant::now(), 0_u32, 0.0_f32);
+        let mut last = t0;
+        while t0.elapsed().as_secs_f32() < secs {
+            let _ = app.update(Msg::Tick);
+            let pos = app.map.debug_play_pos();
+            let wait = app.map.radar.buffering;
+            let _ = h.render(
+                &mut app,
+                &[],
+                Some(&format!("f{k:04}_t{:05}_pos{pos:06.2}{}", t0.elapsed().as_millis(), if wait { "_WAIT" } else { "" })),
+            );
+            let dt = last.elapsed().as_secs_f32();
+            last = Instant::now();
+            if wait {
+                waited += dt;
+            }
+            k += 1;
+            let spent = last.elapsed();
+            std::thread::sleep(Duration::from_millis(45).saturating_sub(spent));
+        }
+        println!("PLAYBACK frames={k} waited={waited:.2}s");
     }
 
     #[test]

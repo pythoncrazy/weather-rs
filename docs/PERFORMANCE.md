@@ -9,6 +9,7 @@ Always set `ICED_TEST_BACKEND=wgpu`. Without it the headless harness can fall ba
 | Benchmark | Command | What it reports |
 | --- | --- | --- |
 | Timeline load, cold cache | `XDG_CACHE_HOME=$(mktemp -d) ICED_TEST_BACKEND=wgpu cargo test --release bench_live_radar_replay_buffering -- --ignored --nocapture` | Time until the first and until every timeline frame is ready, playback stalls, and requests, bytes and latency per upstream host. |
+| Playback smoothness | `WEATHER_RS_PLAYBACK=<dir> ICED_TEST_BACKEND=wgpu cargo test --release audit_precip_live_playback -- --ignored --nocapture` | Plays the precipitation loop in real time and saves a frame about every 55 ms, named with the playhead position and `_WAIT` while playback waits. Prints the total time spent waiting. Add `XDG_CACHE_HOME=$(mktemp -d)` for a cold cache, `WEATHER_RS_PLAYBACK_VIEW=lat,lon,zoom` for another view, and `WEATHER_RS_PLAYBACK_MODEL_FRAMES=1` for the Model Frames setting. |
 | App benchmark | `ICED_TEST_BACKEND=wgpu cargo test --release perf_benchmark -- --ignored --nocapture` | Startup cost, weather fetch latency and bytes, CPU hot paths, and frame times. |
 | End-to-end smoke test | `scripts/e2e-smoke.sh` | Launches the real binary on a virtual display with an empty cache. Reports when each screenshot was taken and the resident memory. |
 
@@ -38,6 +39,38 @@ What changed:
 - **RDPS and GDPS rasters carry a 32-pixel margin** instead of 64. At their coarser resolution that still covers an hour of storm travel.
 - **ECCC is limited to 8 parallel requests** (was 18). ECCC throttles above about 15 requests per second, and 18 parallel requests ran at about 30 per second, which caused multi-second stalls and timeouts. With 8, loading all 12 hours takes longer in the best case, but no request fails, and the hours nearest the playhead still load first.
 - **Frames more than about 3 hours ahead wait 350 ms after the view stops moving**, unless playback is running. A pause in the middle of a pan no longer downloads 12 hours of tiles.
+
+## Precipitation playback (2026-11-24)
+
+Scenario: Pacific Northwest during a frontal passage, 1360×860 window, zoom 6.6, one full loop at 1× (-50 min to +12 h).
+
+| Metric | Before | Now |
+| --- | --- | --- |
+| Wait after pressing Play, warm cache | 0 s | 0 s |
+| Wait after pressing Play, cold cache | 0.5 s, then a further pause at every frame that was not loaded yet | 0.6 s to 2.9 s once (limit 3 s) |
+| Pauses after playback starts | one per unloaded frame | 0 |
+| Whole-picture jumps per loop, not counting the restart | 24 (one every 30 forecast minutes) | 0 |
+| Forecast speed | 15 min per 0.25 s to 0.9 s, changing along the loop | constant 60 forecast minutes per second |
+| Interpolated ECCC frames per hour | 3 (every 15 min) | 7 (every 7.5 min) |
+| Timeline frames | 35 | 55 (HRRR every 15 min for all 12 hours) |
+
+The loop now starts by itself when the precipitation map opens, as in Apple Weather. With an empty cache it began 1.5 s after the map opened; with a warm cache it begins at once. The "wait after pressing Play" rows apply only when the user pauses and presses Play again on frames that are not loaded.
+
+What changed:
+
+- **Playback waits once, before it starts, and never again.** Pressing Play waits until the next 2 seconds of playback are loaded (at most 3 seconds). After that the playhead always moves. Frames load several times faster than they are shown, and a tile that is still late is replaced by the same tile from the adjacent moment until it arrives.
+- **Interpolated ECCC frames are built just ahead of the playhead and dropped behind it.** Only the hourly model rasters are downloaded. The loop keeps about one hour of interpolated frames in memory, so 7.5-minute steps cost no extra network and no extra memory.
+- **ECCC is drawn at the exact playback time**, blended between the two nearest 7.5-minute frames, instead of holding one frame per timeline step.
+- **Day/night shading is off by default** (Apple Weather draws none; the layers menu turns it on), and when on it slides continuously. Before, it moved in 30-minute steps, which changed the brightness of the whole map twice a second during playback.
+- **No dead zones in the cross-dissolve.** Before, each frame was held alone for the first and last 2% of its interval, which made the next frame pop in.
+
+- **HRRR tiles stop at zoom 6** (was 7). HRRR is a 3 km grid. A zoom-6 tile already draws each model cell at least 2 pixels wide, and a zoom-7 tile from IEM repeats the same cells at 4 pixels each (checked by comparing one zoom-6 tile with its four zoom-7 children). Views zoomed past 7.35 now need a quarter of the tiles: the New York scenario (1920×1080, zoom 7.5) went from 1104 IEM requests and 368 kB to 368 requests and 128 kB.
+
+- **A model tier is fetched only where the viewport itself needs it.** The 12% pan margin around the viewport is gone. In the Berkeley scenario it pulled in one extra HRDPS raster for each of 13 forecast hours.
+
+Cold-cache load for the same Berkeley scenario as above, with 55 frames instead of 35: 554 requests, 5.6 MB, 0 failed, every frame ready after 5.9 s, 1.8 s wait after pressing Play immediately. The extra requests are IEM HRRR tiles (414 requests, 1.2 MB, about 3 kB each) for the 20 additional model frames. Bytes per timeline frame fell from 154 kB to 102 kB. ECCC rasters are already requested as WebP.
+
+Not done, on purpose: fetching one viewport-sized ECCC raster per model and hour instead of grid tiles. It would cut this benchmark to about 39 ECCC requests, but every pan would then download all 13 hours again. With grid tiles, four RDPS rasters cover the whole north-east Pacific and western North America and are reused across pans and zooms.
 
 ## App benchmark (2026-11-24)
 

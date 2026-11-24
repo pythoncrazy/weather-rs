@@ -831,7 +831,7 @@ impl MapEngine {
         let dm = ((ts - live_ts) as f64 / 60.0).round() as i64;
         let future = cur_i > live_i || dm > 4;
         let is_live = cur_i == live_i && dm.abs() <= 4;
-        let buffering = self.radar.playing && self.radar.stall_secs >= 0.45;
+        let buffering = self.radar.playing && self.radar.stall_secs >= 0.45 && !self.radar.quiet_preroll;
         let layer = self.overlay.label();
         let (status, scol) = if buffering {
             (format!("{layer} • Buffering…"), h.0[5])
@@ -854,9 +854,16 @@ impl MapEngine {
             self.manifest.as_ref().and_then(|m| m.frames.get(cur_i)).map(|f| match f.source {
                 RadarFrameSource::Tile(..) if !f.is_nowcast => "Radar",
                 RadarFrameSource::Tile(..) => "Radar Nowcast",
-                // Quarter-hour slots between ECCC's hourly model outputs are motion-interpolated by the app, not issued
-                // by the model: say so rather than presenting them as upstream forecast frames.
-                RadarFrameSource::NoaaHrrr(..) | RadarFrameSource::EcccNwp if f.eccc_slot().1 != 0 => "Interpolated Forecast",
+                // Anything between ECCC's hourly model outputs is motion-interpolated by the app, not issued by the
+                // model: say so rather than presenting it as an upstream forecast frame. A running loop is in between
+                // almost all the time, so it keeps the one label instead of flashing the other once per forecast hour.
+                RadarFrameSource::NoaaHrrr(..) | RadarFrameSource::EcccNwp
+                    if crate::providers::forecast_interpolation()
+                        && (self.radar.playing
+                            || !matches!(crate::providers::RainViewerFrame::eccc_blend_at(ts, true), ((_, 0), None))) =>
+                {
+                    "Interpolated Forecast"
+                }
                 RadarFrameSource::NoaaHrrr(..) | RadarFrameSource::EcccNwp => "Model Forecast",
             })
         } else if self.overlay == WeatherOverlay::InfraredClouds {

@@ -881,6 +881,24 @@ impl SharedTilePool {
             !jobs.is_empty()
         });
     }
+    /// Forgets every tile whose namespace `(id, name)` matches `stale` (decoded image, GPU pin, queued pin). Used for
+    /// transient frames — interpolated forecast slots the playhead has left behind — so they never pile up in RAM or
+    /// VRAM. Tiles still being built are left alone and swept on a later call.
+    pub fn drop_tiles_where(&mut self, stale: impl Fn(u32, &str) -> bool) {
+        let mut verdict: FxHashMap<u32, bool> = FxHashMap::default();
+        let names = &self.ns_names;
+        let mut hit = |k: &TileKey| *verdict.entry(k.0).or_insert_with(|| names.get(k.0 as usize).is_some_and(|n| stale(k.0, n)));
+        let before = self.slots.len();
+        self.slots.retain(|k, _| !hit(k));
+        if self.slots.len() == before {
+            return;
+        }
+        self.lru.retain(|k| !hit(k));
+        self.gpu_pins.retain(|k, _| !hit(k));
+        self.gpu_pin_lru.retain(|k| !hit(k));
+        self.gpu_pin_requested.retain(|k| !hit(k));
+        self.pending_gpu_pins.retain(|(k, _)| !hit(k));
+    }
     /// Resolves every derived job parked on source tile `src`: re-runs them once the raster has arrived
     /// (`Some(true)`), puts their tiles into failure cooldown when its download failed (`Some(false)`), or just
     /// forgets them when it was cancelled (`None`) so they can be requested afresh. Returns whether tiles changed state.

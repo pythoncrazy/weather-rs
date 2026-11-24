@@ -139,12 +139,20 @@ pub struct RainViewerFrame {
     pub is_nowcast: bool,
     pub source: RadarFrameSource,
 }
+/// One ECCC interpolation slot: `(UTC hour, index within the hour)`.
+pub type EcccSlot = (i64, u8);
+/// Motion-interpolated ECCC slots per hour (7.5 minutes apart, so every quarter-hour timeline frame lands on a slot).
+pub const ECCC_SUBSTEPS: u8 = 8;
 /// Whether forecast-map frames between hourly ECCC model outputs are motion-interpolated (the user's
 /// "Forecast Map: Smooth / Model Frames" setting).
 static FORECAST_INTERPOLATION: AtomicBool = AtomicBool::new(true);
 /// Applies the forecast-map interpolation setting; call before (re)building the map's timeline namespaces.
 pub fn set_forecast_interpolation(on: bool) {
     FORECAST_INTERPOLATION.store(on, Ordering::Relaxed);
+}
+/// Current forecast-map interpolation setting.
+pub fn forecast_interpolation() -> bool {
+    FORECAST_INTERPOLATION.load(Ordering::Relaxed)
 }
 /// Environment Canada (ECCC GeoMet WMS) multi-tier NWP precipitation rate models, ordered finest to coarsest:
 /// - `Hrdps`: 2.5 km Continental High-Resolution Deterministic Prediction System (Canada + US PNW/Northern US/NE Atlantic, `z=6`).
@@ -210,21 +218,37 @@ impl EcccModel {
 }
 
 impl RainViewerFrame {
-    /// ECCC GeoMet interpolation slot `(h0, q)` for this frame: the frame sits `q` quarter-hours after UTC hour `h0`
-    /// (`q == 0` is the hourly model raster itself; `q` in `1..=3` is synthesized between `h0` and `h0 + 1h`).
-    /// With forecast interpolation switched off, every frame maps to the nearest hour the model actually issued.
-    #[inline]
-    pub fn eccc_slot(&self) -> (i64, u8) {
-        Self::eccc_slot_at(self.time_unix, FORECAST_INTERPOLATION.load(Ordering::Relaxed))
-    }
-    /// See [`Self::eccc_slot`]; `interpolate == false` snaps to the nearest issued hour (`q == 0`).
-    pub fn eccc_slot_at(time_unix: i64, interpolate: bool) -> (i64, u8) {
-        if !interpolate {
-            return ((time_unix + 1800).div_euclid(3600) * 3600, 0);
-        }
+    /// ECCC slots to draw at an arbitrary playback time: the slot at or before it, and — when the time falls between
+    /// two slots — the next slot with its blend weight `0..1`.
+    ///
+    /// Interpolated mode walks the `ECCC_SUBSTEPS` motion-interpolated slots of each hour, so consecutive slots are
+    /// only a few minutes of storm travel apart. Model-frames mode holds each issued hour and cross-fades to the next
+    /// over the ten minutes around the half hour.
+    pub fn eccc_blend_at(time_unix: i64, interpolate: bool) -> (EcccSlot, Option<(EcccSlot, f32)>) {
+        let snap = |first: (i64, u8), second: (i64, u8), frac: f32| {
+            if frac <= 0.02 {
+                (first, None)
+            } else if frac >= 0.98 {
+                (second, None)
+            } else {
+                (first, Some((second, frac)))
+            }
+        };
         let h0 = time_unix.div_euclid(3600) * 3600;
-        let q = (time_unix - h0 + 450) / 900;
-        if q >= 4 { (h0 + 3600, 0) } else { (h0, q as u8) }
+        if !interpolate {
+            let u = ((time_unix - h0 - 1500) as f32 / 600.0).clamp(0.0, 1.0);
+            return snap((h0, 0), (h0 + 3600, 0), u * u * (3.0 - 2.0 * u));
+        }
+        let step = 3600 / ECCC_SUBSTEPS as i64;
+        let k = (time_unix - h0) / step;
+        let slot = |k: i64| if k >= ECCC_SUBSTEPS as i64 { (h0 + 3600, 0) } else { (h0, k as u8) };
+        snap(slot(k), slot(k + 1), (time_unix - h0 - k * step) as f32 / step as f32)
+    }
+    /// Tile namespaces (`[HRDPS, RDPS, GDPS]`) of one ECCC slot, composited as an exact partition of unity outside
+    /// NOAA HRRR (`outside_hrrr`, for `NoaaHrrr` frames) or over the whole globe (for `EcccNwp` frames).
+    pub fn eccc_slot_namespaces(outside_hrrr: bool, (h0, k): (i64, u8)) -> [String; 3] {
+        let mode = if outside_hrrr { "out" } else { "full" };
+        EcccModel::ALL.map(|m| format!("eccc_{}_{mode}_v8_{h0}_{k}", m.tag()))
     }
     /// Official Environment and Climate Change Canada (ECCC GeoMet WMS) real NWP precipitation rate tile URL
     /// (`HRDPS.CONTINENTAL_RT` 2.5 km / `RDPS_10km_PrecipRate` 10 km / `GDPS_15km_PrecipRate` 15 km, all 100% hourly `+1h..+12h`).
@@ -286,23 +310,12 @@ impl RainViewerFrame {
             RadarFrameSource::EcccNwp => None,
         }
     }
-    /// Multi-tier ECCC GeoMet tile namespaces (`[HRDPS 2.5 km, RDPS 10 km, GDPS 15 km]`) composited as an exact
-    /// partition of unity outside NOAA HRRR (`_out_`) for `NoaaHrrr` frames, or globally (`_full_`) for `EcccNwp` frames.
-    /// Each namespace names one interpolation slot (see [`Self::eccc_slot`]).
-    pub fn eccc_tier_namespaces(&self) -> Option<[String; 3]> {
-        let mode = match self.source {
-            RadarFrameSource::NoaaHrrr(..) => "out",
-            RadarFrameSource::EcccNwp => "full",
-            RadarFrameSource::Tile(..) => return None,
-        };
-        let (h0, q) = self.eccc_slot();
-        Some(EcccModel::ALL.map(|m| format!("eccc_{}_{mode}_v7_{h0}_{q}", m.tag())))
-    }
     pub fn max_native_zoom(&self) -> u8 {
         match self.source {
-            // NOAA HRRR 3.0 km CONUS model: regional zooms (`z <= 7.3`) stay at z=5/6 via `primary_zoom_bias = -0.35`,
-            // while deep city zooms (`z >= 7.35`) progressively unlock z=7 (`~0.96 km/px`, 2× sharper!) with instant z=6 fallback.
-            RadarFrameSource::NoaaHrrr(..) => 7,
+            // NOAA HRRR is a 3 km grid. A z=6 tile already draws every model cell at least 2 px wide (~1.9 km/px at
+            // 38°N); IEM's z=7 tiles repeat the very same cells at 4 px each — measured identical data — for four
+            // times the requests, so z=6 is the deepest level worth fetching.
+            RadarFrameSource::NoaaHrrr(..) => 6,
             // LibreWXR / RainViewer 512×512 tiles at z=6 deliver identical ~0.96 km/px density to z=7 @ 256px
             // with 3.6× fewer HTTP requests and 3.6× fewer tile slots on 1440p/4K displays!
             RadarFrameSource::Tile(..) => 6,
@@ -1101,16 +1114,12 @@ impl WeatherClient {
             }
         }
         let live_ts = frames.iter().rfind(|f| !f.is_nowcast).map_or(now, |f| f.time_unix).max(now - 600);
-        // Model forecast frames on a quarter-hour UTC grid: every 15 min through +2h, then every 30 min through +12h.
-        // HRRR is natively 15-minute; hourly ECCC rasters are motion-interpolated onto the same grid (`map::eccc`), so
-        // consecutive frames never differ by more than 30 minutes of storm travel.
-        let first_off: i64 = if frames.iter().any(|f| f.is_nowcast) { 45 } else { 15 };
+        // Model forecast frames every 15 minutes (a quarter-hour UTC grid) through +12h. HRRR is natively 15-minute;
+        // hourly ECCC rasters are motion-interpolated between hours while the timeline plays (`map::eccc`).
         let mut last_ts = frames.last().map_or(live_ts, |f| f.time_unix);
-        let mut off = first_off;
-        while off <= 720 {
-            let grid = if off <= 120 { 900 } else { 1800 };
-            let vt = ((live_ts + off * 60 + grid / 2) / grid) * grid;
-            off += if off < 120 { 15 } else { 30 };
+        let first_off: i64 = if frames.iter().any(|f| f.is_nowcast) { 45 } else { 15 };
+        for off in (first_off..=720).step_by(15) {
+            let vt = ((live_ts + off * 60 + 450) / 900) * 900;
             if vt <= last_ts + 420 {
                 continue;
             }

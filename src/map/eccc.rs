@@ -18,7 +18,7 @@ use super::tiles::{
     AlphaThumb, DecGate, EcccMask, TileCoord, bleed_transparent_edges, build_alpha_thumb, eccc_colorize, eccc_extract_scalar,
     eccc_smooth_scalar,
 };
-use crate::providers::{EcccModel, RainViewerFrame};
+use crate::providers::{ECCC_SUBSTEPS, EcccModel, RainViewerFrame};
 use crate::storage::{delete_cached_tile, load_cached_tile};
 use iced::advanced::image as adv_image;
 use std::collections::{HashMap, VecDeque};
@@ -37,8 +37,8 @@ const NODE_PX: usize = DS * NODE;
 const WIN: isize = 6;
 /// Fastest storm motion the matcher will consider.
 const MAX_SPEED_KMH: f64 = 150.0;
-/// Number of interpolated sub-steps per hour (`q` in `0..SUBSTEPS`; `q == 0` is the hourly raster itself).
-pub(super) const SUBSTEPS: u8 = 4;
+/// Number of interpolated slots per hour (`q` in `0..SUBSTEPS`; `q == 0` is the hourly raster itself).
+const SUBSTEPS: u8 = ECCC_SUBSTEPS;
 
 /// A smoothed scalar precipitation-intensity raster (`t * alpha`, `0..=65535`) for one hourly tile plus its margin.
 /// The tile itself occupies the `TILE×TILE` block at `(ox, oy)`.
@@ -432,7 +432,7 @@ impl<K: std::hash::Hash + Eq + Copy, V: Clone> Fifo<K, V> {
 
 /// `(kind, tier, UTC hour, z, x, y)`; `kind` separates hourly sources (`0`) from flow fields (`1`).
 type MemoKey = (u8, u8, i64, u8, u32, u32);
-static SOURCES: LazyLock<Mutex<Fifo<MemoKey, Option<Arc<Field>>>>> = LazyLock::new(|| Mutex::new(Fifo::new(72)));
+static SOURCES: LazyLock<Mutex<Fifo<MemoKey, Option<Arc<Field>>>>> = LazyLock::new(|| Mutex::new(Fifo::new(160)));
 static FLOWS: LazyLock<Mutex<Fifo<MemoKey, Arc<Flow>>>> = LazyLock::new(|| Mutex::new(Fifo::new(256)));
 /// Per-key single-flight locks so concurrent frames needing the same hourly raster (or flow) fetch / compute it once.
 static KEY_LOCKS: LazyLock<Mutex<HashMap<MemoKey, Arc<Mutex<()>>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -462,8 +462,21 @@ pub(super) struct SourceReq {
     pub url: String,
 }
 
+/// The hourly raster (as an ordinary tile request) that output tile `coord` of `model` is built from at UTC hour
+/// `hour`. Prewarming a timeline only needs these: every interpolated frame is derived from them off-network.
+pub(super) fn source_req(model: EcccModel, hour: i64, coord: TileCoord) -> Option<SourceReq> {
+    let (src, _) = source_tile(model, coord);
+    let url = RainViewerFrame::eccc_wms_request(model, hour, src.0, src.1, src.2, model.gutter_px())?.0;
+    Some(SourceReq { ns: source_ns(model, hour), coord: src, url })
+}
+
+/// Source raster coordinate for output tile `coord` of `model` (see [`source_req`]).
+pub(super) fn source_coord(model: EcccModel, coord: TileCoord) -> TileCoord {
+    source_tile(model, coord).0
+}
+
 /// Tile namespace under which `model`'s hourly raster for UTC hour `hour` is fetched and cached.
-fn source_ns(model: EcccModel, hour: i64) -> String {
+pub(super) fn source_ns(model: EcccModel, hour: i64) -> String {
     format!("eccc_{}_src_g{}_{hour}", model.tag(), model.gutter_px())
 }
 
@@ -494,6 +507,12 @@ pub(super) fn ingest_source(gate: &DecGate, ns: &str, coord: TileCoord, bytes: &
         g.put((0, tier(model), hour, coord.0, coord.1, coord.2), field.clone());
     }
     Some(field.is_some())
+}
+
+/// Test hook: registers `model`'s hourly raster for `src` as downloaded and free of precipitation.
+#[cfg(test)]
+pub(super) fn insert_dry_source_for_test(model: EcccModel, hour: i64, src: TileCoord) {
+    SOURCES.lock().expect("sources").put((0, tier(model), hour, src.0, src.1, src.2), None);
 }
 
 /// `Some(None)` = valid raster without precipitation (stored on disk as a 1-byte sentinel).
@@ -720,7 +739,7 @@ mod tests {
     #[test]
     fn job_spec_round_trips_and_rejects_garbage() {
         assert!(matches!(parse_spec(&job_spec(EcccModel::Rdps, 1_795_510_800, 3)), Some((EcccModel::Rdps, 1_795_510_800, 3))));
-        assert!(parse_spec("eccc-morph:rdps:1795510800:4").is_none());
+        assert!(parse_spec(&format!("eccc-morph:rdps:1795510800:{SUBSTEPS}")).is_none());
         assert!(parse_spec("https://geo.weather.gc.ca/geomet").is_none());
         assert!(is_job_spec(&job_spec(EcccModel::Gdps, 0, 0)) && !is_job_spec("https://example.org/x.png"));
     }
