@@ -851,7 +851,9 @@ impl MapEngine {
                 for b in bundles.values() {
                     let (wspd, wdir) = ts
                         .and_then(|t| b.hourly.iter().min_by_key(|h| (h.timestamp_unix - t).abs()))
-                        .map_or((b.current.wind_speed_mps, b.current.wind_dir_deg), |h| (h.wind_speed_mps, h.wind_dir_deg));
+                        .map_or((b.current.wind_speed_mps, b.current.wind_dir_deg), |h| (h.wind_speed_mps, Some(h.wind_dir_deg)));
+                    // Calm wind has no direction and a zero vector; wind of unknown direction cannot be drawn.
+                    let Some(wdir) = wdir.or((wspd == 0.0).then_some(0.0)) else { continue };
                     let (wu, wv) = crate::providers::wind_uv(wspd, wdir);
                     add_w(b.location.lat, b.location.lon, wu as f64, wv as f64, wspd);
                 }

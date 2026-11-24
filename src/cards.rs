@@ -3,7 +3,8 @@ use crate::astro::compute_moon_info;
 use crate::icons::{UiIcon, WidgetCanvas, icon_svg, owned_widget_canvas, sun_event_svg, weather_icon_svg};
 use crate::map::MapMsg;
 use crate::model::{
-    AlertSeverity, Location, PrecipUnit, PressureUnit, WeatherBundle, WeatherCondition, WindUnit, compass_direction, uv_category,
+    AlertSeverity, DailyForecast, Location, MINUTELY_STEP_SECS, PRESSURE_STEADY_HPA, PrecipUnit, PressureUnit, REFRESH_INTERVAL_SECS,
+    WeatherBundle, WeatherCondition, WindUnit, compass_direction, uv_category, uv_display,
 };
 use crate::style::{
     SkyPalette, alert_card, flat_box, frosted_card, frosted_card_btn, fw, hairline, hud_pill, pbtn, rgb8, rgba8, sleek_scrollable, sp_h,
@@ -104,7 +105,54 @@ fn spec(
     }
 }
 
-/// Zero-allocation stack-buffered YYYY-MM-DD comparison for today's daily forecast row.
+/// Shown wherever the source did not report a value.
+pub(crate) const DASH: &str = "—";
+
+/// WHO sun-protection guidance for the (rounded) UV index.
+fn uv_guidance(uv: f64) -> &'static str {
+    match uv.max(0.0).round() {
+        u if u < 3.0 => "No protection needed",
+        u if u < 8.0 => "Protection needed",
+        _ => "Extra protection",
+    }
+}
+/// UV card sentence, based on the highest real UV value left in the location's day (current value + later hourly
+/// samples of today). Empty when that peak is unknown: nothing is said about the rest of the day from "now" alone.
+pub(crate) fn uv_advice(b: &WeatherBundle, loc: &Location, now: i64, h24: bool) -> String {
+    match b.uv_peak_rest_of_day(loc, now) {
+        None => String::new(),
+        Some((_, pk)) if pk.round() < 3.0 => "Low for the rest of the day.".into(),
+        Some((ts, _)) if ts <= now => "At its highest for the rest of the day.".into(),
+        Some((ts, pk)) => format!("Peaks at {} ({}) around {} today.", uv_display(pk), uv_category(pk), loc.format_local_hour(ts, h24)),
+    }
+}
+/// "Rising" / "Falling" / "Steady" for a 3-hour pressure change taken from the hourly forecast series.
+fn pressure_trend_label(dp: f64) -> &'static str {
+    if dp >= PRESSURE_STEADY_HPA {
+        "Rising"
+    } else if dp <= -PRESSURE_STEADY_HPA {
+        "Falling"
+    } else {
+        "Steady"
+    }
+}
+/// "H:.. L:.." for a daily row; a row covering only the rest of the day says so instead of posing as the day's range.
+pub(crate) fn hi_lo_label(s: &crate::model::Settings, d: &DailyForecast) -> String {
+    let hl = format!("H:{}  L:{}", s.format_temp(d.temp_max_c), s.format_temp(d.temp_min_c));
+    if d.partial { format!("Rest of today  {hl}") } else { hl }
+}
+/// Compact age such as "25 min", "3 h" or "2 d".
+pub(crate) fn format_age(secs: i64) -> String {
+    match secs.max(0) {
+        s if s < 3600 => format!("{} min", (s / 60).max(1)),
+        s if s < 86_400 => format!("{} h", s / 3600),
+        s => format!("{} d", s / 86_400),
+    }
+}
+
+/// Zero-allocation stack-buffered YYYY-MM-DD comparison for today's daily forecast row. Returns `b.daily.len()` (so
+/// `b.daily.get(i)` is `None` and `b.daily[i..]` is empty) when the bundle has no row for today: an older or later row
+/// is never presented as "Today".
 pub(crate) fn today_daily_index_at(b: &WeatherBundle, loc: &Location, now: i64) -> usize {
     let d = loc.local_date(now);
     let (y, m, day) = (d.year(), d.month(), d.day());
@@ -120,11 +168,25 @@ pub(crate) fn today_daily_index_at(b: &WeatherBundle, loc: &Location, now: i64) 
         b'0' + (day / 10) as u8,
         b'0' + (day % 10) as u8,
     ];
-    b.daily.iter().position(|row| row.date.as_bytes() >= &buf[..]).unwrap_or(0)
+    b.daily.iter().position(|row| row.date.as_bytes() == &buf[..]).unwrap_or(b.daily.len())
 }
 
 impl WeatherApp {
-    pub(crate) fn view_hero(&self, b: &WeatherBundle, p: SkyPalette, di: usize) -> El<'static> {
+    /// Unobtrusive data-status line: the age of the oldest data on display once it exceeds the refresh interval, and
+    /// the last refresh error even though a cached bundle is being shown. `None` while everything is current.
+    pub(crate) fn data_status_line(&self, b: &WeatherBundle, now: i64) -> Option<String> {
+        let age = now - b.data_time_unix();
+        let stale = (age > REFRESH_INTERVAL_SECS + 120)
+            .then(|| if b.fetched_unix > 0 { format!("Updated {} ago", format_age(age)) } else { "Update time unknown".into() });
+        let err = self.refresh_error().map(|e| {
+            let short: String = e.chars().take(90).collect();
+            format!("Refresh failed: {short}{}", if short.len() < e.len() { "…" } else { "" })
+        });
+        let parts: Vec<String> = stale.into_iter().chain(err).collect();
+        (!parts.is_empty()).then(|| parts.join(" • "))
+    }
+
+    pub(crate) fn view_hero(&self, b: &WeatherBundle, p: SkyPalette, di: usize, now: i64) -> El<'static> {
         let loc = self.active_location().unwrap_or(&b.location);
         let hd: El<'static> = if loc.is_current_location {
             let tag = row![icon_svg(UiIcon::Locate, 10.5, p.text_secondary), tb("MY LOCATION", 10.5, p.text_secondary)]
@@ -137,9 +199,7 @@ impl WeatherApp {
                 .align_x(Alignment::Center)
                 .into()
         };
-        let hl = b.daily.get(di).map_or_else(String::new, |d| {
-            format!("H:{}  L:{}", self.settings.format_temp(d.temp_max_c), self.settings.format_temp(d.temp_min_c))
-        });
+        let hl = b.daily.get(di).map_or_else(String::new, |d| hi_lo_label(&self.settings, d));
         let mut c = column![
             hd,
             t(self.settings.format_temp(b.current.temp_c), 84.0, p.text_primary),
@@ -147,13 +207,16 @@ impl WeatherApp {
             tb(hl, 14.5, p.text_primary)
         ];
         // macOS Sequoia / Tahoe parity: prominently show Feels Like under H/L when it diverges noticeably from actual temp.
-        if (b.current.feels_like_c - b.current.temp_c).abs() >= 2.5 {
-            c = c.push(tm(format!("Feels Like {}", self.settings.format_temp(b.current.feels_like_c)), 12.5, p.text_secondary));
+        if let Some(fl) = b.current.feels_like_c.filter(|fl| (fl - b.current.temp_c).abs() >= 2.5) {
+            c = c.push(tm(format!("Feels Like {}", self.settings.format_temp(fl)), 12.5, p.text_secondary));
+        }
+        if let Some(status) = self.data_status_line(b, now) {
+            c = c.push(tm(status, 11.0, p.text_muted));
         }
         c.spacing(1).align_x(Alignment::Center).into()
     }
 
-    pub(crate) fn view_alerts_card(&self, b: &WeatherBundle, p: SkyPalette, w: f32) -> El<'static> {
+    pub(crate) fn view_alerts_card(&self, b: &WeatherBundle, p: SkyPalette, w: f32, now: i64) -> El<'static> {
         let accent = match b.alerts.first().map_or(AlertSeverity::Moderate, |a| a.severity) {
             AlertSeverity::Extreme => rgb8(255, 69, 58),
             AlertSeverity::Severe => rgb8(255, 159, 10),
@@ -165,8 +228,19 @@ impl WeatherApp {
         } else {
             (rgba8(255, 255, 255, 0.14), rgba8(255, 255, 255, 0.24), p.text_primary)
         };
-        let hd =
-            row![icon_svg(UiIcon::Alert, 12.5, accent), tb("SEVERE WEATHER", 10.5, p.text_muted)].spacing(5).align_y(Alignment::Center);
+        // Alerts kept from an earlier answer (the feed has not answered since) say when they were fetched.
+        let as_of = b.alerts_fetched_unix.filter(|ts| now - ts > REFRESH_INTERVAL_SECS + 120).map_or_else(String::new, |ts| {
+            let loc = self.active_location().unwrap_or(&b.location);
+            format!("as of {} ({} ago)", loc.format_local_time(ts, self.settings.use_24h_time), format_age(now - ts))
+        });
+        let hd = row![
+            icon_svg(UiIcon::Alert, 12.5, accent),
+            tb("WEATHER ALERTS", 10.5, p.text_muted),
+            sp_w(Fill),
+            tm(as_of, 10.0, p.text_muted)
+        ]
+        .spacing(5)
+        .align_y(Alignment::Center);
         let mut rows: Vec<El<'static>> = vec![hd.into()];
         for (i, a) in b.alerts.iter().enumerate() {
             let open = self.expanded_alert_idx == Some(i);
@@ -181,34 +255,45 @@ impl WeatherApp {
     }
 
     pub(crate) fn view_minutely_card(&self, b: &WeatherBundle, p: SkyPalette, w: f32, now: i64) -> Option<El<'static>> {
-        let raw: Vec<_> = b
+        // One segment per real 15-minute sample, clipped to the next hour: `(start, end, mm/h)`. A sample is stamped with
+        // the end of the 15 minutes it covers. Nothing is interpolated or extended past the last sample: if the data
+        // stops before the hour is up, so does the chart.
+        let segs: Vec<(i64, i64, f64)> = b
             .minutely
             .iter()
-            .filter(|s| s.timestamp_unix >= now - 900 && s.timestamp_unix <= now + 4500)
-            .map(|s| (s.timestamp_unix, s.precip_mm_hr.max(0.0)))
+            .map(|s| ((s.timestamp_unix - MINUTELY_STEP_SECS).max(now), s.timestamp_unix.min(now + 3600), s.precip_mm_hr))
+            .filter(|&(a, e, _)| e > a)
             .collect();
-        if raw.len() < 2 || !raw.iter().any(|&(_, r)| r > 0.06) {
+        if !segs.iter().any(|s| s.2 > 0.0) {
             return None;
         }
-        let samp: Vec<f64> = (0..13)
-            .map(|i| {
-                let ts = now + i * 300;
-                let k = raw.partition_point(|&(t, _)| t < ts);
-                let (a, b) = (raw[k.saturating_sub(1).min(raw.len() - 1)], raw[k.min(raw.len() - 1)]);
-                a.1 + (b.1 - a.1) * ((ts - a.0) as f64 / (b.0 - a.0).max(1) as f64).clamp(0.0, 1.0)
+        let (loc, h24) = (self.active_location().unwrap_or(&b.location), self.settings.use_24h_time);
+        let at = |ts: i64| loc.format_local_time(ts, h24);
+        let wet_now = segs.first().is_some_and(|s| s.0 <= now && s.2 > 0.0);
+        let hl = if wet_now {
+            match (segs.iter().find(|s| s.2 <= 0.0), segs.last()) {
+                (Some(dry), _) => format!("Precipitation forecast to stop around {}.", at(dry.0)),
+                (None, Some(last)) if last.1 < now + 3600 => format!("Precipitation forecast until at least {}.", at(last.1)),
+                _ => "Precipitation forecast through the next hour.".into(),
+            }
+        } else {
+            segs.iter().find(|s| s.2 > 0.0).map_or_else(String::new, |wet| format!("Precipitation forecast to start around {}.", at(wet.0)))
+        };
+        // Twelve 5-minute bars, each showing the rate of the real 15-minute sample that covers it (a restatement of the
+        // sample, not an interpolation). The run stops at the first bar no sample covers and the chart is only as wide
+        // as that run, so the axis stays true to time and nothing is drawn beyond the data.
+        let slots: Vec<f64> = (0..12)
+            .map_while(|k| {
+                let mid = now + k * 300 + 150;
+                segs.iter().find(|s| s.0 <= mid && mid < s.1).map(|s| s.2)
             })
             .collect();
-        if !samp.iter().any(|&r| r > 0.06) {
+        let (n, light) = (slots.len() as u16, p.is_light);
+        if n == 0 {
             return None;
         }
-        let max_r = samp.iter().copied().fold(0.0_f64, f64::max);
-        let hl = if samp[0] <= 0.06 {
-            "Precipitation starting within the hour."
-        } else if max_r > 4.0 {
-            "Heavy precipitation continuing over the next hour."
-        } else {
-            "Precipitation continuing over the next hour."
-        };
+        let bars = owned_widget_canvas(self.bento_sig.get(), WidgetCanvas::Minutely(slots, light), iced::Length::FillPortion(n), 48);
+        let chart = if n < 12 { row![bars, sp_w(iced::Length::FillPortion(12 - n))] } else { row![bars] }.width(Fill);
         let tk = |s: &'static str| text(s).size(10.0).color(p.text_muted);
         let ticks = row![
             tb("Now", 10.0, p.text_primary),
@@ -222,13 +307,7 @@ impl WeatherApp {
             tk("60m")
         ]
         .width(Fill);
-        let col = column![
-            hdr(p, UiIcon::Umbrella, "NEXT-HOUR PRECIPITATION"),
-            tb(hl, 12.5, p.text_primary),
-            owned_widget_canvas(self.bento_sig.get(), WidgetCanvas::Minutely(samp, p.is_light), Fill, 48),
-            ticks
-        ]
-        .spacing(6);
+        let col = column![hdr(p, UiIcon::Umbrella, "NEXT-HOUR PRECIPITATION"), tb(hl, 12.5, p.text_primary), chart, ticks].spacing(6);
         Some(container(col).width(w).padding(13).style(frosted_card(p, 15.0)).into())
     }
 
@@ -236,16 +315,10 @@ impl WeatherApp {
         let (loc, h24) = (self.active_location().unwrap_or(&b.location), self.settings.use_24h_time);
         let i0 = b.hourly.partition_point(|h| h.timestamp_unix < now - 3000);
         let slice = &b.hourly[i0..(i0 + max_n).min(b.hourly.len())];
+        // The headline only restates what the strip itself shows: the forecast condition of one hour, at that hour.
         let summary = slice.get(2).map_or_else(
-            || format!("{} conditions right now.", b.current.condition.label()),
-            |h3| {
-                format!(
-                    "{} conditions expected around {}, with winds near {}.",
-                    h3.condition.label(),
-                    loc.format_local_hour(h3.timestamp_unix, h24),
-                    self.settings.format_wind(b.current.wind_speed_mps)
-                )
-            },
+            || format!("{} right now.", b.current.condition.label()),
+            |h3| format!("{} forecast at {}.", h3.condition.label(), loc.format_local_hour(h3.timestamp_unix, h24)),
         );
         let mut sun: Vec<_> = b
             .daily
@@ -312,6 +385,7 @@ impl WeatherApp {
             days.iter().map(|d| d.temp_min_c).fold(f64::INFINITY, f64::min),
             days.iter().map(|d| d.temp_max_c).fold(f64::NEG_INFINITY, f64::max),
         );
+        let uv_name = if b.uv_clear_sky { "Clear-sky UV" } else { "UV" };
         let (hbg, abg, dbg) = if p.is_light {
             (rgba8(20, 40, 72, 0.06), rgba8(10, 122, 235, 0.09), rgba8(24, 48, 86, 0.05))
         } else {
@@ -321,11 +395,13 @@ impl WeatherApp {
             (Some(h), None) if !days.is_empty() => ((h - 46.0 - days.len() as f32 * 5.0) / days.len() as f32).clamp(32.0, 36.5),
             _ => 33.0,
         };
-        let mut rows: Vec<El<'static>> = vec![hdr(p, UiIcon::Calendar, "10-DAY FORECAST")];
+        let title = if days.is_empty() { "DAILY FORECAST".to_string() } else { format!("{}-DAY FORECAST", days.len()) };
+        let mut rows: Vec<El<'static>> = vec![hdr(p, UiIcon::Calendar, &title)];
         for (i, d) in days.iter().enumerate() {
             rows.push(hairline(p.divider));
+            // `di0` is today's row; when the source only covers the rest of today the row is labelled accordingly.
             let lbl = if i == 0 {
-                "Today".into()
+                if d.partial { "Later" } else { "Today" }.into()
             } else {
                 NaiveDate::parse_from_str(&d.date, "%Y-%m-%d").map_or_else(|_| d.date.clone(), |nd| nd.weekday().to_string())
             };
@@ -359,14 +435,19 @@ impl WeatherApp {
                     || "—".into(),
                     |(sr, ss)| format!("{} / {}", loc.format_local_time(sr, h24), loc.format_local_time(ss, h24)),
                 );
-                let pv = if d.precip_sum_mm >= 0.1 {
-                    format!("{} ({:.0}%)", self.settings.format_precip(d.precip_sum_mm), d.precip_prob_pct)
-                } else {
-                    format!("{:.0}%", d.precip_prob_pct)
+                let pv = match (d.precip_sum_mm, d.precip_prob_pct) {
+                    (Some(mm), Some(pr)) => format!("{} ({pr:.0}%)", self.settings.format_precip(mm)),
+                    (Some(mm), None) => self.settings.format_precip(mm),
+                    (None, Some(pr)) => format!("{pr:.0}%"),
+                    (None, None) => DASH.into(),
                 };
-                let uv_t = text(format!("UV {:.0} • {}", d.uv_max.round(), uv_category(d.uv_max))).size(10.5).color(p.text_secondary);
-                let r1 = row![tb(d.condition.label(), 11.5, p.text_primary), sp_w(Fill), uv_t].align_y(Alignment::Center);
-                let wt = text(format!("Wind {}", self.settings.format_wind(d.wind_max_mps))).size(10.5).color(p.text_secondary);
+                let uv_s =
+                    d.uv_max.map_or_else(|| format!("{uv_name} {DASH}"), |u| format!("{uv_name} {} • {}", uv_display(u), uv_category(u)));
+                let uv_t = text(uv_s).size(10.5).color(p.text_secondary);
+                let cond = if d.partial { format!("Rest of today: {}", d.condition.label()) } else { d.condition.label().into() };
+                let r1 = row![tb(cond, 11.5, p.text_primary), sp_w(Fill), uv_t].align_y(Alignment::Center);
+                let ws = d.wind_max_mps.map_or_else(|| DASH.into(), |w| self.settings.format_wind(w));
+                let wt = text(format!("Max wind {ws}")).size(10.5).color(p.text_secondary);
                 let r2 = row![
                     text(format!("Precip {pv}")).size(10.5).color(p.text_secondary),
                     sp_w(Fill),
@@ -392,16 +473,18 @@ impl WeatherApp {
 
     pub(crate) fn view_aqi_card(&self, b: &WeatherBundle, p: SkyPalette, w: f32, h: f32) -> El<'static> {
         let Some(a) = &b.air_quality else {
-            return simple(p, (w, h), UiIcon::Air, "AIR QUALITY", "--".into(), "Air quality feed unavailable.", None);
+            return simple(p, (w, h), UiIcon::Air, "AIR QUALITY", DASH.into(), "Not available from the air quality feed.", None);
         };
         let (cat, sum) = a.info();
-        let note = if w < 200.0 { format!("PM2.5 • {:.1} µg/m³", a.pm2_5) } else { sum.to_string() };
-        let cat_row: El<'static> = if w >= 200.0 {
-            row![tb(cat, 13.0, p.text_primary), sp_w(Fill), tm(format!("PM2.5 {:.1}", a.pm2_5), 10.5, p.text_muted)]
+        let note = match a.pm2_5 {
+            Some(pm) if w < 200.0 => format!("PM2.5 • {pm:.1} µg/m³"),
+            _ => sum.to_string(),
+        };
+        let cat_row: El<'static> = match a.pm2_5 {
+            Some(pm) if w >= 200.0 => row![tb(cat, 13.0, p.text_primary), sp_w(Fill), tm(format!("PM2.5 {pm:.1}"), 10.5, p.text_muted)]
                 .align_y(Alignment::Center)
-                .into()
-        } else {
-            tb(cat, 13.0, p.text_primary).into()
+                .into(),
+            _ => tb(cat, 13.0, p.text_primary).into(),
         };
         let pos = (a.us_aqi as f32 / 250.0).clamp(0.02, 0.98);
         let col = column![
@@ -419,7 +502,7 @@ impl WeatherApp {
         let (sv, su) = self.settings.wind_value_and_unit(b.current.wind_speed_mps);
         let (gv, gu) = match b.current.wind_gust_mps {
             Some(g) => self.settings.wind_value_and_unit(g),
-            None => ("--".into(), su),
+            None => (DASH.into(), su),
         };
         let compact = w < 200.0;
         let (vsz, usz, lsz, sp, dsz, pad) = if compact { (17.5, 7.5, 9.5, 4, 52.0, 10) } else { (24.0, 8.5, 11.0, 7, 88.0, 12) };
@@ -429,10 +512,12 @@ impl WeatherApp {
                 .align_y(Alignment::Center)
         };
         let lhs = column![stat(sv.clone(), su, "Wind"), hairline(p.divider), stat(gv, gu, "Gusts")].spacing(sp).width(Fill);
-        let body = row![lhs, owned_widget_canvas(self.bento_sig.get(), WidgetCanvas::Compass(b.current.wind_dir_deg, sv, su, p), dsz, dsz)]
-            .spacing(if compact { 5 } else { 8 })
-            .height(Fill)
-            .align_y(Alignment::Center);
+        // No direction (calm / variable wind, or none reported): no compass needle is drawn at all.
+        let dial: El<'static> = match b.current.wind_dir_deg {
+            Some(deg) => owned_widget_canvas(self.bento_sig.get(), WidgetCanvas::Compass(deg, sv, su, p), dsz, dsz),
+            None => container(tm(format!("Direction {DASH}"), lsz, p.text_muted)).width(dsz).height(dsz).center_x(dsz).center_y(dsz).into(),
+        };
+        let body = row![lhs, dial].spacing(if compact { 5 } else { 8 }).height(Fill).align_y(Alignment::Center);
         bento_click(
             p,
             column![hdr(p, UiIcon::Wind, "WIND"), body].spacing(if compact { 2 } else { 4 }),
@@ -448,23 +533,21 @@ impl WeatherApp {
         bento(p, column![hdr(p, UiIcon::Umbrella, "PRECIPITATION"), m].spacing(7), (w, h), 11)
     }
 
-    pub(crate) fn view_uv_card(&self, b: &WeatherBundle, p: SkyPalette, w: f32, h: f32) -> El<'static> {
-        let uv = b.current.uv_index;
-        let adv = if uv < 3.0 {
-            "Low for the rest of the day."
-        } else if uv < 6.0 {
-            "Use sun protection until late afternoon."
-        } else {
-            "Seek shade during midday hours."
+    pub(crate) fn view_uv_card(&self, b: &WeatherBundle, p: SkyPalette, w: f32, h: f32, now: i64) -> El<'static> {
+        let title = if b.uv_clear_sky { "UV (CLEAR SKY)" } else { "UV INDEX" };
+        let click = Some(DetailMetric::UvIndex);
+        let Some(uv) = b.current.uv_index else {
+            return simple(p, (w, h), UiIcon::Sun, title, DASH.into(), "Not available from this source.", click);
         };
+        let loc = self.active_location().unwrap_or(&b.location);
         spec(
             self.bento_sig.get(),
             p,
             (w, h),
-            (UiIcon::Sun, "UV INDEX"),
-            (format!("{uv:.0}"), uv_category(uv)),
-            ((uv as f32 / 11.0).clamp(0.02, 0.98), Some(DetailMetric::UvIndex)),
-            adv.into(),
+            (UiIcon::Sun, title),
+            (uv_display(uv), uv_category(uv)),
+            ((uv.round() as f32 / 11.0).clamp(0.02, 0.98), click),
+            uv_advice(b, loc, now, self.settings.use_24h_time),
         )
     }
 
@@ -486,7 +569,7 @@ impl WeatherApp {
         let foot = text(sts.map(|t| format!("{sl}: {}", fmt(t))).unwrap_or_default()).size(10.5).color(p.text_secondary);
         let col = column![
             hdr(p, ic, title),
-            tb(mts.map(fmt).unwrap_or_else(|| "--:--".into()), 22.0, p.text_primary),
+            tb(mts.map(fmt).unwrap_or_else(|| DASH.into()), 22.0, p.text_primary),
             owned_widget_canvas(self.bento_sig.get(), WidgetCanvas::SunArc(r0, s0, now, p.is_light), Fill, 38),
             sp_h(Fill),
             foot
@@ -495,34 +578,37 @@ impl WeatherApp {
     }
 
     pub(crate) fn view_feels_like_card(&self, b: &WeatherBundle, p: SkyPalette, w: f32, h: f32) -> El<'static> {
-        let d = b.current.feels_like_c - b.current.temp_c;
-        let note = if d <= -1.5 {
-            "Wind is making it feel cooler."
-        } else if d >= 1.5 {
-            "Humidity is making it feel warmer."
-        } else {
-            "Similar to the actual temperature."
+        let click = Some(DetailMetric::Temperature);
+        let Some(fl) = b.current.feels_like_c else {
+            return simple(p, (w, h), UiIcon::Thermometer, "FEELS LIKE", DASH.into(), "Not available from this source.", click);
         };
-        simple(
-            p,
-            (w, h),
-            UiIcon::Thermometer,
-            "FEELS LIKE",
-            self.settings.format_temp(b.current.feels_like_c),
-            note,
-            Some(DetailMetric::Temperature),
-        )
+        // The note states only the difference between the two temperatures as displayed, and how the value was obtained.
+        let s = &self.settings;
+        let d = (s.convert_temp(fl).round() - s.convert_temp(b.current.temp_c).round()) as i64;
+        let mut note = match d {
+            0 => "Same as the air temperature.".to_string(),
+            d if d < 0 => format!("{}° below the air temperature.", -d),
+            d => format!("{d}° above the air temperature."),
+        };
+        if b.current.feels_like_computed {
+            note.push_str(" Computed from temperature, humidity and wind.");
+        }
+        simple(p, (w, h), UiIcon::Thermometer, "FEELS LIKE", s.format_temp(fl), &note, click)
     }
 
     pub(crate) fn view_precip_summary_card(&self, b: &WeatherBundle, p: SkyPalette, w: f32, h: f32, di: usize) -> El<'static> {
-        let (today, tmrw) =
-            (b.daily.get(di).map_or(b.current.precip_mm, |d| d.precip_sum_mm), b.daily.get(di + 1).map_or(0.0, |d| d.precip_sum_mm));
-        let next =
-            if tmrw > 0.1 { format!("{} expected tomorrow.", self.settings.format_precip(tmrw)) } else { "Dry conditions ahead.".into() };
+        let d0 = b.daily.get(di);
+        let today = d0.and_then(|d| d.precip_sum_mm).map_or_else(|| DASH.into(), |mm| self.settings.format_precip(mm));
+        // Only tomorrow's own total is stated; nothing is said about the days after it.
+        let next = match b.daily.get(di + 1).filter(|_| d0.is_some()).and_then(|d| d.precip_sum_mm) {
+            Some(mm) if mm > 0.0 => format!("{} forecast for tomorrow.", self.settings.format_precip(mm)),
+            Some(_) => "None forecast for tomorrow.".into(),
+            None => String::new(),
+        };
         let col = column![
             hdr(p, UiIcon::Droplet, "PRECIPITATION"),
-            tb(self.settings.format_precip(today), 26.0, p.text_primary),
-            tb("Today", 12.0, p.text_primary),
+            tb(today, 26.0, p.text_primary),
+            tb(if d0.is_some_and(|d| d.partial) { "Rest of today" } else { "Today" }, 12.0, p.text_primary),
             sp_h(Fill),
             text(next).size(10.5).line_height(1.18).color(p.text_secondary)
         ];
@@ -561,74 +647,71 @@ impl WeatherApp {
     }
 
     pub(crate) fn view_visibility_card(&self, b: &WeatherBundle, p: SkyPalette, w: f32, h: f32) -> El<'static> {
+        // The card states the reported value and, at most, that it is a lower bound; it does not describe the view.
         let (val, note) = match b.current.visibility_m {
-            Some(v) => {
-                let n = if v >= 14_000.0 {
-                    "Perfectly clear view."
-                } else if v >= 7_000.0 {
-                    "Light haze on horizon."
-                } else {
-                    "Reduced by mist or rain."
-                };
-                (self.settings.format_visibility(v), n)
+            Some(v) if b.current.visibility_at_least => {
+                (self.settings.format_visibility(v, true), "Reported as a minimum: this far or farther.")
             }
-            None => ("--".into(), "No visibility observation."),
+            Some(v) => (self.settings.format_visibility(v, false), ""),
+            None => (DASH.into(), "Not reported by this source."),
         };
         simple(p, (w, h), UiIcon::Eye, "VISIBILITY", val, note, None)
     }
 
     pub(crate) fn view_pressure_card(&self, b: &WeatherBundle, p: SkyPalette, w: f32, h: f32, now: i64) -> El<'static> {
-        let (val, unit) = match self.settings.pressure_unit {
-            PressureUnit::HPa => (format!("{:.0}", b.current.pressure_hpa), "hPa"),
-            PressureUnit::InHg => (format!("{:.2}", b.current.pressure_hpa * 0.02953), "inHg"),
+        let click = Some(DetailMetric::Pressure);
+        let Some(hpa) = b.current.pressure_hpa else {
+            return simple(p, (w, h), UiIcon::Gauge, "PRESSURE", DASH.into(), "Not reported by this source.", click);
         };
-        let i0 = b.hourly.partition_point(|h| h.timestamp_unix < now);
-        let trend = b.hourly.get(i0 + 3).map_or(0_i8, |h3| {
-            let dp = h3.pressure_hpa - b.current.pressure_hpa;
-            if dp >= 0.8 {
-                1
-            } else if dp <= -0.8 {
-                -1
-            } else {
-                0
-            }
-        });
+        let (val, unit) = match self.settings.pressure_unit {
+            PressureUnit::HPa => (format!("{hpa:.0}"), "hPa"),
+            PressureUnit::InHg => (format!("{:.2}", hpa * 0.02953), "inHg"),
+        };
+        // The trend arrow comes from the hourly forecast series alone; without it the card shows the value and no arrow.
+        let Some(dp) = b.pressure_trend_3h(now) else {
+            return simple(p, (w, h), UiIcon::Gauge, "PRESSURE", format!("{val} {unit}"), "No forecast trend available.", click);
+        };
+        let trend = match pressure_trend_label(dp) {
+            "Rising" => 1_i8,
+            "Falling" => -1,
+            _ => 0,
+        };
         let col = column![
             hdr(p, UiIcon::Gauge, "PRESSURE"),
-            owned_widget_canvas(self.bento_sig.get(), WidgetCanvas::Pressure(b.current.pressure_hpa, trend, val, unit, p), Fill, Fill)
+            owned_widget_canvas(self.bento_sig.get(), WidgetCanvas::Pressure(hpa, trend, val, unit, p), Fill, Fill)
         ];
         bento_click(p, col.spacing(2).height(Fill), (w, h), 12, Msg::OpenDetail(DetailMetric::Pressure))
     }
 
     pub(crate) fn view_averages_card(&self, b: &WeatherBundle, p: SkyPalette, w: f32, h: f32, di: usize) -> El<'static> {
-        let slice = &b.daily[di..];
-        let today = slice.first().map_or(b.current.temp_c, |d| d.temp_max_c);
-        let mean = if slice.is_empty() { today } else { slice.iter().map(|d| d.temp_max_c).sum::<f64>() / slice.len() as f64 };
-        // Difference of the two rounded highs shown below, so the headline can never disagree with them
-        // (58.6° vs 60.4° used to read "-2°" beside "H:59°" and "H:60°").
-        let delta = self.settings.convert_temp(today).round() - self.settings.convert_temp(mean).round();
-        let sub = if delta > 0.0 {
-            "above 10-day avg high"
-        } else if delta < 0.0 {
-            "below 10-day avg high"
-        } else {
-            "near 10-day avg high"
+        // Mean of the forecast highs of the whole days from today on; a "rest of today" row is not a day's high.
+        let highs: Vec<f64> = b.daily[di..].iter().filter(|d| !d.partial).map(|d| d.temp_max_c).collect();
+        let today = b.daily.get(di).filter(|d| !d.partial).map(|d| d.temp_max_c);
+        let mean = (!highs.is_empty()).then(|| highs.iter().sum::<f64>() / highs.len() as f64);
+        let n = highs.len();
+        let delta = today.zip(mean).map(|(t, m)| {
+            // Difference of the two highs exactly as displayed below (both rounded), so the three numbers always agree.
+            let rd = self.settings.convert_temp(t).round() - self.settings.convert_temp(m).round();
+            if rd.abs() < 0.5 { 0.0 } else { rd }
+        });
+        let sub = match delta {
+            Some(d) if d > 0.0 => format!("above {n}-day avg high"),
+            Some(d) if d < 0.0 => format!("below {n}-day avg high"),
+            Some(_) => format!("near {n}-day avg high"),
+            None => "No daily highs to compare.".into(),
         };
-        let hi_row = |l: &'static str, tc: f64| {
-            row![
-                text(l).size(10.5).color(p.text_muted),
-                sp_w(Fill),
-                tb(format!("H:{}", self.settings.format_temp(tc)), 10.5, p.text_primary)
-            ]
+        let hi_row = |l: String, tc: Option<f64>| {
+            let v = tc.map_or_else(|| DASH.into(), |tc| self.settings.format_temp(tc));
+            row![text(l).size(10.5).color(p.text_muted), sp_w(Fill), tb(format!("H:{v}"), 10.5, p.text_primary)]
         };
         let col = column![
-            hdr(p, UiIcon::Trend, "10-DAY AVG"),
-            tb(format!("{}{delta:.0}°", if delta > 0.0 { "+" } else { "" }), 25.0, p.text_primary),
+            hdr(p, UiIcon::Trend, &format!("{n}-DAY AVG")),
+            tb(delta.map_or_else(|| DASH.into(), |d| format!("{}{d:.0}°", if d > 0.0 { "+" } else { "" })), 25.0, p.text_primary),
             tm(sub, 10.0, p.text_secondary),
             sp_h(Fill),
             hairline(p.divider),
-            hi_row("Today", today),
-            hi_row("10-Day Avg", mean)
+            hi_row("Today".into(), today),
+            hi_row(format!("{n}-Day Avg"), mean)
         ];
         bento_click(p, col.spacing(2).height(Fill), (w, h), 12, Msg::OpenDetail(DetailMetric::Temperature))
     }
@@ -702,268 +785,230 @@ impl WeatherApp {
             .collect();
         let tab_bar = container(row(tabs).spacing(3).width(Fill)).padding(3).width(Fill).style(flat_box(track_bg, 10.0));
 
-        // Build chart series, hero value, axis bounds, summary tiles, and guidance copy for the active metric.
+        // Build chart series, hero value, axis bounds, summary tiles, and copy for the active metric. Every number is a
+        // real value from the bundle: an hour the source gives no value for is left out of the series, its maxima and its
+        // sums, and a metric without data shows "—" and an explicit "not available" state instead of a chart.
         let mut pts: Vec<ChartPt> = Vec::with_capacity(hrs.len());
-        let (hero_val, hero_sub, accent, is_bars, y_min, y_max, y_unit, stats, summary) = match metric {
+        let (nh, s, cur) = (hrs.len(), &self.settings, &b.current);
+        let hour_lbl = |k: usize, ts: i64| if k == 0 { "Now".to_string() } else { loc.format_local_hour(ts, h24) };
+        let range = |pts: &[ChartPt]| {
+            pts.iter().map(|p| p.val).fold(None, |a: Option<(f64, f64)>, v| Some(a.map_or((v, v), |(lo, hi)| (lo.min(v), hi.max(v)))))
+        };
+        let mean = |pts: &[ChartPt]| (!pts.is_empty()).then(|| pts.iter().map(|p| p.val).sum::<f64>() / pts.len() as f64);
+        let dash = || DASH.to_string();
+        let mut unavailable: Option<String> = None;
+        type Detail = (String, String, Color, bool, f64, f64, &'static str, [(String, String); 3], String);
+        let (hero_val, hero_sub, accent, is_bars, y_min, y_max, y_unit, stats, summary): Detail = match metric {
             DetailMetric::Temperature => {
                 for (k, h) in hrs.iter().enumerate() {
-                    let tc = if k == 0 { b.current.temp_c } else { h.temp_c };
-                    let v = self.settings.convert_temp(tc);
-                    let hr = if k == 0 { "Now".into() } else { loc.format_local_hour(h.timestamp_unix, h24) };
+                    // "Now" is the current reading with the current condition; the hours after it are the forecast.
+                    let (tc, cond) = if k == 0 { (cur.temp_c, cur.condition) } else { (h.temp_c, h.condition) };
                     pts.push(ChartPt {
-                        hour_lbl: hr,
-                        val: v,
+                        hour_lbl: hour_lbl(k, h.timestamp_unix),
+                        val: s.convert_temp(tc),
                         aux: h.precip_prob_pct,
-                        callout: format!("{} · {}", self.settings.format_temp(tc), h.condition.label()),
+                        callout: format!("{} · {}", s.format_temp(tc), cond.label()),
                     });
                 }
-                let lo = pts.iter().map(|p| p.val).fold(f64::INFINITY, f64::min);
-                let hi = pts.iter().map(|p| p.val).fold(f64::NEG_INFINITY, f64::max);
-                let avg = if pts.is_empty() { 0.0 } else { pts.iter().map(|p| p.val).sum::<f64>() / pts.len() as f64 };
-                let pad = ((hi - lo) * 0.22).max(3.0);
-                let s = [
-                    ("24H HIGH", format!("{hi:.0}°")),
-                    ("24H LOW", format!("{lo:.0}°")),
-                    ("FEELS LIKE", self.settings.format_temp(b.current.feels_like_c)),
+                let (r, avg) = (range(&pts), mean(&pts));
+                let fl = cur.feels_like_c.map_or_else(dash, |f| s.format_temp(f));
+                let stats = [
+                    (format!("{nh}H HIGH"), r.map_or_else(dash, |(_, hi)| format!("{hi:.0}°"))),
+                    (format!("{nh}H LOW"), r.map_or_else(dash, |(lo, _)| format!("{lo:.0}°"))),
+                    ("FEELS LIKE".into(), fl.clone()),
                 ];
-                let note = format!(
-                    "Temperatures range from {lo:.0}° to {hi:.0}° over the next 24 hours (average {avg:.0}°). Hover the chart to inspect any hour."
+                let note = r.zip(avg).map_or_else(
+                    || "No hourly forecast is available.".to_string(),
+                    |((lo, hi), avg)| {
+                        format!("Temperatures range from {lo:.0}° to {hi:.0}° over the next {nh} hours (average {avg:.0}°). Hover the chart to inspect any hour.")
+                    },
                 );
-                (
-                    self.settings.format_temp(b.current.temp_c),
-                    format!("{} • Feels like {}", b.current.condition.label(), self.settings.format_temp(b.current.feels_like_c)),
-                    rgb8(255, 168, 46),
-                    false,
-                    (lo - pad).floor(),
-                    (hi + pad).ceil(),
-                    "°",
-                    s,
-                    note,
-                )
+                let (lo, hi) = r.unwrap_or_default();
+                let pad = ((hi - lo) * 0.22).max(3.0);
+                let sub = format!("{} • Feels like {fl}", cur.condition.label());
+                (s.format_temp(cur.temp_c), sub, rgb8(255, 168, 46), false, (lo - pad).floor(), (hi + pad).ceil(), "°", stats, note)
             }
             DetailMetric::Precipitation => {
-                let to_u = |mm: f64| if self.settings.precip_unit == PrecipUnit::Inches { mm / 25.4 } else { mm };
-                let u = if self.settings.precip_unit == PrecipUnit::Inches { " in" } else { " mm" };
+                let inches = s.precip_unit == PrecipUnit::Inches;
                 for (k, h) in hrs.iter().enumerate() {
-                    let v = to_u(h.precip_mm.max(0.0));
-                    let hr = if k == 0 { "Now".into() } else { loc.format_local_hour(h.timestamp_unix, h24) };
+                    let amt = s.format_precip(h.precip_mm);
                     pts.push(ChartPt {
-                        hour_lbl: hr,
-                        val: v,
+                        hour_lbl: hour_lbl(k, h.timestamp_unix),
+                        val: if inches { h.precip_mm.max(0.0) / 25.4 } else { h.precip_mm.max(0.0) },
                         aux: h.precip_prob_pct,
-                        callout: format!("{} ({:.0}%)", self.settings.format_precip(h.precip_mm), h.precip_prob_pct),
+                        callout: h.precip_prob_pct.map_or_else(|| amt.clone(), |pr| format!("{amt} ({pr:.0}%)")),
                     });
                 }
                 let tot_mm: f64 = hrs.iter().map(|h| h.precip_mm.max(0.0)).sum();
                 let max_v = pts.iter().map(|p| p.val).fold(0.0_f64, f64::max);
-                let max_p = hrs.iter().map(|h| h.precip_prob_pct).fold(0.0_f64, f64::max);
-                let top = if self.settings.precip_unit == PrecipUnit::Inches { (max_v * 1.25).max(0.24) } else { (max_v * 1.25).max(3.0) };
-                let s = [
-                    ("24H TOTAL", self.settings.format_precip(tot_mm)),
-                    ("PEAK CHANCE", format!("{max_p:.0}%")),
-                    ("TODAY", self.settings.format_precip(b.daily.get(di).map_or(tot_mm, |d| d.precip_sum_mm))),
+                // Highest hourly probability the source actually reports; `None` when it reports none at all.
+                let max_p = hrs.iter().filter_map(|h| h.precip_prob_pct).reduce(f64::max);
+                let total = if hrs.is_empty() { dash() } else { s.format_precip(tot_mm) };
+                let d0 = b.daily.get(di);
+                let stats = [
+                    (format!("{nh}H TOTAL"), total.clone()),
+                    ("PEAK CHANCE".into(), max_p.map_or_else(dash, |p| format!("{p:.0}%"))),
+                    (
+                        if d0.is_some_and(|d| d.partial) { "REST OF TODAY" } else { "TODAY" }.into(),
+                        d0.and_then(|d| d.precip_sum_mm).map_or_else(dash, |mm| s.format_precip(mm)),
+                    ),
                 ];
-                let note = if tot_mm > 0.2 {
-                    format!(
-                        "Total accumulation of {} expected over the next 24 hours, peaking at {max_p:.0}% probability.",
-                        self.settings.format_precip(tot_mm)
-                    )
-                } else {
-                    "Little to no measurable precipitation expected over the next 24 hours.".into()
+                let note = match max_p {
+                    _ if hrs.is_empty() => "No hourly forecast is available.".to_string(),
+                    Some(p) => format!("{total} forecast over the next {nh} hours; the highest hourly chance is {p:.0}%."),
+                    None => format!("{total} forecast over the next {nh} hours. This source reports no precipitation probability."),
                 };
-                (
-                    self.settings.format_precip(tot_mm),
-                    "Expected in the next 24 hours".into(),
-                    rgb8(58, 178, 255),
-                    true,
-                    0.0,
-                    top,
-                    u,
-                    s,
-                    note,
-                )
+                let top = if inches { (max_v * 1.25).max(0.24) } else { (max_v * 1.25).max(3.0) };
+                let u = if inches { " in" } else { " mm" };
+                (total, format!("Forecast for the next {nh} hours"), rgb8(58, 178, 255), true, 0.0, top, u, stats, note)
             }
             DetailMetric::Wind => {
-                let conv = |mps: f64| match self.settings.wind_unit {
+                let conv = |mps: f64| match s.wind_unit {
                     WindUnit::KmH => mps * 3.6,
                     WindUnit::Mph => mps * 2.23694,
                     WindUnit::Ms => mps,
                     WindUnit::Knots => mps * 1.94384,
                 };
-                let (_, unit_lbl) = self.settings.wind_value_and_unit(b.current.wind_speed_mps);
+                let (_, unit_lbl) = s.wind_value_and_unit(cur.wind_speed_mps);
                 for (k, h) in hrs.iter().enumerate() {
-                    let mps = if k == 0 { b.current.wind_speed_mps } else { h.wind_speed_mps };
-                    let deg = if k == 0 { b.current.wind_dir_deg } else { h.wind_dir_deg };
-                    let hr = if k == 0 { "Now".into() } else { loc.format_local_hour(h.timestamp_unix, h24) };
+                    let (mps, deg) = if k == 0 { (cur.wind_speed_mps, cur.wind_dir_deg) } else { (h.wind_speed_mps, Some(h.wind_dir_deg)) };
+                    let w = s.format_wind(mps);
                     pts.push(ChartPt {
-                        hour_lbl: hr,
+                        hour_lbl: hour_lbl(k, h.timestamp_unix),
                         val: conv(mps),
                         aux: deg,
-                        callout: format!("{} {}", self.settings.format_wind(mps), compass_direction(deg)),
+                        callout: deg.map_or_else(|| w.clone(), |d| format!("{w} {}", compass_direction(d))),
                     });
                 }
-                let hi = pts.iter().map(|p| p.val).fold(0.0_f64, f64::max);
-                let avg = if pts.is_empty() { 0.0 } else { pts.iter().map(|p| p.val).sum::<f64>() / pts.len() as f64 };
-                let gust_lbl = b.current.wind_gust_mps.map_or_else(|| "--".into(), |g| self.settings.format_wind(g));
-                let s = [
-                    ("PEAK 24H", format!("{hi:.0} {unit_lbl}")),
-                    ("GUSTS NOW", gust_lbl),
-                    ("DIRECTION", compass_direction(b.current.wind_dir_deg).into()),
+                let (r, avg) = (range(&pts), mean(&pts));
+                let peak = r.map_or_else(dash, |(_, hi)| format!("{hi:.0} {unit_lbl}"));
+                let stats = [
+                    (format!("PEAK {nh}H"), peak.clone()),
+                    ("GUSTS NOW".into(), cur.wind_gust_mps.map_or_else(dash, |g| s.format_wind(g))),
+                    ("DIRECTION NOW".into(), cur.wind_dir_deg.map_or_else(dash, |d| compass_direction(d).to_string())),
                 ];
-                let note = format!(
-                    "Winds average {avg:.0} {unit_lbl} over the next 24 hours from {}, peaking near {hi:.0} {unit_lbl}.",
-                    compass_direction(b.current.wind_dir_deg)
+                let note = avg.map_or_else(
+                    || "No hourly forecast is available.".to_string(),
+                    |avg| format!("Wind speed averages {avg:.0} {unit_lbl} over the next {nh} hours, peaking near {peak}."),
                 );
-                let sub = match b.current.wind_gust_mps {
-                    Some(g) => format!("From {} • Gusts {}", compass_direction(b.current.wind_dir_deg), self.settings.format_wind(g)),
-                    None => format!("From {}", compass_direction(b.current.wind_dir_deg)),
-                };
-                (
-                    self.settings.format_wind(b.current.wind_speed_mps),
-                    sub,
-                    rgb8(82, 212, 200),
-                    false,
-                    0.0,
-                    (hi * 1.25).max(10.0).ceil(),
-                    "",
-                    s,
-                    note,
-                )
+                // Only what was reported: no direction for calm / variable wind, no gust unless one was measured.
+                let sub: Vec<String> = [
+                    cur.wind_dir_deg.map(|d| format!("From {}", compass_direction(d))),
+                    cur.wind_gust_mps.map(|g| format!("Gusts {}", s.format_wind(g))),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                let top = (r.map_or(0.0, |(_, hi)| hi) * 1.25).max(10.0).ceil();
+                (s.format_wind(cur.wind_speed_mps), sub.join(" • "), rgb8(82, 212, 200), false, 0.0, top, "", stats, note)
             }
             DetailMetric::UvIndex => {
-                let d0 = b.daily.get(di);
-                let uv_peak_day = d0.map_or(b.current.uv_index.max(3.0), |d| d.uv_max.max(b.current.uv_index));
-                let (sr, ss) = (d0.and_then(|d| d.sunrise_unix), d0.and_then(|d| d.sunset_unix));
+                let name = if b.uv_clear_sky { "Clear-sky UV" } else { "UV" };
+                // The real hourly UV values the provider returned ("Now" is the current reading). Nothing is modelled.
                 for (k, h) in hrs.iter().enumerate() {
-                    let uv = if k == 0 {
-                        b.current.uv_index
-                    } else if let (Some(r), Some(s)) = (sr, ss) {
-                        // Project solar day cycle into the hour's time-of-day (handles next-day hours seamlessly)
-                        let span = (s - r).max(3600) as f64;
-                        let off = ((h.timestamp_unix - r).rem_euclid(86400)) as f64;
-                        if off >= 0.0 && off <= span {
-                            let sun_sin = (std::f64::consts::PI * off / span).sin().powf(1.25);
-                            let cloud_att = match h.condition {
-                                WeatherCondition::Clear | WeatherCondition::MostlyClear => 1.0,
-                                WeatherCondition::PartlyCloudy => 0.82,
-                                WeatherCondition::Overcast | WeatherCondition::Fog => 0.52,
-                                _ => 0.35,
-                            };
-                            (uv_peak_day * sun_sin * cloud_att).clamp(0.0, 12.0)
-                        } else {
-                            0.0
-                        }
-                    } else if h.is_day {
-                        (uv_peak_day * 0.6).clamp(0.0, 11.0)
-                    } else {
-                        0.0
-                    };
-                    let hr = if k == 0 { "Now".into() } else { loc.format_local_hour(h.timestamp_unix, h24) };
-                    pts.push(ChartPt { hour_lbl: hr, val: uv, aux: 0.0, callout: format!("UV {uv:.1} · {}", uv_category(uv)) });
+                    let Some(uv) = (if k == 0 { cur.uv_index } else { h.uv_index }) else { continue };
+                    pts.push(ChartPt {
+                        hour_lbl: hour_lbl(k, h.timestamp_unix),
+                        val: uv,
+                        aux: None,
+                        callout: format!("{name} {} · {}", uv_display(uv), uv_category(uv)),
+                    });
                 }
-                let peak = pts.iter().map(|p| p.val).fold(0.0_f64, f64::max);
-                let s = [
-                    ("CURRENT", format!("{:.0} {}", b.current.uv_index, uv_category(b.current.uv_index))),
-                    ("PEAK UV", format!("{peak:.1} {}", uv_category(peak))),
-                    (
-                        "GUIDANCE",
-                        if peak >= 6.0 {
-                            "SPF 30+".into()
-                        } else if peak >= 3.0 {
-                            "Shade Midday".into()
-                        } else {
-                            "Low Risk".into()
-                        },
-                    ),
+                if pts.len() < 2 {
+                    unavailable = Some(format!("Hourly UV index is not available from this source ({}).", b.source_name));
+                }
+                let peak = pts.iter().max_by(|a, c| a.val.total_cmp(&c.val)).map(|p| (p.val, p.hour_lbl.clone()));
+                let stats = [
+                    ("CURRENT".into(), cur.uv_index.map_or_else(dash, |u| format!("{} {}", uv_display(u), uv_category(u)))),
+                    (format!("PEAK {nh}H"), peak.as_ref().map_or_else(dash, |(pk, _)| format!("{} {}", uv_display(*pk), uv_category(*pk)))),
+                    ("WHO GUIDANCE".into(), peak.as_ref().map_or_else(dash, |(pk, _)| uv_guidance(*pk).to_string())),
                 ];
-                let note = if peak >= 6.0 {
-                    "High midday UV expected. Use broad-spectrum sun protection and sunglasses between late morning and mid-afternoon."
-                        .into()
-                } else if peak >= 3.0 {
-                    "Moderate UV levels around solar noon. Light sun protection is advised outdoors.".into()
-                } else {
-                    "UV levels remain low throughout the next 24 hours. No special sun protection needed.".into()
-                };
-                (
-                    format!("{:.0}", b.current.uv_index),
-                    uv_category(b.current.uv_index).into(),
-                    rgb8(255, 198, 42),
-                    false,
-                    0.0,
-                    (peak.max(6.0) + 1.5).ceil().min(12.0),
-                    "",
-                    s,
-                    note,
-                )
+                let note = peak.as_ref().filter(|_| unavailable.is_none()).map_or_else(
+                    || "No hourly UV forecast is available.".to_string(),
+                    |(pk, at)| {
+                        let when = if at == "Now" { "now".to_string() } else { format!("around {at}") };
+                        format!("{name} index peaks at {} ({}) {when} within the next {nh} hours.", uv_display(*pk), uv_category(*pk))
+                    },
+                );
+                let top = (peak.as_ref().map_or(0.0, |(pk, _)| *pk).max(6.0) + 1.5).ceil();
+                let hero = cur.uv_index.map_or_else(dash, uv_display);
+                (hero, cur.uv_index.map_or("", uv_category).into(), rgb8(255, 198, 42), false, 0.0, top, "", stats, note)
             }
             DetailMetric::Pressure => {
-                let in_hg = self.settings.pressure_unit == PressureUnit::InHg;
+                let in_hg = s.pressure_unit == PressureUnit::InHg;
                 let conv = |hpa: f64| if in_hg { hpa * 0.02953 } else { hpa };
-                for (k, h) in hrs.iter().enumerate() {
-                    let hpa = if k == 0 { b.current.pressure_hpa } else { h.pressure_hpa };
-                    let v = conv(hpa);
-                    let hr = if k == 0 { "Now".into() } else { loc.format_local_hour(h.timestamp_unix, h24) };
-                    let lbl = if in_hg { format!("{v:.2} inHg") } else { format!("{v:.0} hPa") };
-                    pts.push(ChartPt { hour_lbl: hr, val: v, aux: 0.0, callout: lbl });
-                }
-                let lo = pts.iter().map(|p| p.val).fold(f64::INFINITY, f64::min);
-                let hi = pts.iter().map(|p| p.val).fold(f64::NEG_INFINITY, f64::max);
-                let dp3 = hrs.get(3).map_or(0.0, |h3| h3.pressure_hpa - b.current.pressure_hpa);
-                let trend = if dp3 >= 0.8 {
-                    "Rising"
-                } else if dp3 <= -0.8 {
-                    "Falling"
-                } else {
-                    "Steady"
-                };
-                let pad = ((hi - lo) * 0.30).max(if in_hg { 0.12 } else { 4.0 });
                 let fmt_p = |v: f64| if in_hg { format!("{v:.2} inHg") } else { format!("{v:.0} hPa") };
-                let s = [("TREND (3H)", trend.into()), ("24H HIGH", fmt_p(hi)), ("24H LOW", fmt_p(lo))];
-                let note = format!(
-                    "Barometric pressure is currently {} and {trend}. Hover the timeline to inspect hourly changes.",
-                    fmt_p(conv(b.current.pressure_hpa))
+                // The chart is the hourly forecast series alone. The current reading may be a station observation, so it is
+                // never spliced onto model hours: every point carries its own hour and the trend compares like with like.
+                for h in hrs {
+                    let Some(hpa) = h.pressure_hpa else { continue };
+                    pts.push(ChartPt {
+                        hour_lbl: loc.format_local_hour(h.timestamp_unix, h24),
+                        val: conv(hpa),
+                        aux: None,
+                        callout: fmt_p(conv(hpa)),
+                    });
+                }
+                let (r, trend) = (range(&pts), b.pressure_trend_3h(now));
+                let delta = |dp: f64| if in_hg { format!("{:+.2} inHg", conv(dp)) } else { format!("{dp:+.1} hPa") };
+                let now_s = cur.pressure_hpa.map_or_else(dash, |hpa| fmt_p(conv(hpa)));
+                let stats = [
+                    ("FORECAST TREND (3H)".into(), trend.map_or_else(dash, |dp| format!("{} ({})", pressure_trend_label(dp), delta(dp)))),
+                    (format!("{nh}H HIGH"), r.map_or_else(dash, |(_, hi)| fmt_p(hi))),
+                    (format!("{nh}H LOW"), r.map_or_else(dash, |(lo, _)| fmt_p(lo))),
+                ];
+                let note = match trend {
+                    Some(dp) => format!(
+                        "Pressure is {now_s} now. The hourly forecast changes by {} over the next 3 hours ({}).",
+                        delta(dp),
+                        pressure_trend_label(dp).to_lowercase()
+                    ),
+                    None => format!("Pressure is {now_s} now. No forecast trend is available."),
+                };
+                let sub = trend.map_or_else(
+                    || "No forecast trend available".to_string(),
+                    |dp| format!("Forecast: {} over the next 3 hours", pressure_trend_label(dp).to_lowercase()),
                 );
-                (
-                    fmt_p(conv(b.current.pressure_hpa)),
-                    format!("{trend} over the next 3 hours"),
-                    rgb8(130, 174, 255),
-                    false,
-                    lo - pad,
-                    hi + pad,
-                    "",
-                    s,
-                    note,
-                )
+                let (lo, hi) = r.unwrap_or_default();
+                let pad = ((hi - lo) * 0.30).max(if in_hg { 0.12 } else { 4.0 });
+                (now_s, sub, rgb8(130, 174, 255), false, lo - pad, hi + pad, "", stats, note)
             }
         };
+        if pts.len() < 2 && unavailable.is_none() {
+            unavailable = Some("No hourly forecast is available to chart.".into());
+        }
 
         let hero = row![
             column![txt(hero_val, 30.0, Weight::Bold, fg), txt(hero_sub, 12.0, Weight::Medium, sub_fg)].spacing(1),
             sp_w(Fill),
-            txt("Hover chart to scrub", 10.5, Weight::Medium, muted_fg),
+            txt(if unavailable.is_some() { "" } else { "Hover chart to scrub" }, 10.5, Weight::Medium, muted_fg),
         ]
         .align_y(Alignment::End);
 
-        let chart = Canvas::new(DetailChartCanvas {
-            pts,
-            accent,
-            is_bars,
-            y_min,
-            y_max,
-            y_unit,
-            decimals: if (metric == DetailMetric::Pressure && self.settings.pressure_unit == PressureUnit::InHg)
-                || (metric == DetailMetric::Precipitation && self.settings.precip_unit == PrecipUnit::Inches)
-            {
-                2
-            } else if metric == DetailMetric::Precipitation {
-                1
-            } else {
-                0
-            },
-            light: lt,
-        })
-        .width(Fill)
-        .height(176);
+        let chart: El<'static> = match unavailable {
+            Some(msg) => container(txt(msg, 12.0, Weight::Medium, sub_fg)).width(Fill).height(176).center_x(Fill).center_y(176).into(),
+            None => Canvas::new(DetailChartCanvas {
+                pts,
+                accent,
+                is_bars,
+                y_min,
+                y_max,
+                y_unit,
+                decimals: if (metric == DetailMetric::Pressure && self.settings.pressure_unit == PressureUnit::InHg)
+                    || (metric == DetailMetric::Precipitation && self.settings.precip_unit == PrecipUnit::Inches)
+                {
+                    2
+                } else if metric == DetailMetric::Precipitation {
+                    1
+                } else {
+                    0
+                },
+                light: lt,
+            })
+            .width(Fill)
+            .height(176)
+            .into(),
+        };
         let chart_box = container(chart)
             .width(Fill)
             .padding(iced::Padding { top: 8.0, right: 6.0, bottom: 4.0, left: 6.0 })
@@ -1006,7 +1051,8 @@ impl WeatherApp {
 struct ChartPt {
     hour_lbl: String,
     val: f64,
-    aux: f64,
+    /// Secondary value (precipitation probability for the bar chart); `None` when the source does not report it.
+    aux: Option<f64>,
     callout: String,
 }
 
@@ -1070,7 +1116,7 @@ impl canvas::Program<Msg> for DetailChartCanvas {
         (w.to_bits(), h.to_bits(), self.is_bars, self.y_min.to_bits(), self.y_max.to_bits(), self.decimals, self.light, self.y_unit)
             .hash(&mut sh);
         for p in &self.pts {
-            (p.val.to_bits(), p.aux.to_bits(), &p.hour_lbl).hash(&mut sh);
+            (p.val.to_bits(), p.aux.map(f64::to_bits), &p.hour_lbl).hash(&mut sh);
         }
         let sig = sh.finish() | 1;
         if state.base_sig.get() != sig {
@@ -1141,14 +1187,21 @@ impl canvas::Program<Msg> for DetailChartCanvas {
                         );
                     }
                 }
+                // The probability line only joins hours that report a probability; it breaks where the source has none.
                 let prob_path = Path::new(|pb| {
+                    let mut pen_down = false;
                     for (i, pt) in self.pts.iter().enumerate() {
-                        let p = Point::new(px(i), pad_t + (1.0 - (pt.aux / 100.0).clamp(0.0, 1.0) as f32) * ph);
-                        if i == 0 {
-                            pb.move_to(p);
-                        } else {
+                        let Some(prob) = pt.aux else {
+                            pen_down = false;
+                            continue;
+                        };
+                        let p = Point::new(px(i), pad_t + (1.0 - (prob / 100.0).clamp(0.0, 1.0) as f32) * ph);
+                        if pen_down {
                             pb.line_to(p);
+                        } else {
+                            pb.move_to(p);
                         }
+                        pen_down = true;
                     }
                 });
                 let prob_col = Color { a: 0.62, ..self.accent };
@@ -1239,9 +1292,9 @@ impl canvas::Program<Msg> for DetailChartCanvas {
 }
 
 fn icon_prob_cell<'a>(
-    cond: WeatherCondition, day: bool, prob: f64, (sz_p, sz_n, fsz, sp, h): (f32, f32, f32, f32, f32), w: Option<f32>, light: bool,
+    cond: WeatherCondition, day: bool, prob: Option<f64>, (sz_p, sz_n, fsz, sp, h): (f32, f32, f32, f32, f32), w: Option<f32>, light: bool,
 ) -> El<'a> {
-    let inner: El<'a> = if prob >= 25.0 {
+    let inner: El<'a> = if let Some(prob) = prob.filter(|p| *p >= 25.0) {
         let pc = if light { rgb8(0, 122, 255) } else { rgb8(94, 202, 255) };
         column![weather_icon_svg(cond, day, sz_p), tbold(format!("{prob:.0}%"), fsz, pc)].spacing(sp).align_x(Alignment::Center).into()
     } else {
@@ -1275,4 +1328,76 @@ fn reflow_alert_text(raw: &str) -> String {
         prev_blank = false;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Settings, test_bundle, test_hour};
+
+    #[test]
+    fn uv_advice_is_based_on_the_remaining_real_hourly_peak() {
+        // 2026-11-24 10:30 PST with hourly samples from 10:00 for 26 hours (peak 7.65 at noon, 9.0 at noon TOMORROW).
+        let (now, mut b) = (1_795_545_000, test_bundle(1_795_545_000));
+        let loc = b.location.clone();
+        let uv_at = |i: i64| {
+            if i == 2 {
+                7.65
+            } else if i == 26 {
+                9.0
+            } else {
+                0.4
+            }
+        };
+        b.hourly = (0..=26).map(|i| test_hour(now - 1800 + i * 3600, Some(uv_at(i)), None)).collect();
+        // "Now" is 2.95 (shown as 3, Moderate) but the day is not "low for the rest of the day": noon peaks at 8.
+        b.current.uv_index = Some(2.95);
+        assert_eq!(uv_advice(&b, &loc, now, false), "Peaks at 8 (Very High) around 12 PM today.");
+        assert_eq!(uv_advice(&b, &loc, now, true), "Peaks at 8 (Very High) around 12:00 today.");
+        // After the peak hours only low values remain, and only then does the card say so.
+        b.current.uv_index = Some(1.2);
+        assert_eq!(uv_advice(&b, &loc, now + 5 * 3600, false), "Low for the rest of the day.");
+        // The current value is the highest left today.
+        b.current.uv_index = Some(8.4);
+        assert_eq!(uv_advice(&b, &loc, now, false), "At its highest for the rest of the day.");
+        // No hourly UV from the provider: nothing is claimed about the rest of the day.
+        b.hourly.iter_mut().for_each(|h| h.uv_index = None);
+        b.current.uv_index = Some(0.0);
+        assert_eq!(uv_advice(&b, &loc, now, false), "");
+        assert_eq!(
+            (uv_guidance(2.4), uv_guidance(2.5), uv_guidance(7.4), uv_guidance(7.65)),
+            ("No protection needed", "Protection needed", "Protection needed", "Extra protection")
+        );
+    }
+
+    #[test]
+    fn labels_say_only_what_the_data_supports() {
+        let s = Settings::default();
+        let mut b = test_bundle(1_795_545_000);
+        let loc = b.location.clone();
+        let day = |date: &str, partial: bool| DailyForecast {
+            date: date.into(),
+            temp_min_c: 9.0,
+            temp_max_c: 16.0,
+            condition: WeatherCondition::Rain,
+            precip_prob_pct: None,
+            precip_sum_mm: None,
+            wind_max_mps: None,
+            uv_max: None,
+            sunrise_unix: None,
+            sunset_unix: None,
+            partial,
+        };
+        // Today's row is found by exact local date; a bundle without one never presents another day as "Today".
+        b.daily = vec![day("2026-11-23", false), day("2026-11-24", false), day("2026-11-25", false)];
+        assert_eq!(today_daily_index_at(&b, &loc, 1_795_545_000), 1);
+        b.daily = vec![day("2026-11-25", false), day("2026-11-26", false)];
+        assert_eq!(today_daily_index_at(&b, &loc, 1_795_545_000), 2);
+        assert!(b.daily.get(today_daily_index_at(&b, &loc, 1_795_545_000)).is_none());
+        // A rest-of-day row is labelled as such instead of posing as the day's high / low.
+        assert_eq!(hi_lo_label(&s, &day("2026-11-24", false)), "H:16°  L:9°");
+        assert_eq!(hi_lo_label(&s, &day("2026-11-24", true)), "Rest of today  H:16°  L:9°");
+        assert_eq!((pressure_trend_label(0.9), pressure_trend_label(-0.8), pressure_trend_label(0.5)), ("Rising", "Falling", "Steady"));
+        assert_eq!([30, 1500, 7200, 200_000].map(format_age), ["1 min", "25 min", "2 h", "2 d"]);
+    }
 }

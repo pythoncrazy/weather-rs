@@ -1655,10 +1655,18 @@ impl MapEngine {
                 let f = ((t - h0.timestamp_unix) as f32 / (h1.timestamp_unix - h0.timestamp_unix).max(1) as f32).clamp(0.0, 1.0);
                 let ((u0, v0), (u1, v1)) = (wind_uv(h0.wind_speed_mps, h0.wind_dir_deg), wind_uv(h1.wind_speed_mps, h1.wind_dir_deg));
                 let (wu, wv, l) = (u0 + (u1 - u0) * f, v0 + (v1 - v0) * f, |a: f64, c: f64| (a + (c - a) * f as f64) as f32);
-                [l(h0.temp_c, h1.temp_c), l(h0.precip_mm, h1.precip_mm), wu, wv, wu.hypot(wv), l(h0.pressure_hpa, h1.pressure_hpa)]
+                let (Some(p0), Some(p1)) = (h0.pressure_hpa, h1.pressure_hpa) else { continue };
+                [l(h0.temp_c, h1.temp_c), l(h0.precip_mm, h1.precip_mm), wu, wv, wu.hypot(wv), l(p0, p1)]
             } else {
-                let (u, v) = wind_uv(b.current.wind_speed_mps, b.current.wind_dir_deg);
-                [b.current.temp_c as f32, b.current.precip_mm as f32, u, v, b.current.wind_speed_mps as f32, b.current.pressure_hpa as f32]
+                // A bundle is only a sample point when every value is real; calm wind is a zero vector of no direction.
+                let c = &b.current;
+                let (Some(dir), Some(prs), Some(pr)) =
+                    (c.wind_dir_deg.or((c.wind_speed_mps == 0.0).then_some(0.0)), c.pressure_hpa, c.precip_mm)
+                else {
+                    continue;
+                };
+                let (u, v) = wind_uv(c.wind_speed_mps, dir);
+                [c.temp_c as f32, pr as f32, u, v, c.wind_speed_mps as f32, prs as f32]
             };
             pts.push(GridWeatherPoint::stationary(b.location.lat, b.location.lon, v));
         }

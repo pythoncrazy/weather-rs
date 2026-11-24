@@ -124,8 +124,15 @@ fn tile_dir(ns: &str, z: u8) -> PathBuf {
     CACHE_DIR.join("tiles").join(safe_name(ns)).join(z.to_string())
 }
 
+/// Loads the last bundle saved for a location. The cache has no expiry of its own: every bundle records when it was
+/// fetched (`fetched_unix` / `full_fetched_unix`), the app refreshes anything older than the refresh interval and shows
+/// the age meanwhile. Bundles written before `BUNDLE_SCHEMA` still deserialize but are discarded, because they may
+/// contain values the old code defaulted or computed itself (0 UV, 1013.25 hPa, a recomputed AQI, ...).
 pub fn load_cached_bundle(id: &str) -> Option<WeatherBundle> {
-    serde_json::from_slice(&fs::read(CACHE_DIR.join("forecasts").join(format!("{}.json", safe_name(id)))).ok()?).ok()
+    parse_cached_bundle(&fs::read(CACHE_DIR.join("forecasts").join(format!("{}.json", safe_name(id)))).ok()?)
+}
+fn parse_cached_bundle(bytes: &[u8]) -> Option<WeatherBundle> {
+    serde_json::from_slice::<WeatherBundle>(bytes).ok().filter(|b| b.schema == crate::model::BUNDLE_SCHEMA)
 }
 pub fn save_cached_bundle(b: &WeatherBundle) {
     if !cfg!(test)
@@ -175,7 +182,7 @@ pub fn load_aqi_cache(max_age_secs: i64) -> std::collections::HashMap<(i32, i32)
     if cfg!(test) {
         return Default::default();
     }
-    let Ok(bytes) = fs::read(CACHE_DIR.join("aqi_cache.json")) else { return Default::default() };
+    let Ok(bytes) = fs::read(CACHE_DIR.join("aqi_cache_v2.json")) else { return Default::default() };
     let Ok(raw) = serde_json::from_slice::<std::collections::HashMap<String, AqiDiskEntry>>(&bytes) else { return Default::default() };
     let now = chrono::Utc::now().timestamp();
     raw.into_iter()
@@ -193,7 +200,7 @@ pub fn save_aqi_cache(map: &std::collections::HashMap<(i32, i32), AqiDiskEntry>)
     }
     let flat: std::collections::HashMap<String, &AqiDiskEntry> = map.iter().map(|((a, b), v)| (format!("{a},{b}"), v)).collect();
     if let Ok(bytes) = serde_json::to_vec(&flat) {
-        atomic_write(&CACHE_DIR, "aqi_cache.json", &bytes);
+        atomic_write(&CACHE_DIR, "aqi_cache_v2.json", &bytes);
     }
 }
 
@@ -202,7 +209,7 @@ pub fn load_alerts_cache(max_age_secs: i64) -> std::collections::HashMap<(i32, i
     if cfg!(test) {
         return Default::default();
     }
-    let Ok(bytes) = fs::read(CACHE_DIR.join("alerts_cache.json")) else { return Default::default() };
+    let Ok(bytes) = fs::read(CACHE_DIR.join("alerts_cache_v2.json")) else { return Default::default() };
     let Ok(raw) = serde_json::from_slice::<std::collections::HashMap<String, AlertsDiskEntry>>(&bytes) else { return Default::default() };
     let now = chrono::Utc::now().timestamp();
     raw.into_iter()
@@ -220,7 +227,7 @@ pub fn save_alerts_cache(map: &std::collections::HashMap<(i32, i32), AlertsDiskE
     }
     let flat: std::collections::HashMap<String, &AlertsDiskEntry> = map.iter().map(|((a, b), v)| (format!("{a},{b}"), v)).collect();
     if let Ok(bytes) = serde_json::to_vec(&flat) {
-        atomic_write(&CACHE_DIR, "alerts_cache.json", &bytes);
+        atomic_write(&CACHE_DIR, "alerts_cache_v2.json", &bytes);
     }
 }
 
@@ -312,5 +319,27 @@ mod tests {
         assert_eq!(safe_name("NUL.json"), "_NUL.json");
         assert_eq!(safe_name("COM9"), "_COM9");
         assert_eq!(safe_name("seattle_wa"), "seattle_wa");
+    }
+
+    #[test]
+    fn pre_upgrade_cached_bundle_deserializes_but_is_not_shown() {
+        // A bundle exactly as the previous version wrote it: plain numbers where the model now has `Option`s, none of the
+        // newer fields, and several values that old code had defaulted (UV 0, pressure 1013.25, 0 % rain, a recomputed AQI).
+        let old = r#"{"location":{"id":"37.870_-122.270","name":"Berkeley","region":"CA","country":"United States","country_code":"US","lat":37.87,"lon":-122.27,"timezone":"America/Los_Angeles"},
+            "current":{"temp_c":8.5,"feels_like_c":5.7,"condition":"PartlyCloudy","is_day":false,"humidity_pct":81.0,"dew_point_c":5.4,"pressure_hpa":1013.25,"wind_speed_mps":3.0,"wind_gust_mps":null,"wind_dir_deg":82.0,"visibility_m":null,"uv_index":0.0,"precip_mm":0.0,"updated_unix":1795512600},
+            "minutely":[{"timestamp_unix":1795512600,"precip_mm_hr":0.4}],
+            "hourly":[{"timestamp_unix":1795510800,"temp_c":8.0,"condition":"Clear","is_day":false,"precip_prob_pct":0.0,"precip_mm":0.0,"wind_speed_mps":2.0,"wind_dir_deg":80.0,"pressure_hpa":1013.25}],
+            "daily":[{"date":"2026-11-24","temp_min_c":8.3,"temp_max_c":15.0,"condition":"Overcast","precip_prob_pct":0.0,"precip_sum_mm":0.0,"wind_max_mps":0.0,"uv_max":0.0,"sunrise_unix":null,"sunset_unix":null}],
+            "air_quality":{"us_aqi":91,"pm2_5":30.6},"alerts":[],"source_name":"Open-Meteo (NOAA / ECMWF / DWD)"}"#;
+        let b: crate::model::WeatherBundle = serde_json::from_str(old).expect("old cache still deserializes");
+        assert_eq!((b.schema, b.fetched_unix, b.full_fetched_unix, b.lean), (0, 0, None, false));
+        assert_eq!((b.current.pressure_hpa, b.hourly[0].uv_index, b.daily[0].partial), (Some(1013.25), None, false));
+        assert!(b.needs_full_refresh(1_795_512_700));
+        // ...but it is never handed to the UI: its values cannot be told apart from defaults.
+        assert!(super::parse_cached_bundle(old.as_bytes()).is_none());
+        // A bundle written by this version round-trips.
+        let cur = crate::model::test_bundle(1_795_512_600);
+        let back = super::parse_cached_bundle(&serde_json::to_vec(&cur).expect("json")).expect("current schema loads");
+        assert_eq!((back.schema, back.fetched_unix, back.current.uv_index), (crate::model::BUNDLE_SCHEMA, 1_795_512_600, Some(5.0)));
     }
 }

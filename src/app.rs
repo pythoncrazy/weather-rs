@@ -2,7 +2,8 @@ use crate::cards::DetailMetric;
 use crate::icons::{UiIcon, WidgetCanvas, cached_widget_canvas, icon_btn, icon_svg, sky_backdrop_canvas};
 use crate::map::{MapEngine, MapExternalAction, MapMsg, TileKey};
 use crate::model::{
-    Location, PrecipUnit, PressureUnit, ProviderChoice, Settings, TempUnit, ThemeMode, WeatherBundle, WeatherCondition, WindUnit,
+    Location, PrecipUnit, PressureUnit, ProviderChoice, REFRESH_INTERVAL_SECS, Settings, TempUnit, ThemeMode, WeatherBundle,
+    WeatherCondition, WindUnit,
 };
 use crate::providers::WeatherClient;
 use crate::storage::{
@@ -147,6 +148,10 @@ pub struct WeatherApp {
     wake: Arc<Notify>,
     boot_instant: Instant,
     last_auto_refresh: Instant,
+    /// Wall-clock twin of `last_auto_refresh`: `Instant` does not advance while the machine is suspended.
+    last_auto_refresh_wall: i64,
+    /// Wall-clock time of the last out-of-cycle full refresh attempt for the selected location.
+    last_active_retry_wall: i64,
 }
 
 impl WeatherApp {
@@ -193,6 +198,8 @@ impl WeatherApp {
             wake,
             boot_instant: now,
             last_auto_refresh: now,
+            last_auto_refresh_wall: Utc::now().timestamp(),
+            last_active_retry_wall: Utc::now().timestamp(),
         };
         #[cfg(target_os = "linux")]
         {
@@ -353,9 +360,16 @@ impl WeatherApp {
             .settings
             .saved_locations
             .iter()
-            .filter(|l| max_age_secs <= 0 || self.bundles.get(&l.id).is_none_or(|b| (now - b.current.updated_unix).abs() >= max_age_secs))
+            .filter(|l| max_age_secs <= 0 || self.bundles.get(&l.id).is_none_or(|b| (now - b.fetched_unix).abs() >= max_age_secs))
             .cloned()
             .collect();
+        // The selected location is always fetched in full; if it only holds a lean / outdated bundle it is refreshed even
+        // when its current conditions are recent enough to skip.
+        if let Some(act) = self.active_location().filter(|l| !locs.iter().any(|x| x.id == l.id)).cloned()
+            && self.bundles.get(&act.id).is_some_and(|b| b.needs_full_refresh(now))
+        {
+            locs.push(act);
+        }
         if let Some(aid) = &self.settings.selected_location_id
             && let Some(p) = locs.iter().position(|l| &l.id == aid)
             && p > 0
@@ -368,7 +382,12 @@ impl WeatherApp {
             self.spawn_refresh_batch(locs);
             self.spawn_sidebar_batch(rest);
         }
-        self.last_auto_refresh = Instant::now();
+        (self.last_auto_refresh, self.last_auto_refresh_wall) = (Instant::now(), now);
+    }
+
+    /// The last refresh error for the selected location (shown even while a cached bundle is on display).
+    pub(crate) fn refresh_error(&self) -> Option<&str> {
+        self.ui.last_error.as_deref()
     }
 
     /// Fetches all background sidebar cities in a SINGLE batched Open-Meteo HTTP call instead of 4 calls per city!
@@ -416,7 +435,9 @@ impl WeatherApp {
             } else {
                 self.map.sync_theme(map_light);
             }
-            if self.bundles.get(&id).is_none_or(|b| b.hourly.is_empty() || b.air_quality.is_none()) {
+            // A lean sidebar bundle, or one whose full data is older than the refresh interval, is fetched in full now:
+            // hourly detail / air quality / alerts carried over from an earlier fetch are never left standing as current.
+            if self.bundles.get(&id).is_none_or(|b| b.needs_full_refresh(Utc::now().timestamp())) {
                 self.spawn_refresh_batch(vec![loc]);
             }
         }
@@ -496,29 +517,22 @@ impl WeatherApp {
                     } else if !sv.timezone.is_empty() {
                         b.location.timezone = sv.timezone.clone();
                     }
-                    if b.hourly.is_empty()
-                        && let Some(prev) = self.bundles.get(&id)
-                    {
-                        b.hourly = prev.hourly.clone();
-                        b.minutely = prev.minutely.clone();
-                        b.air_quality = prev.air_quality.clone();
-                        b.alerts = prev.alerts.clone();
-                        if b.daily.len() <= 1 && prev.daily.len() > 1 {
-                            let mut merged_daily = prev.daily.clone();
-                            if let Some(d0) = b.daily.first() {
-                                if let Some(slot) = merged_daily.iter_mut().find(|d| d.date == d0.date) {
-                                    slot.temp_max_c = d0.temp_max_c;
-                                    slot.temp_min_c = d0.temp_min_c;
-                                    slot.condition = d0.condition;
-                                } else {
-                                    merged_daily[0] = d0.clone();
-                                }
-                            }
-                            b.daily = merged_daily;
+                    if let Some(prev) = self.bundles.get(&id) {
+                        // A lean update that was already in flight must not replace a full bundle fetched since.
+                        if b.lean && !prev.lean && prev.fetched_unix >= b.fetched_unix - 60 {
+                            continue;
+                        }
+                        if b.lean {
+                            // Lean sidebar update: fresh current conditions; the detail of the last full fetch stays,
+                            // labelled with the time of that fetch (see `WeatherBundle::merge_lean_onto`).
+                            *b = (*b).merge_lean_onto(prev);
+                        } else {
+                            // A failed alert request must not wipe the alerts already known for this place.
+                            b.keep_known_alerts(prev);
                         }
                     }
                     let is_sel = self.settings.selected_location_id.as_deref() == Some(id.as_str());
-                    if is_sel {
+                    if is_sel && !b.lean {
                         self.ui.last_error = None;
                     }
                     self.bundles.insert(id, *b);
@@ -579,8 +593,21 @@ impl WeatherApp {
                 {
                     self.spawn_detect_location();
                 }
-                if self.last_auto_refresh.elapsed() > Duration::from_secs(600) {
+                // The refresh timer is checked against the wall clock as well: `Instant` stands still while the machine
+                // is suspended, so after a resume the data would otherwise sit unrefreshed and be shown as current.
+                let wall = Utc::now().timestamp();
+                if self.last_auto_refresh.elapsed() > Duration::from_secs(REFRESH_INTERVAL_SECS as u64)
+                    || (wall - self.last_auto_refresh_wall).abs() > REFRESH_INTERVAL_SECS
+                {
                     self.spawn_refresh_all();
+                } else if (wall - self.last_active_retry_wall).abs() >= 60
+                    && let Some(loc) = self.active_location().filter(|l| !self.ui.loading_ids.contains(&l.id)).cloned()
+                    && self.bundles.get(&loc.id).is_none_or(|b| b.needs_full_refresh(wall))
+                {
+                    // The selected location has no full, current bundle (failed refresh, lean update that landed after it
+                    // was selected, or data older than the interval): fetch it in full, at most once a minute.
+                    self.last_active_retry_wall = wall;
+                    self.spawn_refresh_batch(vec![loc]);
                 }
                 self.map.tick(&self.bundles, self.ui.map_expanded);
                 return self.flush_gpu_pins();
@@ -791,6 +818,9 @@ impl WeatherApp {
             )
                 .hash(&mut h);
             ((self.window_size.width / 20.0).round() as i32, now / 60).hash(&mut h);
+            // Fetch times, the alert set and the last refresh error are all on display (status line, alert card).
+            let fetch = self.active_bundle().map(|b| (b.fetched_unix, b.full_fetched_unix, b.alerts_fetched_unix, b.alerts.len(), b.lean));
+            (fetch, self.ui.last_error.as_deref()).hash(&mut h);
             self.bento_sig.set(h.finish() | 1);
         }
         let main = if self.ui.map_expanded { self.view_split_map_layout(pal, now) } else { self.view_full_bento_layout(pal, now) };
@@ -900,9 +930,13 @@ impl WeatherApp {
                 txt(loc.name.clone(), 13.5, Weight::Bold, Color::WHITE).into()
             };
             let sub = if loc.is_current_location { loc.name.clone() } else { loc.format_local_time(now, self.settings.use_24h_time) };
-            let hl = b.and_then(|b| b.daily.get(crate::cards::today_daily_index_at(b, loc, now))).map_or_else(String::new, |d| {
-                format!("H:{}  L:{}", self.settings.format_temp(d.temp_max_c), self.settings.format_temp(d.temp_min_c))
-            });
+            // A row that only covers the rest of today is not the day's high / low, so the compact sidebar omits it.
+            let hl = b
+                .and_then(|b| b.daily.get(crate::cards::today_daily_index_at(b, loc, now)))
+                .filter(|d| !d.partial)
+                .map_or_else(String::new, |d| {
+                    format!("H:{}  L:{}", self.settings.format_temp(d.temp_max_c), self.settings.format_temp(d.temp_min_c))
+                });
             let cnd = text(b.map_or("Loading…", |b| b.current.condition.label())).size(10.5).color(rgba8(240, 246, 255, 0.86));
             let mut sub_row = row![txt(sub, 10.5, Weight::Medium, rgba8(236, 244, 255, 0.82))].spacing(5).align_y(Alignment::Center);
             if total > 1 && !loc.is_current_location && sel {
@@ -916,7 +950,7 @@ impl WeatherApp {
                 ));
             }
             let lcol = column![title_row, sub_row, sp_h(Fill), cnd].spacing(1).height(Fill);
-            let tmp = b.map_or_else(|| "--".into(), |b| self.settings.format_temp(b.current.temp_c));
+            let tmp = b.map_or_else(|| crate::cards::DASH.into(), |b| self.settings.format_temp(b.current.temp_c));
             let rcol = column![
                 txt(tmp, 34.0, Weight::Normal, Color::WHITE),
                 sp_h(Fill),
@@ -1011,9 +1045,9 @@ impl WeatherApp {
     }
 
     fn view_header_stack(&self, b: &WeatherBundle, pal: SkyPalette, w: f32, gap: f32, now: i64, di: usize) -> Element<'static, Msg> {
-        let mut h = column![self.view_hero(b, pal, di)].spacing(gap).width(w).align_x(Alignment::Center);
+        let mut h = column![self.view_hero(b, pal, di, now)].spacing(gap).width(w).align_x(Alignment::Center);
         if !b.alerts.is_empty() {
-            h = h.push(self.view_alerts_card(b, pal, w));
+            h = h.push(self.view_alerts_card(b, pal, w, now));
         }
         if let Some(mc) = self.view_minutely_card(b, pal, w, now) {
             h = h.push(mc);
@@ -1051,13 +1085,15 @@ impl WeatherApp {
                 .into()
         })
         .into();
-        let attr = format!("Weather: {} • Radar: LibreWXR (CC BY 4.0), NOAA HRRR/MRMS • Map: Esri & OSM", b.source_name);
+        // The footer names the sources actually used for this bundle and, when it is not current, how old it is / why.
+        let status = self.data_status_line(b, now).map_or_else(String::new, |s| format!("{s} • "));
+        let attr = format!("{status}Weather: {} • Radar: LibreWXR (CC BY 4.0), NOAA HRRR/MRMS • Map: Esri & OSM", b.source_name);
         let content = if wide {
             let left_mid: Element<'_, Msg> = iced::widget::lazy(lkey, move |_| -> Element<'static, Msg> {
                 let d10 = self.view_ten_day_card(b, pal, w2, Some(th * 3.0 + g * 2.0), di);
                 let aqi = self.view_aqi_card(b, pal, w2, th);
                 let wind = self.view_wind_card(b, pal, w2, th);
-                let uv = self.view_uv_card(b, pal, u, th);
+                let uv = self.view_uv_card(b, pal, u, th, now);
                 let sun = self.view_sun_card(b, pal, u, th, now, di);
                 let mid = column![aqi, wind, row![uv, sun].spacing(g)].spacing(g);
                 row![d10, mid].spacing(g).align_y(Alignment::Start).into()
@@ -1089,8 +1125,12 @@ impl WeatherApp {
             let aqi_lazy: Element<'_, Msg> = iced::widget::lazy(lkey, move |_| self.view_aqi_card(b, pal, w2, th)).into();
             let lower_lazy: Element<'_, Msg> = iced::widget::lazy(lkey, move |_| -> Element<'static, Msg> {
                 column![
-                    row![self.view_wind_card(b, pal, w2, th), self.view_uv_card(b, pal, u, th), self.view_sun_card(b, pal, u, th, now, di)]
-                        .spacing(g),
+                    row![
+                        self.view_wind_card(b, pal, w2, th),
+                        self.view_uv_card(b, pal, u, th, now),
+                        self.view_sun_card(b, pal, u, th, now, di)
+                    ]
+                    .spacing(g),
                     row![
                         self.view_moon_card(pal, w2, th, now),
                         self.view_feels_like_card(b, pal, u, th),
@@ -1159,7 +1199,7 @@ impl WeatherApp {
         let side3 = column![
             self.view_aqi_card(b, pal, u - 16.0, th),
             self.view_wind_card(b, pal, u - 16.0, th),
-            self.view_uv_card(b, pal, u - 16.0, th)
+            self.view_uv_card(b, pal, u - 16.0, th, now)
         ]
         .spacing(g);
         let col = column![
@@ -1710,6 +1750,12 @@ mod tests {
         let mut h = Harness::new(Size::new(1340.0, 860.0), 1.0, iced::Point::new(920.0, 420.0), "WEATHER_RS_DRAG_AUDIT");
         let mut app = WeatherApp::boot().0;
         let _ = app.update(Msg::WindowResized(Size::new(1340.0, 860.0)));
+        // The drag regions below assume the split layout WITH its left Bento column, which needs a bundle for the selected
+        // location. Use a fixed test bundle unless one is loaded, instead of relying on a forecast that an earlier run of
+        // the app happened to leave in the disk cache (absent on a clean machine, discarded when its schema is outdated).
+        if let Some(id) = app.settings.selected_location_id.clone() {
+            app.bundles.entry(id).or_insert_with(|| crate::model::test_bundle(chrono::Utc::now().timestamp()));
+        }
         // Load a real manifest so the timeline scrubber + HUD are fully active!
         app.map.inject_test_manifest(chrono::Utc::now().timestamp());
         let _ = app.update(Msg::Map(MapMsg::ExpandMap));

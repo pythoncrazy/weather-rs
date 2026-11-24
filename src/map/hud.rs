@@ -505,7 +505,7 @@ impl MapEngine {
             self.base_style
         };
         let fts = self.selected_forecast_timestamp();
-        let sample_bundle = |x: &WeatherBundle| -> (f64, f64, f64, f64) {
+        let sample_bundle = |x: &WeatherBundle| -> (f64, f64, Option<f64>, Option<f64>) {
             if let Some(t) = fts
                 && !x.hourly.is_empty()
             {
@@ -515,7 +515,8 @@ impl MapEngine {
                 let ((u0, v0), (u1, v1)) = (wind_uv(h0.wind_speed_mps, h0.wind_dir_deg), wind_uv(h1.wind_speed_mps, h1.wind_dir_deg));
                 let (wu, wv) = (u0 as f64 + (u1 - u0) as f64 * f, v0 as f64 + (v1 - v0) as f64 * f);
                 let wdir = ((-wu).atan2(-wv).to_degrees() + 360.0) % 360.0;
-                (h0.temp_c + (h1.temp_c - h0.temp_c) * f, wu.hypot(wv), wdir, h0.pressure_hpa + (h1.pressure_hpa - h0.pressure_hpa) * f)
+                let prs = h0.pressure_hpa.zip(h1.pressure_hpa).map(|(p0, p1)| p0 + (p1 - p0) * f);
+                (h0.temp_c + (h1.temp_c - h0.temp_c) * f, wu.hypot(wv), Some(wdir), prs)
             } else {
                 (x.current.temp_c, x.current.wind_speed_mps, x.current.wind_dir_deg, x.current.pressure_hpa)
             }
@@ -532,16 +533,22 @@ impl MapEngine {
                     }
                     WeatherOverlay::WindFlow => b.map_or(("--".into(), String::new(), rgb8(232, 238, 246), None), |x| {
                         let (_, wspd, wdir, _) = sample_bundle(x);
-                        (settings.wind_value_and_unit(wspd).0, compass_direction(wdir).into(), rgb8(245, 248, 252), Some(wdir))
+                        (
+                            settings.wind_value_and_unit(wspd).0,
+                            wdir.map_or_else(String::new, |d| compass_direction(d).into()),
+                            rgb8(245, 248, 252),
+                            wdir,
+                        )
                     }),
-                    WeatherOverlay::Pressure => b.map_or(("--".into(), String::new(), rgb8(84, 118, 168), None), |x| {
-                        let (_, _, _, prs) = sample_bundle(x);
-                        let pv = match settings.pressure_unit {
-                            crate::model::PressureUnit::HPa => format!("{:.0}", prs),
-                            crate::model::PressureUnit::InHg => format!("{:.2}", prs * 0.02953),
-                        };
-                        (pv, String::new(), pressure_to_color(prs, 1.0), None)
-                    }),
+                    WeatherOverlay::Pressure => {
+                        b.and_then(|x| sample_bundle(x).3).map_or(("--".into(), String::new(), rgb8(84, 118, 168), None), |prs| {
+                            let pv = match settings.pressure_unit {
+                                crate::model::PressureUnit::HPa => format!("{:.0}", prs),
+                                crate::model::PressureUnit::InHg => format!("{:.2}", prs * 0.02953),
+                            };
+                            (pv, String::new(), pressure_to_color(prs, 1.0), None)
+                        })
+                    }
                     _ => b.map_or(("--".into(), String::new(), rgb8(68, 118, 186), None), |x| {
                         let (tc, _, _, _) = sample_bundle(x);
                         (settings.format_temp(tc), String::new(), temp_badge_color(tc), None)
@@ -939,8 +946,9 @@ impl MapEngine {
             } else {
                 format!("{:.2}°, {:.2}° • {ltime}", b.location.lat, b.location.lon)
             };
+            let feels = b.current.feels_like_c.map_or_else(|| "—".to_string(), |f| s.format_temp(f));
             let hl = b.daily.first().map_or_else(
-                || format!("Feels {}", s.format_temp(b.current.feels_like_c)),
+                || format!("Feels {feels}"),
                 |d| format!("H:{}  L:{}", s.format_temp(d.temp_max_c), s.format_temp(d.temp_min_c)),
             );
             let hcol = column![txt(b.location.name.clone(), 13.5, Weight::Semibold, h.0[3]), txt(sub, 10.5, Weight::Normal, h.0[4])]
@@ -954,7 +962,7 @@ impl MapEngine {
                 row![wic, txt(s.format_temp(b.current.temp_c), 28.0, Weight::Medium, h.0[3]), mcol].spacing(8).align_y(Alignment::Center);
             let wtxt = txt(s.format_wind(b.current.wind_speed_mps), 10.0, Weight::Medium, h.0[4]);
             let htxt = txt(format!("Hum {:.0}%", b.current.humidity_pct), 10.0, Weight::Medium, h.0[4]);
-            let ftxt = txt(format!("Feels {}", s.format_temp(b.current.feels_like_c)), 10.0, Weight::Medium, h.0[4]);
+            let ftxt = txt(format!("Feels {feels}"), 10.0, Weight::Medium, h.0[4]);
             let meta =
                 row![icon_svg(UiIcon::Wind, 11.0, h.0[4]), wtxt, sp_w(Fill), ftxt, sp_w(Fill), htxt].spacing(4).align_y(Alignment::Center);
             let next3: Vec<Element<'a, M>> = b
