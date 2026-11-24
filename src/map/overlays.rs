@@ -909,6 +909,16 @@ impl MapEngine {
         for (gy, &la) in lats.iter().enumerate() {
             analysis.eval_row(la, &lon_tbl, &mut field[gy * gw..(gy + 1) * gw], &mut near2);
         }
+        // One separable [1, 2, 1] pass over the contouring grid: a single node that pokes a fraction of a hectopascal
+        // above a contour level would otherwise draw a stray one-cell diamond.
+        let raw = field.clone();
+        for gy in 0..gh {
+            for gx in 0..gw {
+                let (x0, x1, y0, y1) = (gx.saturating_sub(1), (gx + 1).min(gw - 1), gy.saturating_sub(1), (gy + 1).min(gh - 1));
+                let row = |y: usize| raw[y * gw + x0] + 2.0 * raw[y * gw + gx] + raw[y * gw + x1];
+                field[gy * gw + gx] = (row(y0) + 2.0 * row(gy) + row(y1)) / 16.0;
+            }
+        }
         let (vmin, vmax) = field.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &v| (lo.min(v), hi.max(v)));
         let (dx, dy) = (bounds.width / (gw - 1) as f32, bounds.height / (gh - 1) as f32);
         let mut data = IsobarData::default();
