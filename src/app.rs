@@ -1619,6 +1619,11 @@ mod tests {
         for _ in 0..16 {
             let _ = app.update(Msg::Tick);
         }
+        // The live radar manifest normally arrives during the pumps above; when the network is slow, fall back to the
+        // synthetic manifest so this rendering test never depends on upstream latency.
+        if app.map.debug_manifest().len() < app.map.live_frame_idx() + 8 {
+            app.map.inject_test_manifest(chrono::Utc::now().timestamp());
+        }
         let live_i = app.map.live_frame_idx();
         let _ = app.update(Msg::Map(MapMsg::ScrubRadar(live_i + 7)));
         assert!(app.map.selected_forecast_timestamp().is_some());

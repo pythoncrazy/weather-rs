@@ -507,16 +507,15 @@ impl WeatherApp {
         let compact = w < 200.0;
         let (vsz, usz, lsz, sp, dsz, pad) = if compact { (17.5, 7.5, 9.5, 4, 52.0, 10) } else { (24.0, 8.5, 11.0, 7, 88.0, 12) };
         let stat = |v: String, u: &'static str, l: &'static str| {
-            row![tb(v, vsz, p.text_primary), column![tbold(u.to_uppercase(), usz, p.text_muted), tm(l, lsz, p.text_primary)]]
+            // A missing value is a quiet muted dash, not a heavy white bar in the headline weight.
+            let col = if v == DASH { p.text_muted } else { p.text_primary };
+            row![tb(v, vsz, col), column![tbold(u.to_uppercase(), usz, p.text_muted), tm(l, lsz, p.text_primary)]]
                 .spacing(if compact { 4 } else { 6 })
                 .align_y(Alignment::Center)
         };
         let lhs = column![stat(sv.clone(), su, "Wind"), hairline(p.divider), stat(gv, gu, "Gusts")].spacing(sp).width(Fill);
-        // No direction (calm / variable wind, or none reported): no compass needle is drawn at all.
-        let dial: El<'static> = match b.current.wind_dir_deg {
-            Some(deg) => owned_widget_canvas(self.bento_sig.get(), WidgetCanvas::Compass(deg, sv, su, p), dsz, dsz),
-            None => container(tm(format!("Direction {DASH}"), lsz, p.text_muted)).width(dsz).height(dsz).center_x(dsz).center_y(dsz).into(),
-        };
+        // No direction (calm / variable wind, or none reported): the dial is drawn without a needle.
+        let dial = owned_widget_canvas(self.bento_sig.get(), WidgetCanvas::Compass(b.current.wind_dir_deg, sv, su, p), dsz, dsz);
         let body = row![lhs, dial].spacing(if compact { 5 } else { 8 }).height(Fill).align_y(Alignment::Center);
         bento_click(
             p,
@@ -586,12 +585,12 @@ impl WeatherApp {
         let s = &self.settings;
         let d = (s.convert_temp(fl).round() - s.convert_temp(b.current.temp_c).round()) as i64;
         let mut note = match d {
-            0 => "Same as the air temperature.".to_string(),
-            d if d < 0 => format!("{}° below the air temperature.", -d),
-            d => format!("{d}° above the air temperature."),
+            0 => "Same as the actual temperature.".to_string(),
+            d if d < 0 => format!("{}° below the actual temperature.", -d),
+            d => format!("{d}° above the actual temperature."),
         };
         if b.current.feels_like_computed {
-            note.push_str(" Computed from temperature, humidity and wind.");
+            note.push_str(" Computed, not measured.");
         }
         simple(p, (w, h), UiIcon::Thermometer, "FEELS LIKE", s.format_temp(fl), &note, click)
     }
@@ -723,9 +722,11 @@ impl WeatherApp {
         };
         let loc = self.active_location().unwrap_or(&b.location);
         let lt = pal.is_light;
+        // The sheet is fully opaque: with no backdrop blur, even 3–4% translucency lets the dashboard's text ghost
+        // through the chart.
         let (sheet_bg, sheet_bdr, fg, sub_fg, muted_fg, track_bg, div_col, hov_bg, tile_bg) = if lt {
             (
-                rgba8(246, 249, 254, 0.97),
+                rgb8(246, 249, 254),
                 rgba8(20, 40, 75, 0.14),
                 rgb8(18, 26, 40),
                 rgba8(36, 52, 76, 0.84),
@@ -737,7 +738,7 @@ impl WeatherApp {
             )
         } else {
             (
-                rgba8(20, 28, 42, 0.96),
+                rgb8(20, 28, 42),
                 rgba8(255, 255, 255, 0.18),
                 Color::WHITE,
                 rgba8(224, 234, 248, 0.86),

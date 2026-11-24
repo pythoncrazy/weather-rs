@@ -325,7 +325,8 @@ pub enum WidgetCanvas {
     SkyParticles(bool, WeatherCondition, bool, f32),
     TempBar((f64, f64), (f64, f64), Option<f64>, bool),
     Spectrum(f32),
-    Compass(f64, String, &'static str, SkyPalette),
+    /// Wind compass: direction the wind comes from (`None` = calm / not reported: the dial is drawn without a needle).
+    Compass(Option<f64>, String, &'static str, SkyPalette),
     SunArc(Option<i64>, Option<i64>, i64, bool),
     Pressure(f64, i8, String, &'static str, SkyPalette),
     Moon(f64),
@@ -463,26 +464,28 @@ impl WidgetCanvas {
                     let col = if d == 0.0 { pal.text_primary } else { pal.text_muted };
                     label(f, l, p.x, p.y, col, if sm { 6.4 } else { 9.5 }, Weight::Bold);
                 }
-                let (to, (gap, wing)) = ((*deg as f32 + 90.0).to_radians(), if sm { (10.5, 4.2) } else { (17.5, 6.2) });
-                let (tip, tail) = (pt(to, rad), pt(to + PI, rad - 2.0));
-                let shaft = Path::new(|pb| {
-                    pb.move_to(tail);
-                    pb.line_to(pt(to + PI, gap));
-                    pb.move_to(pt(to, gap));
-                    pb.line_to(tip);
-                });
-                f.stroke(&shaft, Stroke::default().with_width(if sm { 1.3 } else { 1.7 }).with_color(needle));
-                circ(f, tail.x, tail.y, if sm { 1.8 } else { 2.6 }, needle);
-                let head = Path::new(|pb| {
-                    pb.move_to(tip);
-                    for a in [to - 0.45, to + 0.45] {
-                        pb.line_to(Point::new(tip.x - a.cos() * wing, tip.y - a.sin() * wing));
-                    }
-                    pb.close();
-                });
-                f.fill(&head, needle);
+                if let Some(deg) = deg {
+                    let (to, (gap, wing)) = ((*deg as f32 + 90.0).to_radians(), if sm { (10.5, 4.2) } else { (17.5, 6.2) });
+                    let (tip, tail) = (pt(to, rad), pt(to + PI, rad - 2.0));
+                    let shaft = Path::new(|pb| {
+                        pb.move_to(tail);
+                        pb.line_to(pt(to + PI, gap));
+                        pb.move_to(pt(to, gap));
+                        pb.line_to(tip);
+                    });
+                    f.stroke(&shaft, Stroke::default().with_width(if sm { 1.3 } else { 1.7 }).with_color(needle));
+                    circ(f, tail.x, tail.y, if sm { 1.8 } else { 2.6 }, needle);
+                    let head = Path::new(|pb| {
+                        pb.move_to(tip);
+                        for a in [to - 0.45, to + 0.45] {
+                            pb.line_to(Point::new(tip.x - a.cos() * wing, tip.y - a.sin() * wing));
+                        }
+                        pb.close();
+                    });
+                    f.fill(&head, needle);
+                }
                 if sm {
-                    label(f, compass_direction(*deg), cx, cy, pal.text_primary, 7.0, Weight::Bold);
+                    label(f, deg.map_or("—", compass_direction), cx, cy, pal.text_primary, 7.0, Weight::Bold);
                 } else {
                     label(f, speed_val, cx, cy - 4.5, pal.text_primary, 13.5, Weight::Bold);
                     label(f, *speed_unit, cx, cy + 7.5, pal.text_muted, 8.0, Weight::Semibold);
