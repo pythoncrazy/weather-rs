@@ -3447,15 +3447,17 @@ mod tests {
         refd[0..4].copy_from_slice(&[135, 138, 134, 240]);
         stylize_radar_tile("hrrr_refd_202611200000_0060", (5, 5, 11), &mut refd, 4, 4);
         assert!(refd[3] < 40, "got alpha {}", refd[3]);
+        // HRRR precipitation-type tiles: a row of 27.5–30 dBZ rain (IEM green #228a44) and a row of ~21 dBZ snow
+        // (IEM blue #0073a2) come out as radar-scale blue-violet rain and ice-cyan snow.
         let mut refp = vec![0u8; 64];
         for i in 0..4 {
-            refp[i * 4..i * 4 + 4].copy_from_slice(&[30, 210, 45, 240]);
+            refp[i * 4..i * 4 + 4].copy_from_slice(&[0x22, 0x8a, 0x44, 255]);
         }
         for i in 8..12 {
-            refp[i * 4..i * 4 + 4].copy_from_slice(&[80, 225, 255, 240]);
+            refp[i * 4..i * 4 + 4].copy_from_slice(&[0x00, 0x73, 0xa2, 255]);
         }
         stylize_radar_tile("hrrr_refp_202611200000_0060", (5, 5, 11), &mut refp, 4, 4);
-        assert!(refp[6] > refp[5] && refp[7] > 60 && refp[38] >= 200 && refp[39] > 60);
+        assert!(refp[6] > refp[5] && refp[7] > 60 && refp[38] >= 200 && refp[39] > 60, "got {:?} / {:?}", &refp[4..8], &refp[36..40]);
         // Verify ECCC GeoMet RDPS/GDPS `PRECIPPRTMMH-LINEAR` (MATLAB jet) remaps cleanly to Apple Weather blue/purple
         // and `eccc_out_*` masks CONUS interior to 0 while keeping offshore Pacific (z=5, x=4, y=12) opaque!
         let mut eccc_pac = vec![0u8; 64];
@@ -3796,6 +3798,49 @@ mod tests {
             eng.tick(&bundles, true);
         }
         assert!(!eng.radar.buffering && eng.radar.play_pos > 1.3, "playback stalled mid-loop at {}", eng.radar.play_pos);
+    }
+
+    /// Observed radar, HRRR and ECCC must put the same rain in the same colour: all three go through one reflectivity
+    /// scale, each decoded from its upstream's own published colour table.
+    #[test]
+    fn radar_and_model_rain_share_one_reflectivity_scale() {
+        use tiles::{HrrrPtype, dark_sky_rain, eccc_bar_to_mm_h, rain_rate_to_dbz, refp_decode};
+        // The radar scale reproduces rows of the published "Dark Sky" table exactly.
+        for (dbz, rgba) in [
+            (10.0, [0x00, 0x5e, 0xb6, 0x4c]),
+            (20.0, [0x00, 0x5e, 0xb6, 0x99]),
+            (23.0, [0x15, 0x5a, 0xb1, 0xc1]),
+            (30.0, [0x8e, 0x4b, 0x9b, 0xff]),
+            (33.0, [0xd0, 0x4f, 0x81, 0xff]),
+            (38.0, [0xfd, 0x8f, 0x6e, 0xff]),
+            (42.0, [0xff, 0xd3, 0x44, 0xff]),
+            (60.0, [0xff, 0xfd, 0x05, 0xff]),
+        ] {
+            let got = dark_sky_rain(dbz);
+            assert!(got.iter().zip(rgba).all(|(a, b)| (*a as i32 - b).abs() <= 1), "{dbz} dBZ: {got:?} vs {rgba:?}");
+        }
+        // IEM's HRRR palette decodes to its precipitation type and 2.5 dBZ step: the darkest green is 37.5–40 dBZ rain,
+        // the first yellow 40–42.5 dBZ rain, pink is 45–47.5 dBZ snow, salmon is freezing rain, purple ice pellets.
+        assert_eq!(refp_decode(0x00, 0x44, 0x1b), (HrrrPtype::Rain, 38.75));
+        assert_eq!(refp_decode(0xff, 0xe8, 0x1a), (HrrrPtype::Rain, 41.25));
+        assert_eq!(refp_decode(0xd6, 0xef, 0xd0), (HrrrPtype::Rain, 6.25));
+        assert_eq!(refp_decode(0xd8, 0x1b, 0x6a), (HrrrPtype::Snow, 46.25));
+        assert_eq!(refp_decode(0xfc, 0xa5, 0x88).0, HrrrPtype::Ice);
+        assert_eq!(refp_decode(0x93, 0x90, 0xc3).0, HrrrPtype::Ice);
+        // A colour one step off the palette (a resampled edge) still lands on the nearest entry.
+        assert_eq!(refp_decode(0x01, 0x45, 0x1c), (HrrrPtype::Rain, 38.75));
+        // ECCC's colour bar: its ticks sit at eighths, and rain rate converts to reflectivity by Marshall–Palmer.
+        for (t, mm_h) in [(0.0, 0.01), (0.25, 0.1), (0.5, 1.0), (0.625, 5.0), (0.75, 10.0), (1.0, 50.0)] {
+            assert!((eccc_bar_to_mm_h(t) - mm_h).abs() < 1e-4, "bar {t}");
+        }
+        assert!((eccc_bar_to_mm_h(0.6875) - 7.5).abs() < 1e-4);
+        assert!((rain_rate_to_dbz(1.0) - 23.01).abs() < 0.01 && (rain_rate_to_dbz(10.0) - 39.01).abs() < 0.01);
+        // So 10 mm/h from ECCC and a 37.5–40 dBZ HRRR cell are drawn in the same orange as 39 dBZ on radar.
+        let (eccc, hrrr, radar) =
+            (dark_sky_rain(rain_rate_to_dbz(10.0)), dark_sky_rain(refp_decode(0x00, 0x44, 0x1b).1), dark_sky_rain(39.0));
+        for other in [eccc, hrrr] {
+            assert!(other.iter().zip(radar).all(|(a, b)| (*a as i32 - b as i32).abs() <= 6), "{other:?} vs radar {radar:?}");
+        }
     }
 
     #[test]

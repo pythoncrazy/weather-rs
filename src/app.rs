@@ -2196,6 +2196,51 @@ mod tests {
         }
     }
 
+    /// Captures the dashboard and every detail sheet, and prints the upstream values behind them, so what is drawn can
+    /// be checked against what was fetched.
+    #[test]
+    #[ignore = "visual audit: run with WEATHER_RS_DASH_AUDIT=/tmp/dash cargo test --release audit_dashboard_cards -- --ignored --nocapture"]
+    fn audit_dashboard_cards() {
+        ensure_fonts_loaded();
+        let mut h = Harness::new(Size::new(1360.0, 1500.0), 1.0, iced::Point::new(10.0, 10.0), "WEATHER_RS_DASH_AUDIT");
+        let mut app = WeatherApp::boot().0;
+        let theme = match std::env::var("WEATHER_RS_DASH_THEME").as_deref() {
+            Ok("light") => ThemeMode::Light,
+            Ok("dark") => ThemeMode::Dark,
+            _ => ThemeMode::DynamicSky,
+        };
+        let _ = app.update(Msg::Pref(Pref::Theme(theme)));
+        let _ = app.update(Msg::WindowResized(Size::new(1360.0, 1500.0)));
+        pump(&mut app, 40, 120, true);
+        // Map tiles are requested by drawing, so draw a few frames before the capture.
+        h.pump_render(&mut app, 25, 100);
+        let _ = h.render(&mut app, &[], Some("00_dashboard"));
+        let _ = app.update(Msg::ToggleDayDetails(1));
+        let _ = h.render(&mut app, &[], Some("01_day_expanded"));
+        let _ = app.update(Msg::ToggleDayDetails(1));
+        for (i, m) in
+            [DetailMetric::Temperature, DetailMetric::Precipitation, DetailMetric::Wind, DetailMetric::UvIndex, DetailMetric::Pressure]
+                .into_iter()
+                .enumerate()
+        {
+            let _ = app.update(Msg::OpenDetail(m));
+            let _ = h.render(&mut app, &[], Some(&format!("1{i}_detail_{m:?}").to_lowercase()));
+            let _ = app.update(Msg::CloseDetail);
+        }
+        if let Some(b) = app.settings.selected_location_id.as_ref().and_then(|id| app.bundles.get(id)) {
+            println!("DASH source={} fetched={} lean={}", b.source_name, b.fetched_unix, b.lean);
+            println!("DASH current={:?}", b.current);
+            println!("DASH air={:?}", b.air_quality);
+            for d in b.daily.iter().take(10) {
+                println!("DASH day={d:?}");
+            }
+            for hr in b.hourly.iter().take(26) {
+                println!("DASH hour={hr:?}");
+            }
+            println!("DASH alerts={:?}", b.alerts);
+        }
+    }
+
     /// Plays the precipitation timeline in real time, exactly as the user would see it, and saves a frame every
     /// ~50 ms. Prints, per frame, the playhead and whether playback was waiting, so stalls and flicker are measurable.
     #[test]
@@ -2228,6 +2273,17 @@ mod tests {
         let settle_ms: u64 = std::env::var("WEATHER_RS_PLAYBACK_SETTLE_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(2000);
         h.pump_render(&mut app, (settle_ms / 50) as usize, 50);
         let secs: f32 = std::env::var("WEATHER_RS_PLAYBACK_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(16.0);
+        // WEATHER_RS_PLAYBACK_STILLS=1 first saves paused stills of the live radar frame and the frames after it, to
+        // compare how observed radar and the model forecast colour the same rain.
+        if std::env::var_os("WEATHER_RS_PLAYBACK_STILLS").is_some() {
+            let live = app.map.live_frame_idx();
+            for off in [0_usize, 1, 3, 5, 6, 7, 9] {
+                app.map.debug_set_play((live + off) as f32, false);
+                h.pump_render(&mut app, 30, 80);
+                let _ = h.render(&mut app, &[], Some(&format!("still_live+{off:02}")));
+            }
+            app.map.debug_set_play(live as f32, false);
+        }
         // WEATHER_RS_PLAYBACK_2X=1 plays at double speed (twice as many interpolated tiles to build per second).
         if std::env::var_os("WEATHER_RS_PLAYBACK_2X").is_some() {
             let _ = app.update(Msg::Map(MapMsg::CyclePlaybackSpeed));

@@ -1564,6 +1564,102 @@ static RAIN_LUT: LazyLock<[[u8; 3]; 256]> = LazyLock::new(|| {
     })
 });
 
+/// Display colour `[r, g, b, a]` of rain at radar reflectivity `dbz`: the "Dark Sky" radar scale (RainViewer /
+/// LibreWXR colour scheme 8), copied from its published table, which is piecewise linear between these 5 dBZ knots
+/// and constant above 45 dBZ. Observed radar tiles arrive already painted in this scale, so painting the model
+/// forecasts through the same function is what makes "orange" mean the same rain before and after "Now".
+pub(super) fn dark_sky_rain(dbz: f32) -> [u8; 4] {
+    const KNOTS: [(f32, [f32; 4]); 7] = [
+        (0.0, [0.0, 94.0, 182.0, 0.0]),
+        (20.0, [0.0, 94.0, 182.0, 153.0]),
+        (25.0, [36.0, 88.0, 175.0, 221.0]),
+        (30.0, [142.0, 75.0, 155.0, 255.0]),
+        (35.0, [252.0, 83.0, 112.0, 255.0]),
+        (40.0, [255.0, 183.0, 110.0, 255.0]),
+        (45.0, [255.0, 253.0, 5.0, 255.0]),
+    ];
+    let d = dbz.clamp(0.0, 45.0);
+    let i = KNOTS.iter().rposition(|k| k.0 <= d).unwrap_or(0).min(KNOTS.len() - 2);
+    let ((d0, c0), (d1, c1)) = (KNOTS[i], KNOTS[i + 1]);
+    let f = (d - d0) / (d1 - d0);
+    std::array::from_fn(|c| (c0[c] + (c1[c] - c0[c]) * f).round() as u8)
+}
+
+/// `dark_sky_rain` sampled every 0.25 dBZ from 0 to 63.75 dBZ.
+static DBZ_LUT: LazyLock<[[u8; 4]; 256]> = LazyLock::new(|| std::array::from_fn(|i| dark_sky_rain(i as f32 * 0.25)));
+
+/// Radar reflectivity (dBZ) equivalent to rain rate `mm_h`, by the Marshall–Palmer relation `Z = 200 R^1.6` — the
+/// standard conversion radar products themselves use between reflectivity and rain rate.
+pub(super) fn rain_rate_to_dbz(mm_h: f32) -> f32 {
+    if mm_h <= 0.0 { f32::NEG_INFINITY } else { 23.0103 + 16.0 * mm_h.log10() }
+}
+
+/// Rain rate (mm/h) at position `t` (0..=1) of ECCC GeoMet's `PRECIPPRTMMH-LINEAR` colour bar. Its legend places the
+/// values 0.01, 0.05, 0.1, 0.5, 1, 5, 10, 20 and 50 mm/h at nine evenly spaced positions, linear in between.
+pub(super) fn eccc_bar_to_mm_h(t: f32) -> f32 {
+    const TICKS: [f32; 9] = [0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 20.0, 50.0];
+    let x = t.clamp(0.0, 1.0) * 8.0;
+    let i = (x.floor() as usize).min(7);
+    TICKS[i] + (TICKS[i + 1] - TICKS[i]) * (x - i as f32)
+}
+
+/// Rain colour for every position of the ECCC colour bar (1024 steps), on the shared reflectivity scale.
+static ECCC_RAIN_LUT: LazyLock<[[u8; 4]; 1024]> =
+    LazyLock::new(|| std::array::from_fn(|i| dark_sky_rain(rain_rate_to_dbz(eccc_bar_to_mm_h(i as f32 / 1023.0)))));
+
+/// Precipitation type of an IEM HRRR "reflectivity with precipitation type" (REFP) pixel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum HrrrPtype {
+    Rain,
+    Snow,
+    /// Freezing rain or ice pellets.
+    Ice,
+}
+
+/// IEM's REFP palette (`pyiem.plot.colormaps.radar_ptype`): four ramps of 22 colours — rain, snow, freezing rain, ice
+/// pellets — where colour `k` of a ramp covers reflectivity `2.5 k ..= 2.5 k + 2.5` dBZ (IEM masks everything under
+/// 5 dBZ and clips at 55).
+const REFP_RAMPS: [[u32; 22]; 4] = [
+    [
+        0xeef8ea, 0xe5f5e0, 0xd6efd0, 0xc7e9c0, 0xb4e1ad, 0xa0d99b, 0x8ace88, 0x73c476, 0x5ab769, 0x40aa5d, 0x319a50, 0x228a44, 0x117b38,
+        0x006c2c, 0x005723, 0x00441b, 0xffe81a, 0xffd710, 0xffc505, 0xffb700, 0xffab00, 0xffa000,
+    ],
+    [
+        0xb4dae6, 0x99ccdd, 0x81c0d5, 0x66b3cc, 0x4ea6c4, 0x3399bb, 0x1b8db3, 0x0080aa, 0x0073a2, 0x006699, 0x005a91, 0x004d88, 0x003f7f,
+        0x003377, 0x00266e, 0x001a66, 0x8d003b, 0xb80b4e, 0xd81b6a, 0xe53592, 0xdf66b0, 0xcd8bc2,
+    ],
+    [
+        0xffeee6, 0xfee6da, 0xfedecf, 0xfdd0bc, 0xfcc2aa, 0xfcb499, 0xfca588, 0xfc9576, 0xfc8767, 0xfb7858, 0xfb694a, 0xf7593f, 0xf24734,
+        0xec382b, 0xde2b25, 0xd11e1f, 0xc4161c, 0xb61319, 0xa81016, 0x940b13, 0x7c0510, 0x67000d,
+    ],
+    [
+        0xf8f6fa, 0xf3f1f7, 0xeeecf4, 0xe6e5f1, 0xdedded, 0xd5d5e9, 0xcacae3, 0xbebfdd, 0xb4b4d7, 0xa9a7cf, 0x9e9ac8, 0x9390c3, 0x8885be,
+        0x7e79b8, 0x7669af, 0x6e58a7, 0x66499f, 0x5e3a98, 0x552a90, 0x4e1c8a, 0x460d83, 0x3f007d,
+    ],
+];
+
+/// Decodes one REFP pixel into its precipitation type and reflectivity (the centre of its 2.5 dBZ step). The tiles
+/// are palettized, so colours match the palette exactly; anything else (a resampled edge) takes the nearest entry.
+pub(super) fn refp_decode(r: u8, g: u8, b: u8) -> (HrrrPtype, f32) {
+    static EXACT: LazyLock<HashMap<u32, (HrrrPtype, f32)>> = LazyLock::new(|| {
+        let ptype = [HrrrPtype::Rain, HrrrPtype::Snow, HrrrPtype::Ice, HrrrPtype::Ice];
+        REFP_RAMPS
+            .iter()
+            .zip(ptype)
+            .flat_map(|(ramp, p)| ramp.iter().enumerate().map(move |(k, &c)| (c, (p, k as f32 * 2.5 + 1.25))))
+            .collect()
+    });
+    let key = (r as u32) << 16 | (g as u32) << 8 | b as u32;
+    if let Some(&hit) = EXACT.get(&key) {
+        return hit;
+    }
+    let dist = |c: u32| {
+        let (dr, dg, db) = ((c >> 16) as i32 - r as i32, ((c >> 8) & 255) as i32 - g as i32, (c & 255) as i32 - b as i32);
+        dr * dr + dg * dg + db * db
+    };
+    EXACT.iter().min_by_key(|(c, _)| dist(**c)).map_or((HrrrPtype::Rain, 0.0), |(_, &v)| v)
+}
+
 /// Soft-alpha knee LUT (`oa < 24 => oa*oa/24`, else identity) — zero division in inner loops.
 static SOFT_ALPHA: LazyLock<[u8; 256]> = LazyLock::new(|| std::array::from_fn(|i| if i < 24 { ((i * i) / 24) as u8 } else { i as u8 }));
 
@@ -1711,21 +1807,21 @@ pub(super) fn eccc_smooth_scalar(em: EcccMask, field: &mut [u16], tmp: &mut [u16
     }
 }
 
-/// Color-maps a smoothed ECCC scalar field covering exactly tile `coord` through `RAIN_LUT` and applies the exact
+/// Color-maps a smoothed ECCC scalar field covering exactly tile `coord` through `ECCC_RAIN_LUT` and applies the exact
 /// partition-of-unity domain mask (`HRRR + HRDPS + RDPS + GDPS == 1`). Returns `true` if any pixel is visible.
 pub(super) fn eccc_colorize(field: &[u16], em: EcccMask, coord: TileCoord, rgba: &mut [u8], wu: usize, hu: usize) -> bool {
-    let rain_lut = &*RAIN_LUT;
+    let rain_lut = &*ECCC_RAIN_LUT;
     let (tz, tx, ty) = coord;
     let n_tiles = (1_u64 << tz) as f64;
     let lon_0 = (tx as f64 / n_tiles) * 360.0 - 180.0;
     let lon_step = 360.0 / (n_tiles * wu.max(1) as f64);
     let mut vis = false;
-    // Calibrate ECCC `PRECIPPRTMMH-LINEAR` (0.01..50 mm/h) directly to Marshall-Palmer radar reflectivity (`dBZ`)
-    // matching live `LibreWXR` scheme 8:
-    // - Suppress sub-radar maritime trace drizzle `< ~0.18 mm/h` (`t < 0.29`, `< 15 dBZ`) so ocean static vanishes!
-    // - Map 0.5 mm/h (~20 dBZ) -> rich blue, 4–10 mm/h (~35–42 dBZ) -> purple/rose-magenta, 25+ mm/h -> coral/amber!
+    // The field holds positions on ECCC's colour bar. `ECCC_RAIN_LUT` turns a position into mm/h (from the bar's own
+    // tick values), mm/h into equivalent reflectivity (Marshall–Palmer), and that into the same radar colour scale
+    // the observed radar uses: 1 mm/h (23 dBZ) is blue, 5 mm/h (34 dBZ) rose, 10 mm/h (39 dBZ) orange, 25+ yellow.
+    // Trace drizzle under ~0.23 mm/h (`t < 0.29`, about 13 dBZ — below what radar displays) is not drawn, and the
+    // edge fades in up to 0.41 so the rain shield has no hard rim.
     const T_MIN: f32 = 0.29;
-    const T_MAX: f32 = 0.94;
     const T_MIN_U16: u16 = 19005;
     for py in 0..hu {
         let frow = &field[py * wu..(py + 1) * wu];
@@ -1759,10 +1855,8 @@ pub(super) fn eccc_colorize(field: &[u16], em: EcccMask, coord: TileCoord, rgba:
                 continue;
             }
             let t = *val as f32 * (1.0 / 65535.0);
-            let raw_i = ((t - T_MIN) * (1.0 / (T_MAX - T_MIN))).clamp(0.0, 1.0);
-            let inten = raw_i.powf(1.12);
-            let [cr, cg, cb] = rain_lut[(inten * 255.0) as usize];
-            let mut na = (118.0 + inten * 130.0).min(248.0);
+            let [cr, cg, cb, ca] = rain_lut[((t * 1023.0) as usize).min(1023)];
+            let mut na = (ca as f32).min(248.0);
             if t < 0.41 {
                 let u = (t - T_MIN) * (1.0 / (0.41 - T_MIN));
                 na *= u * u * (3.0 - 2.0 * u);
@@ -1846,7 +1940,8 @@ pub(super) fn stylize_radar_tile(ns: &str, coord: TileCoord, rgba: &mut [u8], w:
         }
         return vis;
     } else if refp || refd {
-        let rain_lut = &*RAIN_LUT;
+        let (rain_lut, dbz_lut) = (&*RAIN_LUT, &*DBZ_LUT);
+        let mut last = ([0_u8; 3], (HrrrPtype::Rain, 0.0_f32));
         let (wu, hu) = (w as usize, h as usize);
         let (tz, tx, ty) = coord;
         let feather_rim = super::overlays::tile_extends_outside_hrrr(tz, tx, ty);
@@ -1863,17 +1958,48 @@ pub(super) fn stylize_radar_tile(ns: &str, coord: TileCoord, rgba: &mut [u8], w:
                 }
                 let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
                 let sat = r.max(g).max(b) - r.min(g).min(b);
-                if (refd && sat < 28 && r > 110 && g > 110) || (sat < 16 && r > 205 && g > 205 && b > 205) {
+                // Plain-reflectivity (REFD) tiles: drop the grey clutter and near-white no-data shades of that palette.
+                if refd && ((sat < 28 && r > 110 && g > 110) || (sat < 16 && r > 205 && g > 205 && b > 205)) {
                     *px = [0, 0, 0, 0];
                     continue;
                 }
-                let (nr, ng, nb, na) = if refp && b > r + 14 && b >= g - 4 {
-                    // Match live LibreWXR scheme-8 crisp ice-cyan snow `[96..118, 204..228, 248..255]` (never murky slate!).
-                    let t = ((225 - r).clamp(0, 215) as f32) * (1.0 / 215.0);
-                    ((116.0 - t * 24.0) as u8, (226.0 - t * 24.0) as u8, (255.0 - t * 6.0) as u8, (132.0 + t * 82.0) as u32)
-                } else if refp && r > g + 18 && b > g + 12 {
-                    let t = ((230 - g).clamp(0, 210) as f32) * (1.0 / 210.0);
-                    ((216.0 + t * 28.0) as u8, (118.0 - t * 50.0) as u8, (242.0 - t * 48.0) as u8, (148.0 + t * 90.0) as u32)
+                let (nr, ng, nb, na) = if refp {
+                    // REFP pixels are decoded exactly: precipitation type and reflectivity from IEM's own palette.
+                    let key = [px[0], px[1], px[2]];
+                    if key != last.0 {
+                        last = (key, refp_decode(key[0], key[1], key[2]));
+                    }
+                    let (ptype, dbz) = last.1;
+                    // Snow and ice keep their own hues; like rain they fade in over the weakest echoes.
+                    let weak = {
+                        let u = ((dbz - 2.5) * (1.0 / 12.5)).clamp(0.0, 1.0);
+                        u * u * (3.0 - 2.0 * u)
+                    };
+                    match ptype {
+                        HrrrPtype::Rain => {
+                            let [cr, cg, cb, ca] = dbz_lut[((dbz * 4.0) as usize).min(255)];
+                            (cr, cg, cb, ca as u32)
+                        }
+                        HrrrPtype::Snow => {
+                            // Live LibreWXR scheme-8 ice-cyan snow `[96..118, 204..228, 248..255]`, deepening to 40 dBZ.
+                            let t = (dbz * (1.0 / 40.0)).clamp(0.0, 1.0);
+                            (
+                                (116.0 - t * 24.0) as u8,
+                                (226.0 - t * 24.0) as u8,
+                                (255.0 - t * 6.0) as u8,
+                                ((132.0 + t * 82.0) * weak) as u32,
+                            )
+                        }
+                        HrrrPtype::Ice => {
+                            let t = (dbz * (1.0 / 45.0)).clamp(0.0, 1.0);
+                            (
+                                (216.0 + t * 28.0) as u8,
+                                (118.0 - t * 50.0) as u8,
+                                (242.0 - t * 48.0) as u8,
+                                ((148.0 + t * 90.0) * weak) as u32,
+                            )
+                        }
+                    }
                 } else {
                     let inten = if r > 165 && b > 165 && g < 130 {
                         0.98_f32

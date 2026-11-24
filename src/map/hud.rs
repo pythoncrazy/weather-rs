@@ -669,7 +669,8 @@ impl MapEngine {
             WeatherOverlay::RadarTimeline | WeatherOverlay::NexradUsRadar => (
                 "Precipitation",
                 ["Extreme", "Heavy", "Moderate", "Light"].map(String::from).into(),
-                vec![rgb8(250, 208, 76), rgb8(242, 96, 134), rgb8(192, 82, 160), rgb8(118, 78, 182), rgb8(36, 98, 202), rgb8(12, 98, 198)],
+                // The radar colour scale itself (`tiles::dark_sky_rain`) at 45, 40, 35, 30, 25 and 20 dBZ.
+                vec![rgb8(255, 253, 5), rgb8(255, 183, 110), rgb8(252, 83, 112), rgb8(142, 75, 155), rgb8(36, 88, 175), rgb8(0, 94, 182)],
             ),
             WeatherOverlay::Temperature => (
                 "Temperature",
