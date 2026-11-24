@@ -4,5 +4,6 @@ This directory is iced_tiny_skia 0.14.1 from crates.io with these changes:
 - `draw_quad` computes the shadow pixels only in the clip bounds and not under the fill of an opaque quad, and fills only the visible rectangle of a quad when the clip bounds miss its rounded corners.
 - `draw_image` intersects per-image `clip_bounds` (from `Canvas` / `Frame::with_clip`) with `layer_bounds` before rasterizing raster or vector images.
 - The damage of two lists of layers, quads, text, primitives or images skips the items that both lists start or end with.
+- Raster images are positioned through the transform in exact destination pixels. The original code passed the origin to `draw_pixmap` as an integer in source pixels, which moved an upscaled image by up to one source pixel and made adjacent map tiles overlap.
 
 Delete this directory and its [patch.crates-io] entry in the root Cargo.toml when an iced release contains these changes.

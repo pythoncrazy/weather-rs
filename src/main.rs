@@ -95,16 +95,15 @@ fn configure_display() {
         if env::var_os("WAYLAND_DISPLAY").is_some() && !linux_display::wayland_live() {
             unsafe { env::remove_var("WAYLAND_DISPLAY") };
         }
-        let need_gl = env::var_os("WAYLAND_DISPLAY").is_none()
+        // An X11 display without DRI3 (Xvfb, VNC / remote X, some nested servers) cannot present a GPU surface. Forcing
+        // wgpu onto software OpenGL there aborts at startup ("Surface::configure: Invalid surface"), so pick iced's
+        // software renderer outright — unless the user chose a backend themselves.
+        let no_gpu_present = env::var_os("WAYLAND_DISPLAY").is_none()
             && env::var_os("WGPU_BACKEND").is_none()
+            && env::var_os("ICED_BACKEND").is_none()
             && env::var("DISPLAY").is_ok_and(|d| !d.is_empty() && !linux_display::x11_has_dri3(&d));
-        if need_gl {
-            unsafe {
-                env::set_var("WGPU_BACKEND", "gl");
-                if env::var_os("LIBGL_ALWAYS_SOFTWARE").is_none() {
-                    env::set_var("LIBGL_ALWAYS_SOFTWARE", "1");
-                }
-            }
+        if no_gpu_present {
+            unsafe { env::set_var("ICED_BACKEND", "tiny-skia") };
         }
     }
 }

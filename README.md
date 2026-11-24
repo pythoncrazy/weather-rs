@@ -14,7 +14,7 @@ It uses `iced` and `wgpu` for GPU graphics, with a `tiny-skia` software fallback
   - **Point inspector and map styles**: Click any point on the map to read local weather. Switch among five map styles: Standard Light, Dark Canvas, Satellite, Topographic, and OpenStreetMap.
 - **Forecast cards**: Cards show 60-minute precipitation, 24-hour and 10-day forecasts, UV index, AQI, wind, sun and moon cycles, pressure, humidity, visibility, and climate averages.
 - **Offline cache and settings**: The app saves forecasts and map tiles to disk. You can search locations, save cities, choose units, set a 12-hour or 24-hour clock, and select a theme.
-- **Linux desktop integration**: On Linux, the app detects Wayland sockets and X11 DRI3 support at startup. It draws Wayland titlebars with GTK3, and sets `weather-rs` as the application ID so the packaged freedesktop launcher entry matches its window.
+- **Linux desktop integration**: On Linux, the app detects Wayland sockets and X11 DRI3 support at startup. On an X11 display without DRI3, such as VNC or Xvfb, it uses the software renderer. It draws Wayland titlebars with GTK3, and sets `weather-rs` as the application ID so the packaged freedesktop launcher entry matches its window.
 
 ## Build and run
 
@@ -59,6 +59,14 @@ cargo clippy --all-targets -- -D warnings
 ICED_TEST_BACKEND=wgpu cargo test
 ```
 
+To test the real binary from start to finish, run the smoke test. It needs `xvfb-run` and ImageMagick:
+
+```bash
+scripts/e2e-smoke.sh
+```
+
+The script launches the release build on a private virtual display with an empty cache. It saves a screenshot every half second and fails if the app exits or logs a panic.
+
 Performance benchmarks and the current numbers are in [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ## Source layout
@@ -74,7 +82,7 @@ Performance benchmarks and the current numbers are in [`docs/PERFORMANCE.md`](do
 
 `Cargo.toml` applies two local patches in `vendor/`:
 
-- `vendor/iced_tiny_skia` (`0.14.1`) adds quad shadows and per-image `Frame::with_clip` support to the software renderer. See `vendor/iced_tiny_skia/README`.
+- `vendor/iced_tiny_skia` (`0.14.1`) adds quad shadows and per-image `Frame::with_clip` support to the software renderer. It also positions images in exact destination pixels, so adjacent map tiles do not overlap. See `vendor/iced_tiny_skia/README`.
 - `vendor/sctk-adwaita` (`0.10.1`) draws Wayland titlebars with the system GTK3 theme and a built-in fallback. See `vendor/sctk-adwaita/README`.
 
 Remove both directories after upstream releases include these fixes.

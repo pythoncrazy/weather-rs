@@ -473,7 +473,11 @@ impl WeatherApp {
 
     pub(crate) fn view_aqi_card(&self, b: &WeatherBundle, p: SkyPalette, w: f32, h: f32) -> El<'static> {
         let Some(a) = &b.air_quality else {
-            return simple(p, (w, h), UiIcon::Air, "AIR QUALITY", DASH.into(), "Not available from the air quality feed.", None);
+            // The forecast is painted before the slower air-quality request returns: until this bundle's full fetch
+            // has completed, the value is still on its way rather than unavailable.
+            let pending = !b.lean && b.full_fetched_unix.is_none();
+            let note = if pending { "Loading…" } else { "Not available from the air quality feed." };
+            return simple(p, (w, h), UiIcon::Air, "AIR QUALITY", DASH.into(), note, None);
         };
         let (cat, sum) = a.info();
         let note = match a.pm2_5 {

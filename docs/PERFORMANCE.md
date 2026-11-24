@@ -10,6 +10,7 @@ Always set `ICED_TEST_BACKEND=wgpu`. Without it the headless harness can fall ba
 | --- | --- | --- |
 | Timeline load, cold cache | `XDG_CACHE_HOME=$(mktemp -d) ICED_TEST_BACKEND=wgpu cargo test --release bench_live_radar_replay_buffering -- --ignored --nocapture` | Time until the first and until every timeline frame is ready, playback stalls, and requests, bytes and latency per upstream host. |
 | App benchmark | `ICED_TEST_BACKEND=wgpu cargo test --release perf_benchmark -- --ignored --nocapture` | Startup cost, weather fetch latency and bytes, CPU hot paths, and frame times. |
+| End-to-end smoke test | `scripts/e2e-smoke.sh` | Launches the real binary on a virtual display with an empty cache. Reports when each screenshot was taken and the resident memory. |
 
 The timeline benchmark uses live upstream servers, so latency varies between runs by a factor of two or more. Request counts and bytes are stable; compare those first.
 
@@ -55,3 +56,12 @@ Frame times vary between runs with whatever else the desktop is drawing. The val
 | Scalar field build | 0.39 ms |
 | Isobar build | 0.11 ms |
 | Hover readout | 5 µs |
+
+## Cold launch of the real binary (2026-11-24)
+
+Measured with `scripts/e2e-smoke.sh`: empty cache and config, software renderer on a virtual display.
+
+| Metric | Value |
+| --- | --- |
+| Complete dashboard on screen (forecast, sidebar cities, mini-map) | within 0.58 s of launch |
+| Resident memory after 5.5 s | 96 MB |
