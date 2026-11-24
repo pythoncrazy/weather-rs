@@ -115,8 +115,9 @@ fn main() -> iced::Result {
     sctk_adwaita::preload();
     style::preload_fonts();
     icons::preload_cloud_tex();
-    const ICON_SVG: &str = r##"<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#1872D8"/><stop offset="1" stop-color="#48ACF4"/></linearGradient></defs><rect width="64" height="64" rx="14" fill="url(#g)"/><circle cx="26" cy="24" r="10.5" fill="#FFD640"/><circle cx="26" cy="39" r="9.5" fill="#F8FCFF"/><circle cx="36" cy="36" r="11.5" fill="#F8FCFF"/><circle cx="45" cy="40" r="8.5" fill="#F8FCFF"/>"##;
-    let icon = window::icon::from_rgba(icons::render_svg_rgba(ICON_SVG, 64, 64.0), 64, 64).ok();
+    // Single source of truth for the app icon: the same SVG the packaged launcher icons are rendered from.
+    const ICON_SVG: &str = include_str!("../assets/icons/weather-rs.svg");
+    let icon = window::icon::from_rgba(icons::render_svg_doc_rgba(ICON_SVG, 64, 64.0), 64, 64).ok();
     let win = window::Settings {
         size: Size::new(1180.0, 760.0),
         min_size: Some(Size::new(720.0, 520.0)),

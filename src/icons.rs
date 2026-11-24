@@ -44,9 +44,12 @@ fn label(f: &mut Frame, s: impl Into<String>, x: f32, y: f32, c: Color, sz: f32,
     });
 }
 pub fn render_svg_rgba(inner: &str, px_sz: u32, vb: f32) -> Vec<u8> {
-    let s = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {vb} {vb}">{inner}</svg>"#);
+    render_svg_doc_rgba(&format!(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {vb} {vb}">{inner}</svg>"#), px_sz, vb)
+}
+/// Rasterizes a complete SVG document with a square `vb × vb` view box into `px_sz × px_sz` straight-alpha RGBA.
+pub fn render_svg_doc_rgba(s: &str, px_sz: u32, vb: f32) -> Vec<u8> {
     let mut px = resvg::tiny_skia::Pixmap::new(px_sz, px_sz).expect("pixmap");
-    if let Ok(tree) = resvg::usvg::Tree::from_str(&s, &resvg::usvg::Options::default()) {
+    if let Ok(tree) = resvg::usvg::Tree::from_str(s, &resvg::usvg::Options::default()) {
         resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(px_sz as f32 / vb, px_sz as f32 / vb), &mut px.as_mut());
     }
     let mut rgba = px.take();

@@ -14,6 +14,27 @@ readme = "README.md"
 keywords = ["weather", "radar", "iced", "desktop", "gis"]
 categories = ["gui", "science"]
 
+# `cargo packager --release` builds native installers (Linux .deb / AppImage / pacman, macOS .app / .dmg, Windows NSIS).
+[package.metadata.packager]
+product-name = "Weather RS"
+identifier = "io.github.pythoncrazy.weather-rs"
+category = "Weather"
+description = "Fast native weather forecast and live radar map"
+homepage = "https://github.com/pythoncrazy/weather-rs"
+license-file = "LICENSE"
+before-packaging-command = "cargo build --release --locked"
+icons = [
+    "assets/icons/32x32.png",
+    "assets/icons/128x128.png",
+    "assets/icons/256x256.png",
+    "assets/icons/512x512.png",
+    "assets/icons/icon.icns",
+    "assets/icons/icon.ico",
+]
+
+[package.metadata.packager.deb]
+desktop-template = "packaging/weather-rs.desktop"
+
 [dependencies]
 iced = { version = "=0.14.0", default-features = false, features = ["canvas", "image-without-codecs", "advanced", "wgpu-bare", "tiny-skia", "tokio", "x11", "wayland", "web-colors", "crisp", "lazy"] }
 iced_runtime = { version = "=0.14.0", default-features = false }

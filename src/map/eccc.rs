@@ -5,20 +5,21 @@
 //! as rhythmic blurring and "breathing" during playback. Instead, every sub-hourly forecast frame is synthesized here
 //! on the CPU, in scalar-intensity space, before color-mapping:
 //!
-//! 1. Both bracketing hourly rasters are fetched once with a margin of real neighboring data ([`GUTTER`] px), reverse-mapped
-//!    to a scalar intensity field and smoothed ([`source`]).
+//! 1. Both bracketing hourly rasters are downloaded once by the tile pool, with a margin of real neighboring data
+//!    ([`GUTTER`] px), then reverse-mapped to a scalar intensity field and smoothed ([`ingest_source`]).
 //! 2. A dense displacement field between the two hours is estimated by regularized block matching ([`estimate_flow`]).
 //! 3. Each quarter-hour frame warps both hours toward its own timestamp along that field and blends the intensities
 //!    ([`warp_blend`]), so rain bands travel instead of fading out in one place and fading in at another.
 //!
-//! Only the hourly source rasters hit the network and the disk cache; derived frames are rebuilt from them on demand.
+//! Only the hourly source rasters hit the network and the disk cache — as ordinary tile jobs, so every raster is
+//! requested once and all of them download in parallel; derived frames are rebuilt from them on demand, off-network.
 
 use super::tiles::{
     AlphaThumb, DecGate, EcccMask, TileCoord, bleed_transparent_edges, build_alpha_thumb, eccc_colorize, eccc_extract_scalar,
     eccc_smooth_scalar,
 };
-use crate::providers::{ECCC_GUTTER_PX, EcccModel, RainViewerFrame, WeatherClient};
-use crate::storage::{delete_cached_tile, is_shutting_down, load_cached_tile, save_cached_tile};
+use crate::providers::{ECCC_GUTTER_PX, EcccModel, RainViewerFrame};
+use crate::storage::{delete_cached_tile, load_cached_tile};
 use iced::advanced::image as adv_image;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -332,19 +333,52 @@ pub(super) fn estimate_flow(a: &Field, b: &Field, max_px: f32) -> Flow {
     Flow { gw, gh, vx, vy }
 }
 
-/// Synthesizes the `TILE×TILE` scalar field at fraction `f` (`0..1`) of the way from hourly raster `a` to `b`:
-/// both rasters are warped toward the intermediate time along `flow` and their intensities blended. A missing
-/// (precipitation-free) raster contributes zero, so rain simply decays into / grows out of dry hours.
-pub(super) fn warp_blend(a: Option<&Field>, b: Option<&Field>, flow: &Flow, f: f32, out: &mut [u16]) {
-    let Some((ox, oy)) = a.or(b).map(|r| (r.ox, r.oy)) else {
+/// Where an output tile sits inside its source raster: output pixel `p` reads source position `origin + p · scale`.
+#[derive(Clone, Copy)]
+pub(super) struct View {
+    x0: f32,
+    y0: f32,
+    scale: f32,
+}
+
+impl View {
+    /// The output tile is the source raster's own `TILE×TILE` block (after its `(ox, oy)` margin), pixel for pixel.
+    const fn same(ox: usize, oy: usize) -> Self {
+        Self { x0: ox as f32, y0: oy as f32, scale: 1.0 }
+    }
+    /// The output tile is quadrant `(qx, qy)` of the source raster's block, upsampled 2× (pixel centers aligned).
+    const fn quadrant(ox: usize, oy: usize, qx: u32, qy: u32) -> Self {
+        let half = (TILE / 2) as f32;
+        Self { x0: ox as f32 + qx as f32 * half - 0.25, y0: oy as f32 + qy as f32 * half - 0.25, scale: 0.5 }
+    }
+}
+
+/// Source raster used to build output tile `coord` of `model`, plus the quadrant of it the tile covers (if any).
+///
+/// HRDPS (2.5 km) tiles are built from a raster of the same tile. RDPS (10 km) and GDPS (15 km) are coarser than a
+/// tile's pixels even one zoom level up, so four sibling tiles share ONE parent-zoom raster: a quarter of the WMS
+/// requests and bytes, one flow field instead of four, and no loss of real model detail — contours stay crisp because
+/// the 2× upsampling happens on the smooth scalar field before color-mapping.
+fn source_tile(model: EcccModel, (z, x, y): TileCoord) -> (TileCoord, Option<(u32, u32)>) {
+    match model {
+        EcccModel::Rdps | EcccModel::Gdps if z >= 2 => ((z - 1, x >> 1, y >> 1), Some((x & 1, y & 1))),
+        _ => ((z, x, y), None),
+    }
+}
+
+/// Synthesizes the `TILE×TILE` scalar field seen through `view` at fraction `f` (`0..1`) of the way from hourly raster
+/// `a` to `b`: both rasters are warped toward the intermediate time along `flow` and their intensities blended. A
+/// missing (precipitation-free) raster contributes zero, so rain simply decays into / grows out of dry hours.
+pub(super) fn warp_blend(a: Option<&Field>, b: Option<&Field>, flow: &Flow, f: f32, view: View, out: &mut [u16]) {
+    if a.is_none() && b.is_none() {
         out.fill(0);
         return;
-    };
+    }
     for py in 0..TILE {
-        let y = (py + oy) as f32;
+        let y = view.y0 + py as f32 * view.scale;
         let row = &mut out[py * TILE..(py + 1) * TILE];
         for (px, dst) in row.iter_mut().enumerate() {
-            let x = (px + ox) as f32;
+            let x = view.x0 + px as f32 * view.scale;
             let (vx, vy) = flow.at(x, y);
             let va = a.map_or(0.0, |r| r.sample(x - f * vx, y - f * vy));
             let vb = b.map_or(0.0, |r| r.sample(x + (1.0 - f) * vx, y + (1.0 - f) * vy));
@@ -421,82 +455,92 @@ const fn tier(model: EcccModel) -> u8 {
     }
 }
 
-enum SrcErr {
-    /// The raster is neither in memory nor on disk and no HTTP client was supplied.
-    NeedNet,
-    Failed,
+/// One hourly WMS raster a tile build is waiting for. The tile pool downloads it as an ordinary (deduplicated,
+/// prioritized, disk-cached) tile job and re-runs the build once it has arrived.
+#[derive(Debug, Clone)]
+pub(super) struct SourceReq {
+    pub ns: String,
+    pub coord: TileCoord,
+    pub url: String,
 }
 
-/// Network / cache context shared by every source fetch of one tile build.
-pub(super) struct Ctx<'a> {
-    pub client: Option<&'a WeatherClient>,
-    pub gate: &'a DecGate,
-    pub ttl: Duration,
-    pub timeouts_ms: (u64, u64),
+/// Tile namespace under which `model`'s hourly raster for UTC hour `hour` is fetched and cached.
+fn source_ns(model: EcccModel, hour: i64) -> String {
+    format!("eccc_{}_src_g{GUTTER}_{hour}", model.tag())
 }
 
-/// Loads the smoothed scalar field of `model`'s hourly raster for `coord` at UTC hour `hour`: memory → disk cache →
-/// network (one retry). `Ok(None)` means the raster exists but holds no precipitation.
-fn source(cx: &Ctx<'_>, model: EcccModel, hour: i64, coord: TileCoord) -> Result<Option<Arc<Field>>, SrcErr> {
+/// True if `ns` names hourly source rasters (see [`source_ns`]) rather than displayable tiles.
+#[inline]
+pub(super) fn is_source_ns(ns: &str) -> bool {
+    ns.starts_with("eccc_") && ns.contains("_src_g")
+}
+
+fn parse_source_ns(ns: &str) -> Option<(EcccModel, i64)> {
+    let mut it = ns.strip_prefix("eccc_")?.split('_');
+    let model = model_from_tag(it.next()?)?;
+    (it.next()? == "src").then_some(())?;
+    Some((model, it.nth(1)?.parse().ok()?))
+}
+
+fn model_from_tag(tag: &str) -> Option<EcccModel> {
+    EcccModel::ALL.into_iter().find(|m| m.tag() == tag)
+}
+
+/// Decodes a downloaded (or disk-cached) hourly raster and keeps its smoothed scalar field in memory for the tile
+/// builds that need it. Returns `Some(has_precipitation)`, or `None` if `bytes` is not a valid raster for this tile
+/// (e.g. a WMS service-exception document), in which case nothing is stored.
+pub(super) fn ingest_source(gate: &DecGate, ns: &str, coord: TileCoord, bytes: &[u8]) -> Option<bool> {
+    let (model, hour) = parse_source_ns(ns)?;
+    let field = decode_source(gate, model, hour, coord, bytes)?;
+    if let Ok(mut g) = SOURCES.lock() {
+        g.put((0, tier(model), hour, coord.0, coord.1, coord.2), field.clone());
+    }
+    Some(field.is_some())
+}
+
+/// `Some(None)` = valid raster without precipitation (stored on disk as a 1-byte sentinel).
+fn decode_source(gate: &DecGate, model: EcccModel, hour: i64, (z, x, y): TileCoord, bytes: &[u8]) -> Option<Option<Arc<Field>>> {
+    if bytes == [0] {
+        return Some(None);
+    }
+    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
+        return None;
+    }
+    let (_, [gl, gt, pw, ph]) = RainViewerFrame::eccc_wms_request(model, hour, z, x, y, ECCC_GUTTER_PX)?;
+    let _permit = gate.enter();
+    let img = ::image::load_from_memory_with_format(bytes, ::image::ImageFormat::WebP).ok()?.into_rgba8();
+    (img.dimensions() == (pw, ph))
+        .then(|| Field::from_rgba(model, img.as_raw(), pw as usize, ph as usize, gl as usize, gt as usize).map(Arc::new))
+}
+
+/// Smoothed scalar field of `model`'s hourly raster for `coord` at UTC hour `hour`, from memory or the disk cache.
+/// `Ok(None)` means the raster holds no precipitation; `Err` carries the download the caller must wait for.
+fn source(gate: &DecGate, ttl: Duration, model: EcccModel, hour: i64, coord: TileCoord) -> Result<Option<Arc<Field>>, SourceReq> {
     let (z, x, y) = coord;
     let key: MemoKey = (0, tier(model), hour, z, x, y);
     let cached = |k: &MemoKey| SOURCES.lock().ok().and_then(|g| g.get(k));
     if let Some(f) = cached(&key) {
         return Ok(f);
     }
+    // Single-flight: concurrent builds needing the same raster decode it from disk once.
     let lock = key_lock(key);
     let _held = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(f) = cached(&key) {
         return Ok(f);
     }
-    let (url, [gl, gt, pw, ph]) = RainViewerFrame::eccc_wms_request(model, hour, z, x, y, ECCC_GUTTER_PX).ok_or(SrcErr::Failed)?;
-    let ns = format!("eccc_{}_src_g{GUTTER}_{hour}", model.tag());
-    let decode = |bytes: &[u8]| -> Result<Option<Arc<Field>>, SrcErr> {
-        if bytes == [0] {
-            return Ok(None);
-        }
-        let _permit = cx.gate.enter();
-        let img = ::image::load_from_memory_with_format(bytes, ::image::ImageFormat::WebP).map_err(|_| SrcErr::Failed)?.into_rgba8();
-        if img.dimensions() != (pw, ph) {
-            return Err(SrcErr::Failed);
-        }
-        Ok(Field::from_rgba(model, img.as_raw(), pw as usize, ph as usize, gl as usize, gt as usize).map(Arc::new))
-    };
-    let remember = |field: &Option<Arc<Field>>| {
-        if let Ok(mut g) = SOURCES.lock() {
-            g.put(key, field.clone());
-        }
-    };
-    if let Some(bytes) = load_cached_tile(&ns, z, x, y, cx.ttl) {
-        if let Ok(field) = decode(&bytes) {
-            remember(&field);
+    let ns = source_ns(model, hour);
+    if let Some(bytes) = load_cached_tile(&ns, z, x, y, ttl) {
+        if let Some(field) = decode_source(gate, model, hour, coord, &bytes) {
+            if let Ok(mut g) = SOURCES.lock() {
+                g.put(key, field.clone());
+            }
             return Ok(field);
         }
-        // A corrupt cache entry must never pin this tile to failure: drop it and fall through to the network.
+        // A corrupt cache entry must never pin this tile to failure: drop it and download again.
         delete_cached_tile(&ns, z, x, y);
     }
-    let c = cx.client.ok_or(SrcErr::NeedNet)?;
-    let bytes = c
-        .fetch_bytes_timeout(&url, cx.timeouts_ms.0)
-        .or_else(|e| {
-            if is_shutting_down() {
-                return Err(e);
-            }
-            std::thread::sleep(Duration::from_millis(120));
-            c.fetch_bytes_timeout(&url, cx.timeouts_ms.1)
-        })
-        .map_err(|_| SrcErr::Failed)?;
-    // Anything that is not a WebP raster is a WMS service exception (XML): never cache or decode it.
-    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
-        return Err(SrcErr::Failed);
-    }
-    let field = decode(&bytes)?;
-    if !is_shutting_down() {
-        // Precipitation-free rasters store a 1-byte sentinel so reloads skip the WebP decode entirely.
-        save_cached_tile(&ns, z, x, y, if field.is_some() { &bytes } else { &[0] });
-    }
-    remember(&field);
-    Ok(field)
+    let url = RainViewerFrame::eccc_wms_request(model, hour, z, x, y, ECCC_GUTTER_PX).map_or_else(String::new, |r| r.0);
+    Err(SourceReq { ns, coord, url })
 }
 
 /// Memoized hour-long displacement field between `a` (UTC hour `h0`) and `b` (`h0 + 1h`) for `coord`.
@@ -535,12 +579,7 @@ pub(super) fn is_job_spec(url: &str) -> bool {
 
 fn parse_spec(spec: &str) -> Option<(EcccModel, i64, u8)> {
     let mut it = spec.strip_prefix("eccc-morph:")?.split(':');
-    let model = match it.next()? {
-        "hrdps" => EcccModel::Hrdps,
-        "rdps" => EcccModel::Rdps,
-        "gdps" => EcccModel::Gdps,
-        _ => return None,
-    };
+    let model = model_from_tag(it.next()?)?;
     let (h0, q) = (it.next()?.parse().ok()?, it.next()?.parse::<u8>().ok()?);
     (q < SUBSTEPS).then_some((model, h0, q))
 }
@@ -548,41 +587,34 @@ fn parse_spec(spec: &str) -> Option<(EcccModel, i64, u8)> {
 pub(super) enum Built {
     /// Finished tile (`None` image = no visible precipitation in this tile).
     Done(Option<adv_image::Handle>, Option<AlphaThumb>),
-    /// A source raster must be downloaded; retry with an HTTP client.
-    NeedNet,
+    /// Hourly rasters that must be downloaded before this tile can be built.
+    Need(Vec<SourceReq>),
     Failed,
 }
 
-/// Builds the ECCC precipitation tile `coord` of namespace `ns` described by `spec` (see [`job_spec`]).
-pub(super) fn build(cx: &Ctx<'_>, ns: &str, spec: &str, coord: TileCoord) -> Built {
+/// Builds the ECCC precipitation tile `coord` of namespace `ns` described by `spec` (see [`job_spec`]) from hourly
+/// rasters already in memory or on disk. Never touches the network: missing rasters are reported via [`Built::Need`].
+pub(super) fn build(gate: &DecGate, ttl: Duration, ns: &str, spec: &str, coord: TileCoord) -> Built {
     let (Some(em), Some((model, h0, q))) = (EcccMask::from_ns(ns), parse_spec(spec)) else { return Built::Failed };
-    let load = |hour: i64| match source(cx, model, hour, coord) {
-        Ok(f) => Ok(f),
-        Err(SrcErr::NeedNet) => Err(Built::NeedNet),
-        Err(SrcErr::Failed) => Err(Built::Failed),
-    };
-    let a = match load(h0) {
-        Ok(f) => f,
-        Err(e) => return e,
-    };
-    let b = if q == 0 {
-        None
-    } else {
-        match load(h0 + 3600) {
-            Ok(f) => f,
-            Err(e) => return e,
+    let (src, quadrant) = source_tile(model, coord);
+    let a = source(gate, ttl, model, h0, src);
+    let b = if q == 0 { Ok(None) } else { source(gate, ttl, model, h0 + 3600, src) };
+    let (a, b) = match (a, b) {
+        (Ok(a), Ok(b)) => (a, b),
+        (a, b) => {
+            let need: Vec<SourceReq> = [a.err(), b.err()].into_iter().flatten().collect();
+            return if need.iter().any(|r| r.url.is_empty()) { Built::Failed } else { Built::Need(need) };
         }
     };
-    if a.is_none() && b.is_none() {
-        return Built::Done(None, None);
-    }
+    let Some((ox, oy)) = a.as_deref().or(b.as_deref()).map(|r| (r.ox, r.oy)) else { return Built::Done(None, None) };
     let flow = match (&a, &b) {
-        (Some(fa), Some(fb)) => flow_between(cx.gate, model, h0, coord, fa, fb),
+        (Some(fa), Some(fb)) => flow_between(gate, model, h0, src, fa, fb),
         _ => Arc::new(Flow::zero()),
     };
-    let _permit = cx.gate.enter();
+    let view = quadrant.map_or(View::same(ox, oy), |(qx, qy)| View::quadrant(ox, oy, qx, qy));
+    let _permit = gate.enter();
     let mut out = vec![0_u16; TILE * TILE];
-    warp_blend(a.as_deref(), b.as_deref(), &flow, q as f32 / SUBSTEPS as f32, &mut out);
+    warp_blend(a.as_deref(), b.as_deref(), &flow, q as f32 / SUBSTEPS as f32, view, &mut out);
     let (h, th) = finish(&out, em, coord);
     Built::Done(h, th)
 }
@@ -590,6 +622,8 @@ pub(super) fn build(cx: &Ctx<'_>, ns: &str, spec: &str, coord: TileCoord) -> Bui
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const VIEW: View = View::same(GUTTER, GUTTER);
 
     /// Synthetic field: one Gaussian rain cell centered at source pixel `(cx, cy)`.
     fn blob(cx: f32, cy: f32, sigma: f32, peak: f32) -> Field {
@@ -627,7 +661,7 @@ mod tests {
         let (vx, vy) = flow.at(320.0, 292.0);
         assert!((vx - 40.0).abs() < 4.0 && (vy - 24.0).abs() < 4.0, "flow at cell = ({vx:.1}, {vy:.1}), expected ~(40, 24)");
         let mut mid = vec![0_u16; TILE * TILE];
-        warp_blend(Some(&a), Some(&b), &flow, 0.5, &mut mid);
+        warp_blend(Some(&a), Some(&b), &flow, 0.5, VIEW, &mut mid);
         let (cx, cy, peak) = centroid(&mid);
         // Halfway through the hour the cell sits halfway along its track (tile px = source px - GUTTER) ...
         assert!((cx - (320.0 - GUTTER as f32)).abs() < 3.0 && (cy - (292.0 - GUTTER as f32)).abs() < 3.0, "centroid ({cx:.1}, {cy:.1})");
@@ -635,7 +669,7 @@ mod tests {
         assert!(peak > 0.72, "mid-hour peak {peak:.2} collapsed like a double exposure");
         // Without motion compensation the same blend really does collapse.
         let mut naive = vec![0_u16; TILE * TILE];
-        warp_blend(Some(&a), Some(&b), &Flow::zero(), 0.5, &mut naive);
+        warp_blend(Some(&a), Some(&b), &Flow::zero(), 0.5, VIEW, &mut naive);
         assert!(centroid(&naive).2 < 0.6);
     }
 
@@ -649,7 +683,7 @@ mod tests {
         let b = blob(360.0, 320.0, 30.0, 0.7);
         let moving = estimate_flow(&a, &b, 80.0);
         let mut out = vec![0_u16; TILE * TILE];
-        warp_blend(Some(&a), None, &moving, 0.0, &mut out);
+        warp_blend(Some(&a), None, &moving, 0.0, VIEW, &mut out);
         let (cx, cy, peak) = centroid(&out);
         assert!((cx - (320.0 - GUTTER as f32)).abs() < 0.5 && (cy - (320.0 - GUTTER as f32)).abs() < 0.5 && (peak - 0.7).abs() < 0.01);
     }
@@ -658,9 +692,29 @@ mod tests {
     fn rain_fades_in_from_a_dry_hour() {
         let b = blob(320.0, 320.0, 30.0, 0.8);
         let mut out = vec![0_u16; TILE * TILE];
-        warp_blend(None, Some(&b), &Flow::zero(), 0.25, &mut out);
+        warp_blend(None, Some(&b), &Flow::zero(), 0.25, VIEW, &mut out);
         let (cx, _, peak) = centroid(&out);
         assert!((cx - (320.0 - GUTTER as f32)).abs() < 0.5 && (peak - 0.2).abs() < 0.01, "peak {peak:.3}");
+    }
+
+    #[test]
+    fn sibling_tiles_share_one_parent_raster_and_line_up() {
+        // RDPS / GDPS tiles come from the parent-zoom raster; HRDPS keeps its own.
+        assert!(matches!(source_tile(EcccModel::Rdps, (4, 5, 9)), ((3, 2, 4), Some((1, 1)))));
+        assert!(matches!(source_tile(EcccModel::Gdps, (3, 2, 2)), ((2, 1, 1), Some((0, 0)))));
+        assert!(matches!(source_tile(EcccModel::Hrdps, (5, 4, 11)), ((5, 4, 11), None)));
+        // A cell centered on the parent block's center (source px 320 = block px 256) lands on the shared corner of the
+        // four children: bottom-right pixel of quadrant (0,0), top-left pixel of quadrant (1,1), with matching values.
+        let src = blob(320.0, 320.0, 40.0, 0.8);
+        let (mut q00, mut q11) = (vec![0_u16; TILE * TILE], vec![0_u16; TILE * TILE]);
+        warp_blend(Some(&src), None, &Flow::zero(), 0.0, View::quadrant(GUTTER, GUTTER, 0, 0), &mut q00);
+        warp_blend(Some(&src), None, &Flow::zero(), 0.0, View::quadrant(GUTTER, GUTTER, 1, 1), &mut q11);
+        let (corner_a, corner_b) = (q00[TILE * TILE - 1] as f32 / 65535.0, q11[0] as f32 / 65535.0);
+        assert!(corner_a > 0.79 && (corner_a - corner_b).abs() < 0.002, "seam: {corner_a:.4} vs {corner_b:.4}");
+        // The cell is twice as wide in child pixels: one sigma (40 source px = 80 child px) left of the corner it has
+        // decayed to exp(-0.5) of the peak.
+        let v = q00[(TILE - 1) * TILE + (TILE - 1 - 80)] as f32 / 65535.0;
+        assert!((v - 0.8 * (-0.5_f32).exp()).abs() < 0.01, "upsampled profile {v:.3}");
     }
 
     #[test]
@@ -700,7 +754,7 @@ mod tests {
         // Prediction residual: how much of the hour-to-hour change remains after advecting `a` along the flow.
         let resid = |fl: &Flow| -> f64 {
             let mut pred = vec![0_u16; TILE * TILE];
-            warp_blend(Some(&a), None, fl, 1.0, &mut pred);
+            warp_blend(Some(&a), None, fl, 1.0, VIEW, &mut pred);
             let mut fwd = vec![0_u16; TILE * TILE];
             // `f = 1` of `a` alone is zero-weighted, so evaluate the advected `a` directly instead.
             for py in 0..TILE {
@@ -725,7 +779,7 @@ mod tests {
             for q in 0..=4_u8 {
                 let mut out = vec![0_u16; TILE * TILE];
                 let t0 = std::time::Instant::now();
-                warp_blend(Some(&a), Some(&b), fl, q as f32 / 4.0, &mut out);
+                warp_blend(Some(&a), Some(&b), fl, q as f32 / 4.0, VIEW, &mut out);
                 let dt = t0.elapsed();
                 let mut rgba = vec![0_u8; TILE * TILE * 4];
                 eccc_colorize(&out, EcccMask::Legacy { outside_hrrr: false }, coord, &mut rgba, TILE, TILE);

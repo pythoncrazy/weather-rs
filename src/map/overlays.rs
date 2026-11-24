@@ -3,7 +3,7 @@ use super::{BaseMapStyle, MapEngine, WeatherOverlay};
 use crate::astro::subsolar_point;
 use crate::icons::{pressure_to_color, ramp, temp_to_color};
 use crate::model::{AlertSeverity, Location, Settings, WeatherBundle, compass_direction};
-use crate::providers::GridWeatherPoint;
+use crate::providers::{EcccModel, GridWeatherPoint};
 use crate::style::rgba8;
 use iced::advanced::image as adv_image;
 use iced::{Color, Point, Rectangle, Size};
@@ -432,6 +432,77 @@ pub(super) fn tile_needs_gdps(z: u8, x: u32, y: u32, with_hrrr: bool) -> bool {
     !((with_hrrr && tile_fully_inside_hrrr_core(z, x, y)) || tile_fully_inside_hrdps_core(z, x, y) || tile_fully_inside_rdps_core(z, x, y))
 }
 
+/// Display weight `[0, 1]` of ECCC tier `model` at a point: the exact partition of unity used to composite the tiers
+/// (`HRRR + HRDPS + RDPS + GDPS == 1` everywhere; `outside_hrrr == false` drops HRRR from the partition).
+#[inline]
+pub(super) fn eccc_tier_weight(model: EcccModel, outside_hrrr: bool, la: f64, lo: f64) -> f32 {
+    let base = if outside_hrrr { 1.0 - hrrr_weight(la, lo) } else { 1.0 };
+    match model {
+        EcccModel::Hrdps => base * hrdps_weight(la, lo),
+        EcccModel::Rdps => base * (1.0 - hrdps_weight(la, lo)) * rdps_weight(la, lo),
+        EcccModel::Gdps => base * (1.0 - hrdps_weight(la, lo)) * (1.0 - rdps_weight(la, lo)),
+    }
+}
+
+/// Geographic window `(lat_min, lat_max, lon_min, lon_max)` covering viewport `vp` plus a pan margin, snapped outward
+/// to whole degrees so it stays stable (cacheable) during small pans. `None` when the view wraps the antimeridian.
+pub(super) fn viewport_geo_window((bounds, lat, lon, zoom): MapVp) -> Option<(f64, f64, f64, f64)> {
+    let ws = 256.0 * 2.0_f64.powf(zoom);
+    let (cwx, cwy) = lat_lon_to_world_px(lat, lon, zoom);
+    let (hw, hh) = (bounds.width as f64 * 0.62, bounds.height as f64 * 0.62);
+    if cwx - hw < 0.0 || cwx + hw > ws {
+        return None;
+    }
+    let (la1, lo0) = world_px_to_lat_lon(cwx - hw, cwy - hh, zoom);
+    let (la0, lo1) = world_px_to_lat_lon(cwx + hw, cwy + hh, zoom);
+    Some((la0.floor(), la1.ceil(), lo0.floor(), lo1.ceil()))
+}
+
+/// True if ECCC tier `model` has nonzero display weight anywhere in the part of tile `(z, x, y)` that lies inside
+/// `window` (the whole tile when `None`).
+///
+/// Tiles are only worth downloading where their tier is actually drawn: a 45°-wide GDPS tile that pokes 2° into the
+/// viewport is skipped when RDPS owns those 2°. The tier masks are sampled on a ≤ 0.5° lattice (their blend ramps are
+/// ≥ 2° wide), and results are memoized because the draw loop asks every frame.
+pub(super) fn eccc_tier_needed_in(
+    model: EcccModel, outside_hrrr: bool, z: u8, x: u32, y: u32, window: Option<(f64, f64, f64, f64)>,
+) -> bool {
+    type Key = (u8, bool, u8, u32, u32, Option<[i32; 4]>);
+    thread_local! {
+        static MEMO: std::cell::RefCell<HashMap<Key, bool>> = std::cell::RefCell::new(HashMap::new());
+    }
+    let key: Key = (model as u8, outside_hrrr, z, x, y, window.map(|w| [w.0 as i32, w.1 as i32, w.2 as i32, w.3 as i32]));
+    if let Some(v) = MEMO.with(|m| m.borrow().get(&key).copied()) {
+        return v;
+    }
+    let coarse = match model {
+        EcccModel::Hrdps => tile_needs_hrdps(z, x, y, outside_hrrr),
+        EcccModel::Rdps => tile_needs_rdps(z, x, y, outside_hrrr),
+        EcccModel::Gdps => tile_needs_gdps(z, x, y, outside_hrrr),
+    };
+    let needed = coarse && {
+        let (mut la0, mut la1, mut lo0, mut lo1) = tile_geo_bounds(z, x, y);
+        if let Some((wa0, wa1, wo0, wo1)) = window {
+            (la0, la1, lo0, lo1) = (la0.max(wa0), la1.min(wa1), lo0.max(wo0), lo1.min(wo1));
+        }
+        la0 <= la1 && lo0 <= lo1 && {
+            let (ny, nx) = ((((la1 - la0) / 0.5).ceil() as usize).clamp(1, 96), (((lo1 - lo0) / 0.5).ceil() as usize).clamp(1, 96));
+            (0..=ny).any(|iy| {
+                let la = la0 + (la1 - la0) * iy as f64 / ny as f64;
+                (0..=nx).any(|ix| eccc_tier_weight(model, outside_hrrr, la, lo0 + (lo1 - lo0) * ix as f64 / nx as f64) > 0.002)
+            })
+        }
+    };
+    MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.len() > 8192 {
+            m.clear();
+        }
+        m.insert(key, needed);
+    });
+    needed
+}
+
 impl MapEngine {
     pub(super) fn build_scalar_overlay_handle(
         &self, vp: MapVp, ov: WeatherOverlay, bundles: &HashMap<String, WeatherBundle>, ts: Option<i64>,
@@ -494,8 +565,6 @@ impl MapEngine {
         }
         let npts = pts.len();
         let vis_span = lat_span / 1.75;
-        let sigma = if ov == WeatherOverlay::AirQuality { (vis_span / 3.2).clamp(0.45, 7.5) } else { (vis_span / 3.4).clamp(0.40, 8.0) };
-        let s2 = sigma * sigma;
         let (lut_lo, lut_hi, lut): (f32, f32, &[[u8; 4]; 256]) = match ov {
             WeatherOverlay::Temperature => (-30.0, 50.0, &SCALAR_TEMP_LUT),
             WeatherOverlay::WindFlow => (0.0, 26.0, &SCALAR_WIND_LUT),
@@ -506,120 +575,28 @@ impl MapEngine {
         let lut_scale = 255.0 / (lut_hi - lut_lo);
         const BAYER4: [f32; 16] = [-0.44, 0.06, -0.31, 0.19, 0.31, -0.19, 0.44, -0.06, -0.25, 0.25, -0.38, 0.12, 0.50, 0.00, 0.38, -0.12];
         let mut rgba = vec![0_u8; fw * fh * 4];
-        thread_local! {
-            static SCALAR_SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>, Vec<f32>)> =
-                const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
+        let analysis = SampleAnalysis::new(&pts, zoom);
+        let lon_tbl = analysis.lon_table(&lons);
+        let (mut vals, mut near2) = (vec![0.0_f32; fw], vec![0.0_f32; fw]);
+        // Before the 20-point CAMS AQI regional grid arrives, show a refined radial aura around known stations
+        // instead of smearing one city's AQI uniformly across thousands of miles of ocean.
+        let aqi_sparse_fade = ov == WeatherOverlay::AirQuality && npts < 4;
+        let r_in = (vis_span * 0.16).clamp(0.8, 3.2);
+        let r_out = (r_in * 2.2).max(r_in + 1.0);
+        for (gy, &la) in lats.iter().enumerate() {
+            analysis.eval_row(la, &lon_tbl, &mut vals, &mut near2);
+            let bayer_row = (gy & 3) << 2;
+            for (gx, (&v, &d2)) in vals.iter().zip(&near2).enumerate() {
+                let idx = ((v - lut_lo) * lut_scale + BAYER4[bayer_row | (gx & 3)]).clamp(0.0, 255.0) as usize;
+                let mut px = lut[idx];
+                if aqi_sparse_fade {
+                    let u = ((r_out - d2.sqrt()) / (r_out - r_in)).clamp(0.0, 1.0);
+                    px[3] = (px[3] as f32 * u * u * (3.0 - 2.0 * u)).round() as u8;
+                }
+                let o = (gy * fw + gx) * 4;
+                rgba[o..o + 4].copy_from_slice(&px);
+            }
         }
-        // Pad sample count to a multiple of 4 so the inner IDW loop unrolls cleanly into 4-wide SIMD lanes (AVX/SSE).
-        let pad_n = (npts + 3) & !3;
-        SCALAR_SCRATCH.with(|cell| {
-            let mut guard = cell.borrow_mut();
-            let (pvs, dlo2_tbl, dlat2) = &mut *guard;
-            pvs.clear();
-            pvs.extend(pts.iter().map(|p| p.2));
-            pvs.resize(pad_n, 0.0);
-            dlo2_tbl.resize(fw * pad_n, 0.0);
-            for (gx, &lo) in lons.iter().enumerate() {
-                let row = &mut dlo2_tbl[gx * pad_n..(gx + 1) * pad_n];
-                for (k, &(_, plo, _)) in pts.iter().enumerate() {
-                    let dl = (plo - lo).abs();
-                    let dlo = dl.min(360.0 - dl);
-                    row[k] = dlo * dlo;
-                }
-                for slot in &mut row[npts..pad_n] {
-                    *slot = 0.0;
-                }
-            }
-            dlat2.resize(pad_n, 1e18);
-            let pvs_c = pvs[..pad_n].as_chunks::<4>().0;
-            for (gy, &la) in lats.iter().enumerate() {
-                let cos_lat = la.to_radians().cos().abs().max(0.22);
-                let cos2 = cos_lat * cos_lat;
-                for (k, &(pla, _, _)) in pts.iter().enumerate() {
-                    let d = pla - la;
-                    dlat2[k] = d * d + s2;
-                }
-                for slot in &mut dlat2[npts..pad_n] {
-                    *slot = 1e18;
-                }
-                let bayer_row = (gy & 3) << 2;
-                let dlat2_c = dlat2[..pad_n].as_chunks::<4>().0;
-                let aqi_sparse_fade = ov == WeatherOverlay::AirQuality && npts < 4;
-                if !aqi_sparse_fade {
-                    // Branch-free 4-wide SIMD IDW hot loop (99.9% of calls): auto-vectorizes cleanly on AVX2/NEON.
-                    for (gx, _) in lons.iter().enumerate() {
-                        let dlo2_c = dlo2_tbl[gx * pad_n..(gx + 1) * pad_n].as_chunks::<4>().0;
-                        let o = (gy * fw + gx) * 4;
-                        let (mut ws0, mut ws1, mut ws2, mut ws3) = (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32);
-                        let (mut a0, mut a1, mut a2, mut a3) = (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32);
-                        for ((dl, dlo), pv) in dlat2_c.iter().zip(dlo2_c).zip(pvs_c) {
-                            let d0 = dl[0] + dlo[0] * cos2;
-                            let d1 = dl[1] + dlo[1] * cos2;
-                            let d2 = dl[2] + dlo[2] * cos2;
-                            let d3 = dl[3] + dlo[3] * cos2;
-                            let w0 = 1.0 / (d0 * d0);
-                            let w1 = 1.0 / (d1 * d1);
-                            let w2 = 1.0 / (d2 * d2);
-                            let w3 = 1.0 / (d3 * d3);
-                            ws0 += w0;
-                            ws1 += w1;
-                            ws2 += w2;
-                            ws3 += w3;
-                            a0 += pv[0] * w0;
-                            a1 += pv[1] * w1;
-                            a2 += pv[2] * w2;
-                            a3 += pv[3] * w3;
-                        }
-                        let ws = (ws0 + ws1) + (ws2 + ws3);
-                        let acc = (a0 + a1) + (a2 + a3);
-                        let v = acc / ws.max(1e-12);
-                        let idx = ((v - lut_lo) * lut_scale + BAYER4[bayer_row | (gx & 3)]).clamp(0.0, 255.0) as usize;
-                        rgba[o..o + 4].copy_from_slice(&lut[idx]);
-                    }
-                } else {
-                    for (gx, _) in lons.iter().enumerate() {
-                        let dlo2_c = dlo2_tbl[gx * pad_n..(gx + 1) * pad_n].as_chunks::<4>().0;
-                        let o = (gy * fw + gx) * 4;
-                        let (mut ws0, mut ws1, mut ws2, mut ws3) = (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32);
-                        let (mut a0, mut a1, mut a2, mut a3) = (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32);
-                        let mut min_d = f32::INFINITY;
-                        for ((dl, dlo), pv) in dlat2_c.iter().zip(dlo2_c).zip(pvs_c) {
-                            let d0 = dl[0] + dlo[0] * cos2;
-                            let d1 = dl[1] + dlo[1] * cos2;
-                            let d2 = dl[2] + dlo[2] * cos2;
-                            let d3 = dl[3] + dlo[3] * cos2;
-                            min_d = min_d.min(d0.min(d1).min(d2.min(d3)));
-                            let w0 = 1.0 / (d0 * d0);
-                            let w1 = 1.0 / (d1 * d1);
-                            let w2 = 1.0 / (d2 * d2);
-                            let w3 = 1.0 / (d3 * d3);
-                            ws0 += w0;
-                            ws1 += w1;
-                            ws2 += w2;
-                            ws3 += w3;
-                            a0 += pv[0] * w0;
-                            a1 += pv[1] * w1;
-                            a2 += pv[2] * w2;
-                            a3 += pv[3] * w3;
-                        }
-                        let ws = (ws0 + ws1) + (ws2 + ws3);
-                        let acc = (a0 + a1) + (a2 + a3);
-                        let v = acc / ws.max(1e-12);
-                        let idx = ((v - lut_lo) * lut_scale + BAYER4[bayer_row | (gx & 3)]).clamp(0.0, 255.0) as usize;
-                        let mut px = lut[idx];
-                        // Before the 20-point CAMS AQI regional grid arrives, show a refined radial aura around
-                        // known stations instead of smearing one city's AQI uniformly across thousands of miles of ocean.
-                        let dist = (min_d - s2).max(0.0).sqrt();
-                        let r_in = (vis_span * 0.16).clamp(0.8, 3.2);
-                        let r_out = (r_in * 2.2).max(r_in + 1.0);
-                        let u = ((r_out - dist) / (r_out - r_in)).clamp(0.0, 1.0);
-                        let fade = u * u * (3.0 - 2.0 * u);
-                        px[3] = (px[3] as f32 * fade).round() as u8;
-                        rgba[o..o + 4].copy_from_slice(&px);
-                    }
-                }
-            }
-        });
         let handle = adv_image::Handle::from_rgba(fw as u32, fh as u32, rgba);
         let _ = self.scalar_tex.lock().map(|mut g| {
             *g = Some(ScalarCache { meta_sig, zoom, wx0, wy0, wx1, wy1, handle: handle.clone() });
@@ -678,6 +655,126 @@ pub(super) fn project_screen_to_lat_lon(pos: Point, clat: f64, clon: f64, zoom: 
 pub(super) fn wrap_lon(lon: f64) -> f64 {
     ((lon + 180.0).rem_euclid(360.0)) - 180.0
 }
+/// Extent in degrees of the 4×5 model sample lattice requested around the map center at `zoom`
+/// (`span × 1.15` of latitude over 4 rows, `span × 1.5` of longitude over 5 columns).
+pub(super) fn grid_sample_span_deg(zoom: f64) -> f64 {
+    (135.0 / 2.0_f64.powf(zoom - 2.0)).clamp(1.2, 55.0)
+}
+/// Two-scale objective analysis of sparse model samples `(lat, lon, value)` into a continuous field — the single
+/// interpolator behind the temperature / wind / pressure / air-quality color fields and the pressure isobars.
+///
+/// A wide inverse-distance kernel (softening radius = the sample lattice's row spacing) gives a smooth first guess;
+/// two successive-correction passes with a kernel half as wide then add back what the first guess smoothed away at
+/// the samples (the classic Barnes scheme). Against the model's own pressure field this is ~1.3 hPa RMS; the previous
+/// single wide kernel flattened real gradients to ~4 hPa RMS (up to 13 hPa), putting isobars and colors in the wrong
+/// place, while a single narrow kernel is accurate at the samples but draws lumpy bullseyes between them.
+pub(super) struct SampleAnalysis {
+    lat: Vec<f32>,
+    lon: Vec<f32>,
+    /// Sample values, zero-padded to a multiple of 4 lanes.
+    val: Vec<f32>,
+    /// Summed correction residual per sample, zero-padded like `val`.
+    resid: Vec<f32>,
+    s2_wide: f32,
+    s2_narrow: f32,
+}
+
+impl SampleAnalysis {
+    pub(super) fn new(pts: &[(f32, f32, f32)], zoom: f64) -> Self {
+        let spacing = (grid_sample_span_deg(zoom) * 1.15 / 3.0) as f32;
+        let pad_n = (pts.len() + 3) & !3;
+        let mut a = Self {
+            lat: pts.iter().map(|p| p.0).collect(),
+            lon: pts.iter().map(|p| p.1).collect(),
+            val: pts.iter().map(|p| p.2).chain(std::iter::repeat(0.0)).take(pad_n).collect(),
+            resid: vec![0.0; pad_n],
+            s2_wide: spacing * spacing,
+            s2_narrow: (0.5 * spacing) * (0.5 * spacing),
+        };
+        for _ in 0..2 {
+            let corr: Vec<f32> = pts.iter().map(|&(la, lo, v)| v - a.eval_point(la, lo)).collect();
+            for (r, c) in a.resid.iter_mut().zip(corr) {
+                *r += c;
+            }
+        }
+        a
+    }
+
+    /// Latitude-compressed squared distance weights: `1 / (Δlat² + Δlon²·cos²(lat) + s²)²`.
+    #[inline]
+    fn cos2(la: f32) -> f32 {
+        let c = la.to_radians().cos().abs().max(0.22);
+        c * c
+    }
+
+    /// Analysed value at one point (used to form the correction residuals at the samples themselves).
+    fn eval_point(&self, la: f32, lo: f32) -> f32 {
+        let cos2 = Self::cos2(la);
+        let (mut ww, mut aw, mut wn, mut an) = (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32);
+        for (k, (&pla, &plo)) in self.lat.iter().zip(&self.lon).enumerate() {
+            let dl = (plo - lo).abs();
+            let dlo = dl.min(360.0 - dl);
+            let d2 = (pla - la) * (pla - la) + dlo * dlo * cos2;
+            let (w, n) = (1.0 / ((d2 + self.s2_wide) * (d2 + self.s2_wide)), 1.0 / ((d2 + self.s2_narrow) * (d2 + self.s2_narrow)));
+            ww += w;
+            aw += self.val[k] * w;
+            wn += n;
+            an += self.resid[k] * n;
+        }
+        aw / ww.max(1e-12) + an / wn.max(1e-12)
+    }
+
+    /// Squared longitude differences between every output column and every sample (`lons.len() × padded samples`).
+    pub(super) fn lon_table(&self, lons: &[f32]) -> Vec<f32> {
+        let pad_n = self.val.len();
+        let mut tbl = vec![0.0_f32; lons.len() * pad_n];
+        for (row, &lo) in tbl.chunks_exact_mut(pad_n.max(1)).zip(lons) {
+            for (slot, &plo) in row.iter_mut().zip(&self.lon) {
+                let dl = (plo - lo).abs();
+                let dlo = dl.min(360.0 - dl);
+                *slot = dlo * dlo;
+            }
+        }
+        tbl
+    }
+
+    /// Evaluates the analysed field along one latitude row. `out[gx]` receives the value at column `gx` of the
+    /// `lon_table`; `near2[gx]` receives the squared distance (degrees²) to the nearest sample.
+    pub(super) fn eval_row(&self, la: f32, lon_tbl: &[f32], out: &mut [f32], near2: &mut [f32]) {
+        let (n, pad_n) = (self.lat.len(), self.val.len());
+        if n == 0 {
+            out.fill(0.0);
+            near2.fill(f32::INFINITY);
+            return;
+        }
+        let cos2 = Self::cos2(la);
+        // Padding lanes sit infinitely far away so they contribute nothing to either kernel.
+        let mut dlat2 = vec![1e18_f32; pad_n];
+        for (d, &pla) in dlat2.iter_mut().zip(&self.lat) {
+            *d = (pla - la) * (pla - la);
+        }
+        let (dlat_c, val_c, res_c) = (dlat2.as_chunks::<4>().0, self.val.as_chunks::<4>().0, self.resid.as_chunks::<4>().0);
+        for ((o, nr), dlo_row) in out.iter_mut().zip(near2.iter_mut()).zip(lon_tbl.chunks_exact(pad_n)) {
+            // 4-wide lanes auto-vectorize cleanly (AVX2 / NEON).
+            let (mut ww, mut aw, mut wn, mut an, mut md) = ([0.0_f32; 4], [0.0_f32; 4], [0.0_f32; 4], [0.0_f32; 4], [f32::INFINITY; 4]);
+            for (((dl, dlo), pv), pr) in dlat_c.iter().zip(dlo_row.as_chunks::<4>().0).zip(val_c).zip(res_c) {
+                for l in 0..4 {
+                    let d2 = dl[l] + dlo[l] * cos2;
+                    let (dw, dn) = (d2 + self.s2_wide, d2 + self.s2_narrow);
+                    let (w, nw) = (1.0 / (dw * dw), 1.0 / (dn * dn));
+                    ww[l] += w;
+                    aw[l] += pv[l] * w;
+                    wn[l] += nw;
+                    an[l] += pr[l] * nw;
+                    md[l] = md[l].min(d2);
+                }
+            }
+            let sum = |a: [f32; 4]| (a[0] + a[1]) + (a[2] + a[3]);
+            *o = sum(aw) / sum(ww).max(1e-12) + sum(an) / sum(wn).max(1e-12);
+            *nr = md[0].min(md[1]).min(md[2].min(md[3]));
+        }
+    }
+}
 pub(super) fn quantize_coord(lat: f64, lon: f64) -> (i32, i32) {
     ((lat * 10.0).round() as i32, (wrap_lon(lon) * 10.0).round() as i32)
 }
@@ -717,45 +814,24 @@ pub(super) fn scale_bar_spec(lat: f64, zoom: f64, imperial: bool) -> (f32, Strin
 }
 
 impl MapEngine {
-    /// Zero-allocation live probe interpolation under the cursor (matches scalar overlay kernel).
+    /// Value under the cursor, read from the same analysed field the overlay is colored from.
+    ///
+    /// Everything here is an estimate between sparse model samples, so every readout is prefixed with `≈`; the exact
+    /// model value for a point comes from "Inspect Weather Here", which fetches it.
     pub(super) fn sample_probe_label(
         &self, lat: f64, lon: f64, ov: WeatherOverlay, bundles: &HashMap<String, WeatherBundle>, settings: &Settings,
     ) -> String {
         let ts = self.selected_forecast_timestamp();
-        let cos2 = lat.to_radians().cos().abs().max(0.22).powi(2);
-        let vis_span = (135.0 / 2.0_f64.powf((self.zoom - 2.0).max(0.0))).clamp(1.2, 55.0);
-        let s2 = (vis_span / 3.4).clamp(0.40, 8.0).powi(2);
-        let add_idw = |la: f64, lo: f64, v: f64, ws: &mut f64, acc: &mut f64| {
-            let (dl, dlat) = ((lo - lon).abs(), la - lat);
-            let dlo = dl.min(360.0 - dl);
-            let d2 = dlat * dlat + dlo * dlo * cos2 + s2;
-            let w = 1.0 / (d2 * d2);
-            *ws += w;
-            *acc += v * w;
-        };
+        let analysed =
+            |pts: &[(f32, f32, f32)]| (!pts.is_empty()).then(|| SampleAnalysis::new(pts, self.zoom).eval_point(lat as f32, lon as f32));
         match ov {
             WeatherOverlay::Temperature | WeatherOverlay::Pressure => {
                 let idx = if ov == WeatherOverlay::Temperature { 0 } else { 5 };
-                let (mut ws, mut acc) = (0.0, 0.0);
-                for p in self.grid.data.values() {
-                    let pt = p.at_timestamp(ts);
-                    add_idw(pt.lat, pt.lon, pt.v[idx] as f64, &mut ws, &mut acc);
-                }
-                for b in bundles.values() {
-                    let v = if idx == 0 {
-                        ts.and_then(|t| b.hourly.iter().min_by_key(|h| (h.timestamp_unix - t).abs())).map_or(b.current.temp_c, |h| h.temp_c)
-                    } else {
-                        ts.and_then(|t| b.hourly.iter().min_by_key(|h| (h.timestamp_unix - t).abs()))
-                            .map_or(b.current.pressure_hpa, |h| h.pressure_hpa)
-                    };
-                    add_idw(b.location.lat, b.location.lon, v, &mut ws, &mut acc);
-                }
-                if ws > 0.0 {
-                    let v = acc / ws;
-                    if idx == 0 { settings.format_temp(v) } else { settings.format_pressure(v) }
-                } else {
-                    String::new()
-                }
+                let pts: Vec<(f32, f32, f32)> =
+                    self.all_weather_points(bundles, ts).into_iter().map(|p| (p.lat as f32, p.lon as f32, p.v[idx])).collect();
+                analysed(&pts).map_or_else(String::new, |v| {
+                    format!("≈ {}", if idx == 0 { settings.format_temp(v as f64) } else { settings.format_pressure(v as f64) })
+                })
             }
             WeatherOverlay::WindFlow => {
                 // Zero-allocation IDW wind interpolation over grid + bundles!
@@ -784,19 +860,12 @@ impl MapEngine {
                 }
                 let (u, v, spd) = (us / ws, vs / ws, ss / ws);
                 let from_deg = ((-u).atan2(-v).to_degrees() + 360.0) % 360.0;
-                format!("{} {}", settings.format_wind(spd), compass_direction(from_deg))
+                format!("≈ {} {}", settings.format_wind(spd), compass_direction(from_deg))
             }
             WeatherOverlay::AirQuality => {
-                let (mut ws, mut acc) = (0.0, 0.0);
-                for &(la, lo, v) in self.aqi.data.values() {
-                    add_idw(la, lo, v, &mut ws, &mut acc);
-                }
-                for b in bundles.values() {
-                    if let Some(aq) = &b.air_quality {
-                        add_idw(b.location.lat, b.location.lon, aq.us_aqi as f64, &mut ws, &mut acc);
-                    }
-                }
-                if ws > 0.0 { format!("AQI {:.0}", (acc / ws).clamp(0.0, 500.0)) } else { String::new() }
+                let pts: Vec<(f32, f32, f32)> =
+                    self.all_aqi_points(bundles).into_iter().map(|(la, lo, v)| (la as f32, lo as f32, v as f32)).collect();
+                analysed(&pts).map_or_else(String::new, |v| format!("≈ AQI {:.0}", v.clamp(0.0, 500.0)))
             }
             _ => {
                 let (ns, ew) = (if lat >= 0.0 { "N" } else { "S" }, if lon >= 0.0 { "E" } else { "W" });
@@ -831,79 +900,14 @@ impl MapEngine {
             return IsobarData::default();
         }
         let ((gw, gh), (lats, lons)) = ((64_usize, 48_usize), grid_coords((64, 48), vp, false));
-        let lat_span = (lats[0] - lats[gh - 1]).abs().max(0.5);
-        let sigma = (lat_span / 3.4).clamp(0.45, 8.0);
-        let s2 = sigma * sigma;
+        let analysis = SampleAnalysis::new(&pts, zoom);
+        let lon_tbl = analysis.lon_table(&lons);
         let mut field = vec![0.0_f32; gw * gh];
-        let npts = pts.len();
-        let pad_n = (npts + 3) & !3;
-        thread_local! {
-            static ISOBAR_SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>, Vec<f32>)> =
-                const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
+        let mut near2 = vec![0.0_f32; gw];
+        for (gy, &la) in lats.iter().enumerate() {
+            analysis.eval_row(la, &lon_tbl, &mut field[gy * gw..(gy + 1) * gw], &mut near2);
         }
-        let (mut vmin, mut vmax) = (f32::INFINITY, f32::NEG_INFINITY);
-        ISOBAR_SCRATCH.with(|cell| {
-            let mut guard = cell.borrow_mut();
-            let (pvs, dlo2_tbl, dlat2) = &mut *guard;
-            pvs.clear();
-            pvs.extend(pts.iter().map(|p| p.2));
-            pvs.resize(pad_n, 0.0);
-            dlo2_tbl.resize(gw * pad_n, 0.0);
-            for (gx, &lo) in lons.iter().enumerate() {
-                let row = &mut dlo2_tbl[gx * pad_n..(gx + 1) * pad_n];
-                for (k, &(_, plo, _)) in pts.iter().enumerate() {
-                    let dl = (plo - lo).abs();
-                    let dlo = dl.min(360.0 - dl);
-                    row[k] = dlo * dlo;
-                }
-                for slot in &mut row[npts..pad_n] {
-                    *slot = 0.0;
-                }
-            }
-            dlat2.resize(pad_n, 1e18);
-            let pvs_c = pvs[..pad_n].as_chunks::<4>().0;
-            for (gy, &la) in lats.iter().enumerate() {
-                let cos_lat = la.to_radians().cos().abs().max(0.22);
-                let cos2 = cos_lat * cos_lat;
-                for (k, &(pla, _, _)) in pts.iter().enumerate() {
-                    let d = pla - la;
-                    dlat2[k] = d * d + s2;
-                }
-                for slot in &mut dlat2[npts..pad_n] {
-                    *slot = 1e18;
-                }
-                let dlat2_c = dlat2[..pad_n].as_chunks::<4>().0;
-                for gx in 0..gw {
-                    let dlo2_c = dlo2_tbl[gx * pad_n..(gx + 1) * pad_n].as_chunks::<4>().0;
-                    let (mut ws0, mut ws1, mut ws2, mut ws3) = (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32);
-                    let (mut a0, mut a1, mut a2, mut a3) = (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32);
-                    for ((dl, dlo), pv) in dlat2_c.iter().zip(dlo2_c).zip(pvs_c) {
-                        let d0 = dl[0] + dlo[0] * cos2;
-                        let d1 = dl[1] + dlo[1] * cos2;
-                        let d2 = dl[2] + dlo[2] * cos2;
-                        let d3 = dl[3] + dlo[3] * cos2;
-                        let w0 = 1.0 / (d0 * d0);
-                        let w1 = 1.0 / (d1 * d1);
-                        let w2 = 1.0 / (d2 * d2);
-                        let w3 = 1.0 / (d3 * d3);
-                        ws0 += w0;
-                        ws1 += w1;
-                        ws2 += w2;
-                        ws3 += w3;
-                        a0 += pv[0] * w0;
-                        a1 += pv[1] * w1;
-                        a2 += pv[2] * w2;
-                        a3 += pv[3] * w3;
-                    }
-                    let ws = (ws0 + ws1) + (ws2 + ws3);
-                    let acc = (a0 + a1) + (a2 + a3);
-                    let v = if ws > 0.0 { acc / ws } else { 1013.25 };
-                    field[gy * gw + gx] = v;
-                    vmin = vmin.min(v);
-                    vmax = vmax.max(v);
-                }
-            }
-        });
+        let (vmin, vmax) = field.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &v| (lo.min(v), hi.max(v)));
         let (dx, dy) = (bounds.width / (gw - 1) as f32, bounds.height / (gh - 1) as f32);
         let mut data = IsobarData::default();
         let l0 = ((vmin / 4.0).floor() as i32) * 4;
@@ -1110,4 +1114,56 @@ pub(super) fn compute_overview_camera(locs: &[Location], vp: Size) -> Option<(f6
     let zx = (usable_w / wx_span0).log2();
     let zy = (usable_h / wy_span0).log2();
     Some((center_lat.clamp(-80.0, 80.0), center_lon, zx.min(zy).clamp(2.3, 10.5)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 4×5 lattice `poll_grid_samples` requests around `(lat, lon)` at `zoom`, sampled from `f`.
+    fn lattice(lat: f32, lon: f32, zoom: f64, f: impl Fn(f32, f32) -> f32) -> Vec<(f32, f32, f32)> {
+        let span = grid_sample_span_deg(zoom) as f32;
+        let mut pts = Vec::new();
+        for gy in 0..4 {
+            for gx in 0..5 {
+                let (la, lo) = (lat + ((gy as f32 - 1.5) / 3.0) * span * 1.15, lon + ((gx as f32 - 2.0) / 4.0) * span * 1.5);
+                pts.push((la, lo, f(la, lo)));
+            }
+        }
+        pts
+    }
+
+    #[test]
+    fn sample_analysis_honors_samples_and_keeps_real_gradients() {
+        // A deep low west of the viewport and a ridge inland: ~35 hPa across the lattice, like a Pacific winter storm.
+        let truth = |la: f32, lo: f32| 1024.0 - 40.0 * (-((la - 44.0).powi(2) + ((lo + 134.0) * 0.75).powi(2)) / 90.0).exp();
+        let pts = lattice(37.87, -122.27, 5.0, truth);
+        let a = SampleAnalysis::new(&pts, 5.0);
+        // 1. The field passes (nearly) through every sample: a pin's value and the contours around it agree.
+        let worst_at_samples = pts.iter().map(|&(la, lo, v)| (a.eval_point(la, lo) - v).abs()).fold(0.0_f32, f32::max);
+        assert!(worst_at_samples < 1.0, "analysis misses its own samples by {worst_at_samples:.2} hPa");
+        // 2. Between samples it tracks the true field far better than one contour interval (4 hPa) on average.
+        let (lats, lons): (Vec<f32>, Vec<f32>) =
+            ((0..24).map(|i| 29.0 + i as f32 * 0.75).collect(), (0..32).map(|i| -134.0 + i as f32 * 0.75).collect());
+        let tbl = a.lon_table(&lons);
+        let (mut row, mut near2) = (vec![0.0_f32; lons.len()], vec![0.0_f32; lons.len()]);
+        let (mut se, mut n) = (0.0_f64, 0_u32);
+        for &la in &lats {
+            a.eval_row(la, &tbl, &mut row, &mut near2);
+            for (&v, &lo) in row.iter().zip(&lons) {
+                // Row evaluation and point evaluation are the same analysis.
+                assert!((v - a.eval_point(la, lo)).abs() < 0.02);
+                se += ((v - truth(la, lo)) as f64).powi(2);
+                n += 1;
+            }
+        }
+        let rms = (se / n as f64).sqrt();
+        assert!(rms < 2.0, "analysis rms error {rms:.2} hPa");
+        // 3. A single isolated sample yields a constant field, and its distance aura is exact.
+        let one = SampleAnalysis::new(&[(10.0, 20.0, 42.0)], 5.0);
+        let tbl = one.lon_table(&[20.0, 23.0]);
+        one.eval_row(10.0, &tbl, &mut row[..2], &mut near2[..2]);
+        assert!((row[0] - 42.0).abs() < 1e-3 && (row[1] - 42.0).abs() < 1e-3 && near2[0] < 1e-6);
+        assert!((near2[1].sqrt() - 3.0 * 10.0_f32.to_radians().cos()).abs() < 1e-3);
+    }
 }

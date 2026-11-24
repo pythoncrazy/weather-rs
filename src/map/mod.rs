@@ -366,6 +366,8 @@ pub struct MapEngine {
     last_vp_bits: AtomicU64,
     last_tick: Instant,
     last_cam_move: Instant,
+    /// True while far-future timeline frames are waiting for the view to settle before being prewarmed.
+    strip_deferred: bool,
     pool: Arc<Mutex<SharedTilePool>>,
     base_cache: canvas::Cache,
     base_cache_sig: Cell<u64>,
@@ -429,6 +431,7 @@ impl MapEngine {
             last_vp_bits: AtomicU64::new(pack_size(Size::new(900.0, 700.0))),
             last_tick: now,
             last_cam_move: now,
+            strip_deferred: false,
             pool,
             base_cache: canvas::Cache::with_group(cache_grp),
             base_cache_sig: Cell::new(0),
@@ -709,6 +712,7 @@ impl MapEngine {
     #[cfg(test)]
     pub fn has_pending_work(&self, expanded: bool) -> bool {
         self.needs_animation_tick(expanded)
+            || (expanded && self.strip_deferred && self.overlay == WeatherOverlay::RadarTimeline)
             || self.pool.lock().is_ok_and(|p| !p.in_flight.is_empty())
             || self.inspect.loading
             || !self.grid.in_flight.is_empty()
@@ -928,14 +932,11 @@ fn for_each_visible_tile_biased(vp: MapVp, max_z: u8, bias: f64, mut visit: impl
     true
 }
 
-/// Returns whether tile `(z, x, y)` contributes nonzero weight for ECCC tier `model` (`outside_hrrr == true` for HRRR frames).
+/// Returns whether ECCC tier `model` is actually drawn somewhere in the part of tile `(z, x, y)` near viewport `vp`
+/// (`outside_hrrr == true` for HRRR frames). Tiles for which this is false are never requested, awaited or drawn.
 #[inline]
-fn eccc_tier_tile_needed(model: EcccModel, outside_hrrr: bool, z: u8, x: u32, y: u32) -> bool {
-    match model {
-        EcccModel::Hrdps => overlays::tile_needs_hrdps(z, x, y, outside_hrrr),
-        EcccModel::Rdps => overlays::tile_needs_rdps(z, x, y, outside_hrrr),
-        EcccModel::Gdps => overlays::tile_needs_gdps(z, x, y, outside_hrrr),
-    }
+fn eccc_tier_tile_needed(model: EcccModel, outside_hrrr: bool, z: u8, x: u32, y: u32, vp: MapVp) -> bool {
+    overlays::eccc_tier_needed_in(model, outside_hrrr, z, x, y, overlays::viewport_geo_window(vp))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -985,7 +986,7 @@ fn radar_frame_readiness_ids(
         for (model, tid) in EcccModel::ALL.into_iter().zip([hrdps_id, rdps_id, gdps_id]) {
             let max_z = model.max_native_zoom();
             for_each_visible_tile_biased(vp, max_z, model.zoom_bias(), |z, x, y, d2| {
-                if eccc_tier_tile_needed(model, is_hrrr, z, x, y) {
+                if eccc_tier_tile_needed(model, is_hrrr, z, x, y, vp) {
                     total_req += 1;
                     if tid.is_some_and(|id| pool.is_settled_id(id, (z, x, y))) {
                         covered_req += 1;
@@ -1087,7 +1088,7 @@ fn ensure_radar_frame_visible(pool: &mut SharedTilePool, host: &str, f: &RainVie
                 vp,
                 &ns,
                 (model.max_native_zoom(), model.zoom_bias(), prio, mark_wanted),
-                |z, x, y| eccc_tier_tile_needed(model, is_hrrr, z, x, y),
+                |z, x, y| eccc_tier_tile_needed(model, is_hrrr, z, x, y, vp),
                 |_, _, _| eccc::job_spec(model, h0, q),
             );
         }
@@ -1215,12 +1216,17 @@ impl MapEngine {
         // Because `TileWorkers::pop_net_job` is strictly priority-ordered per origin lane (`LibreWxr`, `Iem`, `Eccc`),
         // enqueueing the full strip immediately NEVER delays `cur` on LibreWXR while keeping all 42 IEM+ECCC workers
         // busy downloading `+1h..+12h` in parallel from `t = 0 ms` (both paused AND playing)!
-        let key = (z, min_x, max_x, min_y, max_y, (cur << 9) | (len << 2) | usize::from(self.radar.playing));
+        // Frames more than ~3 hours ahead of the playhead wait until the view has been still for a moment (or playback
+        // is running): a pause mid-pan must not download 12 hours of tiles for a viewport the user is already leaving.
+        const NEAR_FRAMES: usize = 14;
+        let far_ok = self.radar.playing || self.last_cam_move.elapsed() >= Duration::from_millis(350);
+        self.strip_deferred = !far_ok;
+        let key = (z, min_x, max_x, min_y, max_y, (cur << 10) | (len << 3) | (usize::from(far_ok) << 1) | usize::from(self.radar.playing));
         if self.last_prewarmed_strip == Some(key) {
             return;
         }
         let mut all_ok = true;
-        for off in 0..len {
+        for off in (0..len).take(if far_ok { len } else { NEAR_FRAMES }) {
             let idx = (cur + off) % len;
             let prio = PRIO_MAX.saturating_sub(off.min(21) as u8).max(2);
             all_ok &= self.prewarm_radar_frame(&m.host, &m.frames[idx], prio);
@@ -1603,8 +1609,7 @@ impl MapEngine {
             return;
         }
         self.last_grid_poll = Some(Instant::now());
-        let (span, is_aqi, mut req) =
-            ((135.0 / 2.0_f64.powf(self.zoom - 2.0)).clamp(1.2, 55.0), self.overlay == WeatherOverlay::AirQuality, Vec::new());
+        let (span, is_aqi, mut req) = (overlays::grid_sample_span_deg(self.zoom), self.overlay == WeatherOverlay::AirQuality, Vec::new());
         // 4x5 adaptive grid (20 points in one Open-Meteo batch, -33% payload & faster RBF) with 0.1° snapping.
         let snap_deg = (span / 8.0).clamp(0.1, 0.5);
         for gy in 0..4 {
@@ -2281,7 +2286,7 @@ impl<M> MapCanvas<'_, M> {
                         eid,
                         vp,
                         el,
-                        |z, x, y| eccc_tier_tile_needed(model, is_hrrr, z, x, y),
+                        |z, x, y| eccc_tier_tile_needed(model, is_hrrr, z, x, y, vp),
                         |_, _, _| eccc::job_spec(model, h0, q),
                     );
                 }
@@ -3653,7 +3658,7 @@ mod tests {
                 for (model, ens) in EcccModel::ALL.into_iter().zip(tiers) {
                     let id = pool.intern(&ens);
                     for_each_visible_tile_biased(vp, model.max_native_zoom(), model.zoom_bias(), |z, x, y, _| {
-                        if eccc_tier_tile_needed(model, is_hrrr, z, x, y) {
+                        if eccc_tier_tile_needed(model, is_hrrr, z, x, y, vp) {
                             pool.insert_ready_for_test(TileKey(id, z, x, y));
                         }
                         true
@@ -3773,7 +3778,9 @@ mod tests {
         let client = WeatherClient::new();
         let m = client.fetch_rainviewer_manifest().expect("live manifest");
         println!("\n=== LIVE RADAR REPLAY BUFFERING BENCHMARK ({} frames) ===", m.frames.len());
+        let _ = tiles::take_lane_stats();
         for &(label, lat, lon, zoom, w, h) in &[
+            ("Berkeley 1360x860 z=5.6", 37.8779, -122.2672, 5.6, 1360.0_f32, 860.0_f32),
             ("Berkeley 2560x1440 z=5.5", 37.8779, -122.2672, 5.5, 2560.0_f32, 1440.0_f32),
             ("Berkeley 2560x1440 z=6.2", 37.8779, -122.2672, 6.2, 2560.0_f32, 1440.0_f32),
             ("Seattle 2560x1440 z=6.0", 47.6062, -122.3321, 6.0, 2560.0_f32, 1440.0_f32),
@@ -3848,7 +3855,7 @@ mod tests {
                 .map(|(i, ms)| format!("f{i}:{}", ms.map_or_else(|| "MISS".into(), |v| format!("{v}ms"))))
                 .collect();
             println!(
-                "  {label:28} | first_ready={:>4} ms | all_20_ready={:>4} ms | stall_ticks={:>3} ({:>4} ms) | max_stall={:.2}s | stalled={:?}",
+                "  {label:28} | first_ready={:>4} ms | all_ready={:>5} ms | stall_ticks={:>3} ({:>4} ms) | max_stall={:.2}s | stalled={:?}",
                 first_ready_ms.unwrap_or(9999),
                 all_ready_ms.unwrap_or(9999),
                 stall_ticks,
@@ -3857,6 +3864,12 @@ mod tests {
                 stalled_frames,
             );
             println!("    per-frame ready: {}", per_f.join(" "));
+            let lanes: Vec<String> = tiles::take_lane_stats()
+                .iter()
+                .filter(|(_, s)| s[0] > 0)
+                .map(|(n, s)| format!("{n}: {} req, {} KB, avg {} ms, max {} ms, {} failed", s[0], s[1] / 1024, s[2] / s[0], s[3], s[4]))
+                .collect();
+            println!("    network: {}", lanes.join(" | "));
         }
     }
 

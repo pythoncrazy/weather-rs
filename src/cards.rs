@@ -604,8 +604,9 @@ impl WeatherApp {
         let slice = &b.daily[di..];
         let today = slice.first().map_or(b.current.temp_c, |d| d.temp_max_c);
         let mean = if slice.is_empty() { today } else { slice.iter().map(|d| d.temp_max_c).sum::<f64>() / slice.len() as f64 };
-        let rd = (self.settings.convert_temp(today) - self.settings.convert_temp(mean)).round();
-        let delta = if rd.abs() < 0.5 { 0.0 } else { rd };
+        // Difference of the two rounded highs shown below, so the headline can never disagree with them
+        // (58.6° vs 60.4° used to read "-2°" beside "H:59°" and "H:60°").
+        let delta = self.settings.convert_temp(today).round() - self.settings.convert_temp(mean).round();
         let sub = if delta > 0.0 {
             "above 10-day avg high"
         } else if delta < 0.0 {
@@ -1150,7 +1151,22 @@ impl canvas::Program<Msg> for DetailChartCanvas {
                         }
                     }
                 });
+                let prob_col = Color { a: 0.62, ..self.accent };
                 f.stroke(&prob_path, Stroke::default().with_width(1.4).with_color(Color { a: 0.45, ..self.accent }));
+                // The trend line is chance of precipitation on its own 0–100% scale (full chart height), NOT an amount on
+                // the right-hand axis: label that scale along the left edge in the line's own color.
+                for (frac, lbl) in [(0.0_f32, "100% chance"), (0.5, "50%")] {
+                    f.fill_text(canvas::Text {
+                        content: lbl.into(),
+                        position: Point::new(pad_l + 4.0, pad_t + frac * ph + 7.0),
+                        color: prob_col,
+                        size: iced::Pixels(9.0),
+                        font: fw(Weight::Medium),
+                        align_x: iced::alignment::Horizontal::Left.into(),
+                        align_y: iced::alignment::Vertical::Center,
+                        ..Default::default()
+                    });
+                }
             } else {
                 // Smooth cubic-interpolated macOS Weather area fill + luminous curve
                 let pts_xy: Vec<Point> = self.pts.iter().enumerate().map(|(i, p)| Point::new(px(i), py(p.val))).collect();

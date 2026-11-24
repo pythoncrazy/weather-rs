@@ -847,6 +847,9 @@ impl MapEngine {
             self.manifest.as_ref().and_then(|m| m.frames.get(cur_i)).map(|f| match f.source {
                 RadarFrameSource::Tile(..) if !f.is_nowcast => "Radar",
                 RadarFrameSource::Tile(..) => "Radar Nowcast",
+                // Quarter-hour slots between ECCC's hourly model outputs are motion-interpolated by the app, not issued
+                // by the model: say so rather than presenting them as upstream forecast frames.
+                RadarFrameSource::NoaaHrrr(..) | RadarFrameSource::EcccNwp if f.eccc_slot().1 != 0 => "Interpolated Forecast",
                 RadarFrameSource::NoaaHrrr(..) | RadarFrameSource::EcccNwp => "Model Forecast",
             })
         } else if self.overlay == WeatherOverlay::InfraredClouds {

@@ -247,7 +247,7 @@ impl RainViewerFrame {
     }
     pub fn tile_namespace(&self) -> Option<String> {
         match &self.source {
-            RadarFrameSource::Tile(_, lwxr) => Some(format!("{}_{}", if *lwxr { "lwxr8_512" } else { "rv512" }, self.time_unix)),
+            RadarFrameSource::Tile(_, lwxr) => Some(format!("{}_{}", if *lwxr { "lwxr8_raw512" } else { "rv512" }, self.time_unix)),
             RadarFrameSource::NoaaHrrr(init, lead, refp) => Some(format!("hrrr_{}_{init}_{lead:04}", if *refp { "refp" } else { "refd" })),
             RadarFrameSource::EcccNwp => None,
         }
@@ -291,8 +291,10 @@ impl RainViewerFrame {
             RadarFrameSource::Tile(p, lwxr) => {
                 // 512×512 radar tiles fetched at `z - 1` (`primary_zoom_bias = -0.95`) deliver identical screen pixel
                 // density to 256×256 at `z` with 3.6× fewer HTTP round trips & tile slots on 1440p/4K screens!
-                let (sz, scheme) = if *lwxr { (512, 8) } else { (512, 2) };
-                Some(format!("{host}{p}/{sz}/{z}/{x}/{y}/{scheme}/1_1.png"))
+                // LibreWXR is asked for unsmoothed tiles (`0_1`: its exact palettized radar values, ~5× smaller than the
+                // server-blurred `1_1` PNGs) and smoothed locally; the RainViewer fallback keeps its pre-smoothed scheme.
+                let (scheme, opts) = if *lwxr { (8, "0_1") } else { (2, "1_1") };
+                Some(format!("{host}{p}/512/{z}/{x}/{y}/{scheme}/{opts}.png"))
             }
             RadarFrameSource::NoaaHrrr(init, lead, refp) => Some(format!(
                 "https://mesonet.agron.iastate.edu/cache/tile.py/1.0.0/hrrr::{}-F{lead:04}-{init}/{z}/{x}/{y}.png",

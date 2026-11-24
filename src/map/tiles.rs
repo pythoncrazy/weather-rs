@@ -1,6 +1,6 @@
 use super::{WorkerEvent, eccc, lat_lon_to_world_px};
 use crate::icons::ramp;
-use crate::providers::WeatherClient;
+use crate::providers::{EcccModel, WeatherClient};
 use crate::storage::{delete_cached_tile, is_shutting_down, load_cached_tile, save_cached_tile};
 use iced::advanced::image as adv_image;
 use iced::widget::canvas::Frame;
@@ -68,11 +68,28 @@ pub(super) const PRIO_MAX: u8 = (PRIO_LEVELS - 1) as u8;
 /// basemaps NEVER trips single-host burst throttling (`api.librewxr.net` drops connections >12 concurrent!) and NEVER
 /// head-of-line blocks other origins while one host is at its cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HostLane {
+pub(super) enum HostLane {
     LibreWxr = 0,
     Eccc = 1,
     Iem = 2,
     Base = 3,
+}
+/// Per-origin tile network accounting, indexed by [`HostLane`]: `[requests, bytes, total ms, slowest ms, failures]`.
+static LANE_STATS: [[AtomicU64; 5]; 4] = [const { [const { AtomicU64::new(0) }; 5] }; 4];
+/// Records one finished tile HTTP request against its origin lane.
+pub(super) fn record_fetch(lane: HostLane, bytes: usize, elapsed: Duration, ok: bool) {
+    let (s, ms) = (&LANE_STATS[lane as usize], elapsed.as_millis() as u64);
+    s[0].fetch_add(1, Ordering::Relaxed);
+    s[1].fetch_add(bytes as u64, Ordering::Relaxed);
+    s[2].fetch_add(ms, Ordering::Relaxed);
+    s[3].fetch_max(ms, Ordering::Relaxed);
+    s[4].fetch_add(u64::from(!ok), Ordering::Relaxed);
+}
+/// Returns and clears the per-lane counters as `(lane name, [requests, bytes, total ms, slowest ms, failures])`.
+#[cfg(test)]
+pub(super) fn take_lane_stats() -> [(&'static str, [u64; 5]); 4] {
+    let names = ["librewxr", "eccc", "iem", "basemap"];
+    std::array::from_fn(|i| (names[i], std::array::from_fn(|k| LANE_STATS[i][k].swap(0, Ordering::Relaxed))))
 }
 impl HostLane {
     #[inline]
@@ -90,10 +107,12 @@ impl HostLane {
     #[inline]
     const fn cap(self) -> usize {
         match self {
-            // Measured optimal per-origin concurrency peaks (0 errors, lowest p90/wall time):
-            // LibreWXR 512px@12 (rate-limits cold edge >12!), ECCC 512px@18, IEM CDN@24, Basemap@12.
+            // Per-origin concurrency caps. LibreWXR rate-limits a cold edge above 12 parallel requests. ECCC GeoMet
+            // throttles above ~15 requests/s per IP and its usage policy asks clients not to pull tiles in bulk: at
+            // ~0.6 s per raster, 8 parallel requests stay under that ceiling (18 ran at ~30 req/s and drew multi-second
+            // stalls and timeouts).
             Self::LibreWxr => 12,
-            Self::Eccc => 18,
+            Self::Eccc => 8,
             Self::Iem => 24,
             Self::Base => 12,
         }
@@ -169,6 +188,8 @@ pub(super) enum TileEvent {
     Loaded(TileKey, Option<adv_image::Handle>, Option<AlphaThumb>),
     Failed(TileKey),
     Cancelled(TileKey),
+    /// A derived tile job that cannot be built until the listed source rasters have been downloaded.
+    NeedSources(TileJob, Vec<eccc::SourceReq>),
 }
 pub(super) enum TileSlot {
     /// Decoded tile handle + optional 24×24 precipitation alpha thumbnail (for optical-flow advection) + arrival time + CLOCK bit.
@@ -288,10 +309,21 @@ impl TileWorkers {
                         continue;
                     }
                     if eccc::is_job_spec(url) {
-                        // Interpolated ECCC frames are rebuilt from cached hourly rasters; only a missing raster needs the network.
-                        let cx = eccc::Ctx { client: None, gate: &dg, ttl, timeouts_ms: (0, 0) };
-                        if let eccc::Built::Done(h, th) = eccc::build(&cx, ns, url, (k.1, k.2, k.3)) {
-                            let _ = tx.send(TileEvent::Loaded(k, h, th));
+                        // ECCC frames are built here, off-network, from hourly rasters in memory / on disk. Rasters that
+                        // are still missing go back to the pool, which downloads each one exactly once as a normal tile.
+                        let ev = match eccc::build(&dg, ttl, ns, url, (k.1, k.2, k.3)) {
+                            eccc::Built::Done(h, th) => TileEvent::Loaded(k, h, th),
+                            eccc::Built::Need(reqs) => TileEvent::NeedSources(job, reqs),
+                            eccc::Built::Failed => TileEvent::Failed(k),
+                        };
+                        let _ = tx.send(ev);
+                        wk.notify_one();
+                        continue;
+                    }
+                    if eccc::is_source_ns(ns) {
+                        let cached = load_cached_tile(ns, k.1, k.2, k.3, ttl);
+                        if cached.is_some_and(|b| eccc::ingest_source(&dg, ns, (k.1, k.2, k.3), &b).is_some()) {
+                            let _ = tx.send(TileEvent::Loaded(k, None, None));
                             wk.notify_one();
                         } else if let Some(dropped) = Self::push_queue(&nq, job, 1400) {
                             let _ = tx.send(TileEvent::Cancelled(dropped.0));
@@ -336,23 +368,15 @@ impl TileWorkers {
                 Arc::clone(&dec_gate),
             );
             std::thread::spawn(move || {
-                while let Some(((k, ns, url, ttl, _, cancel, job_ep), lane, _permit)) = Self::pop_net_job(&nq) {
+                while let Some(((k, ns, url, _, _, cancel, job_ep), lane, _permit)) = Self::pop_net_job(&nq) {
                     if cancel && job_ep != ep.load(Ordering::Acquire) {
                         let _ = tx.send(TileEvent::Cancelled(k));
                         wk.notify_one();
                         continue;
                     }
                     let (t1, t2) = lane.timeout_ms();
-                    if eccc::is_job_spec(&url) {
-                        let cx = eccc::Ctx { client: Some(&c), gate: &dg, ttl, timeouts_ms: (t1, t2) };
-                        let _ = tx.send(match eccc::build(&cx, &ns, &url, (k.1, k.2, k.3)) {
-                            eccc::Built::Done(h, th) => TileEvent::Loaded(k, h, th),
-                            eccc::Built::NeedNet | eccc::Built::Failed => TileEvent::Failed(k),
-                        });
-                        wk.notify_one();
-                        continue;
-                    }
                     // 1x fast automatic retry with bounded lane timeout so a rare hung CDN/origin request recovers quickly!
+                    let t_req = Instant::now();
                     let fetched = match c.fetch_bytes_timeout(&url, t1) {
                         Ok(b) => Ok(b),
                         Err(_) if !is_shutting_down() && (!cancel || job_ep == ep.load(Ordering::Acquire)) => {
@@ -366,6 +390,20 @@ impl TileWorkers {
                         }
                         Err(e) => Err(e),
                     };
+                    record_fetch(lane, fetched.as_ref().map_or(0, Vec::len), t_req.elapsed(), fetched.is_ok());
+                    if eccc::is_source_ns(&ns) {
+                        // Hourly ECCC rasters are inputs, not displayable tiles: keep the decoded field for the builds
+                        // waiting on it and cache the raw bytes (or a 1-byte sentinel when it holds no precipitation).
+                        let ingested = fetched.ok().and_then(|b| eccc::ingest_source(&dg, &ns, (k.1, k.2, k.3), &b).map(|wet| (b, wet)));
+                        let _ = tx.send(if ingested.is_some() { TileEvent::Loaded(k, None, None) } else { TileEvent::Failed(k) });
+                        wk.notify_one();
+                        if let Some((b, wet)) = ingested
+                            && !is_shutting_down()
+                        {
+                            let _ = stx.try_send((ns, k.1, k.2, k.3, if wet { b } else { vec![0] }));
+                        }
+                        continue;
+                    }
                     if let Ok(b) = fetched
                         && let Some((h, th)) = decode_gated(&dg, &ns, (k.1, k.2, k.3), &b)
                     {
@@ -481,6 +519,10 @@ pub(super) struct SharedTilePool {
     gpu_pin_requested: FxHashSet<TileKey>,
     gpu_pins: FxHashMap<TileKey, iced_runtime::image::Allocation>,
     gpu_pin_lru: VecDeque<TileKey>,
+    /// Derived tile jobs parked until the source raster they are keyed by has been downloaded.
+    waiting: FxHashMap<TileKey, Vec<TileJob>>,
+    /// `(derived tile, source raster)` pairs whose build was re-run once because the raster had just arrived.
+    source_retries: FxHashSet<(TileKey, TileKey)>,
     pub tx: mpsc::Sender<WorkerEvent>,
     pub tile_tx: mpsc::Sender<TileEvent>,
     pub tile_rx: mpsc::Receiver<TileEvent>,
@@ -511,6 +553,8 @@ impl SharedTilePool {
             gpu_pin_requested: FxHashSet::default(),
             gpu_pins: FxHashMap::default(),
             gpu_pin_lru: VecDeque::new(),
+            waiting: FxHashMap::default(),
+            source_retries: FxHashSet::default(),
             tx,
             tile_tx,
             tile_rx,
@@ -621,8 +665,49 @@ impl SharedTilePool {
         let now = Instant::now();
         while let Ok(ev) = self.tile_rx.try_recv() {
             match ev {
+                TileEvent::NeedSources(job, reqs) => {
+                    // Park the job on its first missing raster; when that arrives the build re-runs and, if another
+                    // raster is still missing, parks on that one. Every raster is requested here exactly once.
+                    let mut park_on = None;
+                    for r in reqs {
+                        let id = self.intern(&r.ns);
+                        let sk = TileKey(id, r.coord.0, r.coord.1, r.coord.2);
+                        if matches!(self.slots.get(&sk), Some(TileSlot::Ready(..))) {
+                            // The raster finished downloading while this build was reporting it missing: simply build
+                            // again. Only if a second attempt still cannot read it back (evicted from memory before
+                            // its disk write landed) is it downloaded afresh.
+                            if self.source_retries.len() > 4096 {
+                                self.source_retries.clear();
+                            }
+                            if self.source_retries.insert((job.0, sk)) {
+                                park_on = None;
+                                self.workers.push(job.clone(), &self.tile_tx);
+                                break;
+                            }
+                            self.slots.remove(&sk);
+                        }
+                        self.source_retries.remove(&(job.0, sk));
+                        let _ = self.ensure_id_prio(id, r.coord, || r.url, job.3, job.4, job.5);
+                        if self.in_flight.contains(&sk) {
+                            park_on.get_or_insert(sk);
+                        } else {
+                            // The raster is in failure cooldown or was refused by back-pressure: fail this tile for now.
+                            park_on = None;
+                            self.in_flight.remove(&job.0);
+                            self.wanted_weather.remove(&job.0);
+                            self.slots.insert(job.0, TileSlot::Failed(now + Duration::from_secs(3)));
+                            self.weather_rev = self.weather_rev.wrapping_add(1);
+                            any = true;
+                            break;
+                        }
+                    }
+                    if let Some(sk) = park_on {
+                        self.waiting.entry(sk).or_default().push(job);
+                    }
+                }
                 TileEvent::Loaded(k, h, th) => {
                     self.in_flight.remove(&k);
+                    self.release_waiting(k, Some(true), now);
                     let fresh = !matches!(self.slots.get(&k), Some(TileSlot::Ready(..)));
                     let _ = (fresh && k.1 > 2).then(|| self.lru.push_back(k));
                     let has_img = h.is_some();
@@ -683,6 +768,7 @@ impl SharedTilePool {
                 }
                 TileEvent::Failed(k) => {
                     self.in_flight.remove(&k);
+                    any |= self.release_waiting(k, Some(false), now);
                     let wb = self.wanted_base.remove(&k);
                     let ww = self.wanted_weather.remove(&k);
                     let wl = self.wanted_label.remove(&k);
@@ -697,6 +783,7 @@ impl SharedTilePool {
                 }
                 TileEvent::Cancelled(k) => {
                     self.in_flight.remove(&k);
+                    any |= self.release_waiting(k, None, now);
                     let wb = self.wanted_base.remove(&k);
                     let ww = self.wanted_weather.remove(&k);
                     let wl = self.wanted_label.remove(&k);
@@ -782,6 +869,38 @@ impl SharedTilePool {
     }
     pub fn bump_epoch(&mut self) {
         self.workers.bump_epoch(&mut self.in_flight);
+        // Parked cancellable jobs belong to the old epoch too: forget them so their tiles can be requested afresh.
+        let in_flight = &mut self.in_flight;
+        self.waiting.retain(|_, jobs| {
+            jobs.retain(|j| {
+                if j.5 {
+                    in_flight.remove(&j.0);
+                }
+                !j.5
+            });
+            !jobs.is_empty()
+        });
+    }
+    /// Resolves every derived job parked on source tile `src`: re-runs them once the raster has arrived
+    /// (`Some(true)`), puts their tiles into failure cooldown when its download failed (`Some(false)`), or just
+    /// forgets them when it was cancelled (`None`) so they can be requested afresh. Returns whether tiles changed state.
+    fn release_waiting(&mut self, src: TileKey, outcome: Option<bool>, now: Instant) -> bool {
+        let Some(jobs) = self.waiting.remove(&src) else { return false };
+        for job in jobs {
+            if outcome == Some(true) {
+                self.workers.push(job, &self.tile_tx);
+                continue;
+            }
+            self.in_flight.remove(&job.0);
+            self.wanted_weather.remove(&job.0);
+            if outcome == Some(false) {
+                self.slots.insert(job.0, TileSlot::Failed(now + Duration::from_secs(3)));
+            }
+        }
+        if outcome != Some(true) {
+            self.weather_rev = self.weather_rev.wrapping_add(1);
+        }
+        outcome != Some(true)
     }
     pub fn cancel_base_tiles(&mut self) {
         self.workers.cancel_base_only(&mut self.in_flight);
@@ -1606,18 +1725,9 @@ pub(super) fn eccc_colorize(field: &[u16], em: EcccMask, coord: TileCoord, rgba:
             }
             let lo = lon_0 + (px_i as f64 + 0.5) * lon_step;
             let mask = match em {
-                EcccMask::Hrdps { outside_hrrr } => {
-                    let base = if outside_hrrr { 1.0 - super::overlays::hrrr_weight(lat_row, lo) } else { 1.0 };
-                    base * super::overlays::hrdps_weight(lat_row, lo)
-                }
-                EcccMask::Rdps { outside_hrrr } => {
-                    let base = if outside_hrrr { 1.0 - super::overlays::hrrr_weight(lat_row, lo) } else { 1.0 };
-                    base * (1.0 - super::overlays::hrdps_weight(lat_row, lo)) * super::overlays::rdps_weight(lat_row, lo)
-                }
-                EcccMask::Gdps { outside_hrrr } => {
-                    let base = if outside_hrrr { 1.0 - super::overlays::hrrr_weight(lat_row, lo) } else { 1.0 };
-                    base * (1.0 - super::overlays::hrdps_weight(lat_row, lo)) * (1.0 - super::overlays::rdps_weight(lat_row, lo))
-                }
+                EcccMask::Hrdps { outside_hrrr } => super::overlays::eccc_tier_weight(EcccModel::Hrdps, outside_hrrr, lat_row, lo),
+                EcccMask::Rdps { outside_hrrr } => super::overlays::eccc_tier_weight(EcccModel::Rdps, outside_hrrr, lat_row, lo),
+                EcccMask::Gdps { outside_hrrr } => super::overlays::eccc_tier_weight(EcccModel::Gdps, outside_hrrr, lat_row, lo),
                 EcccMask::Legacy { outside_hrrr } => {
                     if outside_hrrr {
                         1.0 - super::overlays::hrrr_weight(lat_row, lo)
@@ -1711,11 +1821,10 @@ pub(super) fn stylize_radar_tile(ns: &str, coord: TileCoord, rgba: &mut [u8], w:
         }
         if vis {
             despeckle_radar_alpha(rgba, w as usize, h as usize);
-            // Native 512×512 LibreWXR tiles are already smoothly antialiased — skipping `smooth_rgba_crisp` preserves
-            // sharp convective cores & rainband micro-structure while cutting tile stylization time by ~3.5×!
-            if w < 512 {
-                smooth_rgba_crisp(rgba, w as usize, h as usize);
-            }
+            // Tiles are requested unsmoothed (the provider's exact palettized values, ~5× fewer bytes on the wire than its
+            // server-side smoothed PNGs). The light `[1, 6, 1]` premultiplied-alpha pass is the closest match to that
+            // server smoothing (measured against the same tile), without the dark fringes it leaves around snow.
+            smooth_rgba_crisp(rgba, w as usize, h as usize);
         }
         return vis;
     } else if refp || refd {
