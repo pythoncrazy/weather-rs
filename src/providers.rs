@@ -128,8 +128,6 @@ pub struct RainViewerFrame {
     pub is_nowcast: bool,
     pub source: RadarFrameSource,
 }
-/// Margin of real neighboring data (px) requested around every hourly ECCC GeoMet tile (see `map::eccc`).
-pub const ECCC_GUTTER_PX: u32 = 64;
 /// Environment Canada (ECCC GeoMet WMS) multi-tier NWP precipitation rate models, ordered finest to coarsest:
 /// - `Hrdps`: 2.5 km Continental High-Resolution Deterministic Prediction System (Canada + US PNW/Northern US/NE Atlantic, `z=6`).
 /// - `Rdps`: 10 km Regional Deterministic Prediction System (all North America + 2,500 km offshore Pacific/Atlantic, `z=5`).
@@ -170,6 +168,16 @@ impl EcccModel {
             Self::Rdps => 4,
             // - GDPS 15 km: z=3 @ 512×512 (~6.1–7.7 km/px — 2×–2.5× finer than 15 km native grid, 3× fewer WMS calls!)
             Self::Gdps => 3,
+        }
+    }
+    /// Margin of real neighboring data (px) requested around every hourly raster of this model (see `map::eccc`).
+    /// It must cover the farthest a storm can travel in an hour at the raster's resolution: 64 px for 2.5 km HRDPS;
+    /// RDPS / GDPS rasters are fetched one zoom level coarser (≥ 7 km per pixel), where 32 px is ample.
+    #[inline]
+    pub const fn gutter_px(self) -> u32 {
+        match self {
+            Self::Hrdps => 64,
+            Self::Rdps | Self::Gdps => 32,
         }
     }
     /// Per-tier 512×512 zoom bias matched to each model's native grid spacing so 1440p/4K displays stay under

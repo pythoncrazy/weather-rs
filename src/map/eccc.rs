@@ -6,7 +6,7 @@
 //! on the CPU, in scalar-intensity space, before color-mapping:
 //!
 //! 1. Both bracketing hourly rasters are downloaded once by the tile pool, with a margin of real neighboring data
-//!    ([`GUTTER`] px), then reverse-mapped to a scalar intensity field and smoothed ([`ingest_source`]).
+//!    ([`EcccModel::gutter_px`]), then reverse-mapped to a scalar intensity field and smoothed ([`ingest_source`]).
 //! 2. A dense displacement field between the two hours is estimated by regularized block matching ([`estimate_flow`]).
 //! 3. Each quarter-hour frame warps both hours toward its own timestamp along that field and blends the intensities
 //!    ([`warp_blend`]), so rain bands travel instead of fading out in one place and fading in at another.
@@ -18,15 +18,13 @@ use super::tiles::{
     AlphaThumb, DecGate, EcccMask, TileCoord, bleed_transparent_edges, build_alpha_thumb, eccc_colorize, eccc_extract_scalar,
     eccc_smooth_scalar,
 };
-use crate::providers::{ECCC_GUTTER_PX, EcccModel, RainViewerFrame};
+use crate::providers::{EcccModel, RainViewerFrame};
 use crate::storage::{delete_cached_tile, load_cached_tile};
 use iced::advanced::image as adv_image;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
-/// Margin of real neighboring data (in source pixels) requested around every hourly tile.
-const GUTTER: usize = ECCC_GUTTER_PX as usize;
 /// Edge length of the finished tile.
 const TILE: usize = 512;
 /// Block-matching runs on fields box-downsampled by this factor.
@@ -389,11 +387,11 @@ pub(super) fn warp_blend(a: Option<&Field>, b: Option<&Field>, flow: &Flow, f: f
 
 /// Largest plausible hour-long displacement (source pixels) for tile `(z, _, y)`, capped so warped samples stay inside
 /// the margin of real data.
-fn max_flow_px((z, _, y): TileCoord) -> f32 {
+fn max_flow_px((z, _, y): TileCoord, gutter: u32) -> f32 {
     let n = (1_u64 << z) as f64;
     let lat = (std::f64::consts::PI * (1.0 - 2.0 * (y as f64 + 0.5) / n)).sinh().atan();
     let km_per_px = 40_075.0 * lat.cos() / (n * TILE as f64);
-    ((MAX_SPEED_KMH / km_per_px.max(1e-6)) as f32).min(GUTTER as f32 / 0.75)
+    ((MAX_SPEED_KMH / km_per_px.max(1e-6)) as f32).min(gutter as f32 / 0.75)
 }
 
 /// Color-maps a finished `TILE×TILE` scalar field into a GPU tile + optical-flow thumbnail (`(None, None)` if empty).
@@ -466,7 +464,7 @@ pub(super) struct SourceReq {
 
 /// Tile namespace under which `model`'s hourly raster for UTC hour `hour` is fetched and cached.
 fn source_ns(model: EcccModel, hour: i64) -> String {
-    format!("eccc_{}_src_g{GUTTER}_{hour}", model.tag())
+    format!("eccc_{}_src_g{}_{hour}", model.tag(), model.gutter_px())
 }
 
 /// True if `ns` names hourly source rasters (see [`source_ns`]) rather than displayable tiles.
@@ -506,7 +504,7 @@ fn decode_source(gate: &DecGate, model: EcccModel, hour: i64, (z, x, y): TileCoo
     if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
         return None;
     }
-    let (_, [gl, gt, pw, ph]) = RainViewerFrame::eccc_wms_request(model, hour, z, x, y, ECCC_GUTTER_PX)?;
+    let (_, [gl, gt, pw, ph]) = RainViewerFrame::eccc_wms_request(model, hour, z, x, y, model.gutter_px())?;
     let _permit = gate.enter();
     let img = ::image::load_from_memory_with_format(bytes, ::image::ImageFormat::WebP).ok()?.into_rgba8();
     (img.dimensions() == (pw, ph))
@@ -539,7 +537,7 @@ fn source(gate: &DecGate, ttl: Duration, model: EcccModel, hour: i64, coord: Til
         // A corrupt cache entry must never pin this tile to failure: drop it and download again.
         delete_cached_tile(&ns, z, x, y);
     }
-    let url = RainViewerFrame::eccc_wms_request(model, hour, z, x, y, ECCC_GUTTER_PX).map_or_else(String::new, |r| r.0);
+    let url = RainViewerFrame::eccc_wms_request(model, hour, z, x, y, model.gutter_px()).map_or_else(String::new, |r| r.0);
     Err(SourceReq { ns, coord, url })
 }
 
@@ -557,7 +555,7 @@ fn flow_between(gate: &DecGate, model: EcccModel, h0: i64, coord: TileCoord, a: 
     }
     let flow = {
         let _permit = gate.enter();
-        Arc::new(estimate_flow(a, b, max_flow_px(coord)))
+        Arc::new(estimate_flow(a, b, max_flow_px(coord, model.gutter_px())))
     };
     if let Ok(mut g) = FLOWS.lock() {
         g.put(key, Arc::clone(&flow));
@@ -623,6 +621,8 @@ pub(super) fn build(gate: &DecGate, ttl: Duration, ns: &str, spec: &str, coord: 
 mod tests {
     use super::*;
 
+    /// Margin used by the synthetic test rasters.
+    const GUTTER: usize = 64;
     const VIEW: View = View::same(GUTTER, GUTTER);
 
     /// Synthetic field: one Gaussian rain cell centered at source pixel `(cx, cy)`.
@@ -742,8 +742,8 @@ mod tests {
             .map_or_else(|_| vec![4, 2, 5], |v| v.split(',').filter_map(|p| p.parse().ok()).collect());
         let coord: TileCoord = (tc[0] as u8, tc[1], tc[2]);
         let t0 = std::time::Instant::now();
-        let flow = estimate_flow(&a, &b, max_flow_px(coord));
-        println!("flow: {:?} ({}x{} nodes, cap {:.0} px)", t0.elapsed(), flow.gw, flow.gh, max_flow_px(coord));
+        let flow = estimate_flow(&a, &b, max_flow_px(coord, GUTTER as u32));
+        println!("flow: {:?} ({}x{} nodes, cap {:.0} px)", t0.elapsed(), flow.gw, flow.gh, max_flow_px(coord, GUTTER as u32));
         for ny in (0..flow.gh).step_by(2) {
             let row: Vec<String> = (0..flow.gw)
                 .step_by(2)

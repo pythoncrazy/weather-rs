@@ -528,12 +528,13 @@ impl MapEngine {
                 self.prev_base_style = Some((self.base_style, Instant::now()));
                 self.base_style = next;
                 self.last_adj_prewarm = None;
-                // Immediately warm the new style's basemap & labels at mini-map zoom (5) and current zoom so theme switches never flash blank ocean!
+                // Immediately warm the new style's basemap & labels at the mini-map's tile zoom and the current zoom so theme switches never flash blank ocean!
                 if let Ok(mut p) = self.pool.lock() {
                     let coord = (self.center_lat, self.center_lon);
-                    Self::prewarm_style_2x2(&mut p, next, 5, coord, true);
+                    let mini_z = Self::mini_tile_zoom(next);
+                    Self::prewarm_style_2x2(&mut p, next, mini_z, coord, true);
                     let cur_z = effective_tile_zoom(self.zoom, next.spec().1);
-                    if cur_z != 5 {
+                    if cur_z != mini_z {
                         Self::prewarm_style_2x2(&mut p, next, cur_z, coord, true);
                     }
                 }
@@ -851,15 +852,19 @@ impl MapEngine {
             .label_overlay()
             .map(|(lns, svc)| Self::prewarm_2x2(p, lns, z, coord, ttl, high, |x, y| BaseMapStyle::label_tile_url(svc, z, x, y)));
     }
+    /// Basemap / label tile zoom the dashboard mini-map draws at (both resolve to the same level at [`MINI_MAP_ZOOM`]).
+    fn mini_tile_zoom(style: BaseMapStyle) -> u8 {
+        effective_tile_zoom(MINI_MAP_ZOOM, style.spec().1)
+    }
     pub fn prewarm_saved_locations(&mut self, locs: &[Location], _light: bool) {
         // Lean boot prewarm: warm ONLY the active city's 2x2 tiles in `self.base_style` (reused 100% by both mini-map & expanded map!).
         let Ok(mut p) = self.pool.lock() else { return };
         let coord = locs.first().map_or((self.center_lat, self.center_lon), |l| (l.lat, l.lon));
-        Self::prewarm_style_2x2(&mut p, self.base_style, 5, coord, true);
+        Self::prewarm_style_2x2(&mut p, self.base_style, Self::mini_tile_zoom(self.base_style), coord, true);
     }
     pub fn prewarm_region(&mut self, lat: f64, lon: f64, expanded: bool, _light: bool) {
         let Ok(mut p) = self.pool.lock() else { return };
-        let z = if expanded { effective_tile_zoom(self.zoom, self.base_style.spec().1) } else { 5 };
+        let z = if expanded { effective_tile_zoom(self.zoom, self.base_style.spec().1) } else { Self::mini_tile_zoom(self.base_style) };
         Self::prewarm_style_2x2(&mut p, self.base_style, z, (lat, lon), true);
     }
 
@@ -2164,6 +2169,10 @@ fn fill_lbl(f: &mut Frame, content: String, position: Point, color: Color, size:
 fn dot(f: &mut Frame, p: Point, r: f32, c: Color) {
     f.fill(&Path::circle(p, r), c);
 }
+
+/// Camera zoom of the dashboard mini-map. At 5.7 both the basemap (`+0.58` bias) and its label overlay (`+0.35` bias)
+/// resolve to zoom-6 tiles drawn at 0.81× — crisp, never upscaled raster text (5.5 drew zoom-5 labels at 1.41×).
+pub(super) const MINI_MAP_ZOOM: f64 = 5.7;
 
 /// Cross-dissolve weight exponent between consecutive model-forecast frames (see `draw_radar_timeline`).
 const NWP_DISSOLVE_EXP: f32 = 0.8;

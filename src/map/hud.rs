@@ -474,7 +474,7 @@ impl MapEngine {
             vectors_only: false,
             interactive: false,
             accept_keys: false,
-            cam: (clat, clon, 5.5),
+            cam: (clat, clon, super::MINI_MAP_ZOOM),
             base_style: self.base_style,
             overlay: WeatherOverlay::RadarTimeline,
             corner_r: 10.0,
