@@ -9,7 +9,7 @@ Always set `ICED_TEST_BACKEND=wgpu`. Without it the headless harness can fall ba
 | Benchmark | Command | What it reports |
 | --- | --- | --- |
 | Timeline load, cold cache | `XDG_CACHE_HOME=$(mktemp -d) ICED_TEST_BACKEND=wgpu cargo test --release bench_live_radar_replay_buffering -- --ignored --nocapture` | Time until the first and until every timeline frame is ready, playback stalls, and requests, bytes and latency per upstream host. |
-| Playback smoothness | `WEATHER_RS_PLAYBACK=<dir> ICED_TEST_BACKEND=wgpu cargo test --release audit_precip_live_playback -- --ignored --nocapture` | Plays the precipitation loop in real time and saves a frame about every 55 ms, named with the playhead position and `_WAIT` while playback waits. Prints the total time spent waiting. Add `XDG_CACHE_HOME=$(mktemp -d)` for a cold cache, `WEATHER_RS_PLAYBACK_VIEW=lat,lon,zoom` for another view, and `WEATHER_RS_PLAYBACK_MODEL_FRAMES=1` for the Model Frames setting. |
+| Playback smoothness | `WEATHER_RS_PLAYBACK=<dir> ICED_TEST_BACKEND=wgpu cargo test --release audit_precip_live_playback -- --ignored --nocapture` | Plays the precipitation loop in real time and saves a frame about every 55 ms, named with the playhead position and `_WAIT` while playback waits. Prints the total time spent waiting. Add `XDG_CACHE_HOME=$(mktemp -d)` for a cold cache, `WEATHER_RS_PLAYBACK_VIEW=lat,lon,zoom` for another view, `WEATHER_RS_PLAYBACK_SIZE=WxH` and `WEATHER_RS_PLAYBACK_2X=1` for a heavier load, `WEATHER_RS_PLAYBACK_THEME=light` for the light map, and `WEATHER_RS_PLAYBACK_MODEL_FRAMES=1` for the Model Frames setting. |
 | App benchmark | `ICED_TEST_BACKEND=wgpu cargo test --release perf_benchmark -- --ignored --nocapture` | Startup cost, weather fetch latency and bytes, CPU hot paths, and frame times. |
 | End-to-end smoke test | `scripts/e2e-smoke.sh` | Launches the real binary on a virtual display with an empty cache. Reports when each screenshot was taken and the resident memory. |
 
@@ -56,6 +56,8 @@ Scenario: Pacific Northwest during a frontal passage, 1360×860 window, zoom 6.6
 
 The loop now starts by itself when the precipitation map opens, as in Apple Weather. With an empty cache it began 1.5 s after the map opened; with a warm cache it begins at once. The "wait after pressing Play" rows apply only when the user pauses and presses Play again on frames that are not loaded.
 
+Stress check: at 2560×1440 and 2× speed (`WEATHER_RS_PLAYBACK_SIZE=2560x1440 WEATHER_RS_PLAYBACK_2X=1`), with a warm cache, the loop also ran with no wait, no missing tiles and no jump other than the restart.
+
 What changed:
 
 - **Playback waits once, before it starts, and never again.** Pressing Play waits until the next 2 seconds of playback are loaded (at most 3 seconds). After that the playhead always moves. Frames load several times faster than they are shown, and a tile that is still late is replaced by the same tile from the adjacent moment until it arrives.
@@ -84,7 +86,7 @@ Frame times vary between runs with whatever else the desktop is drawing. The val
 | Radar manifest | 192 ms, 2 requests, 2.3 kB |
 | Map grid, 20 points | 36 ms, 1 request, 3.4 kB on the wire |
 | Bento view, full frame | 3.3 ms |
-| Radar playback, full frame | 4.1 ms |
+| Radar playback, full frame | 4.6 ms (4.1 ms before the loop drew two interpolation frames at once) |
 | Map pan, full frame | 4.0 ms |
 | Scalar field build | 0.39 ms |
 | Isobar build | 0.11 ms |

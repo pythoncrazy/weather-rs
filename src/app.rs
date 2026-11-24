@@ -2202,7 +2202,12 @@ mod tests {
     #[ignore = "visual audit: run with WEATHER_RS_PLAYBACK=/tmp/playback cargo test --release audit_precip_live_playback -- --ignored --nocapture"]
     fn audit_precip_live_playback() {
         ensure_fonts_loaded();
-        let mut h = Harness::new(Size::new(1360.0, 860.0), 1.0, iced::Point::new(10.0, 10.0), "WEATHER_RS_PLAYBACK");
+        // WEATHER_RS_PLAYBACK_SIZE=2560x1440 captures a larger window (more tiles to build per frame).
+        let (w, hgt) = std::env::var("WEATHER_RS_PLAYBACK_SIZE")
+            .ok()
+            .and_then(|v| v.split_once('x').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))))
+            .unwrap_or((1360.0_f32, 860.0_f32));
+        let mut h = Harness::new(Size::new(w, hgt), 1.0, iced::Point::new(10.0, 10.0), "WEATHER_RS_PLAYBACK");
         let mut app = WeatherApp::boot().0;
         let light = std::env::var("WEATHER_RS_PLAYBACK_THEME").is_ok_and(|t| t == "light");
         let _ = app.update(Msg::Pref(Pref::Theme(if light { ThemeMode::Light } else { ThemeMode::Dark })));
@@ -2223,6 +2228,10 @@ mod tests {
         let settle_ms: u64 = std::env::var("WEATHER_RS_PLAYBACK_SETTLE_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(2000);
         h.pump_render(&mut app, (settle_ms / 50) as usize, 50);
         let secs: f32 = std::env::var("WEATHER_RS_PLAYBACK_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(16.0);
+        // WEATHER_RS_PLAYBACK_2X=1 plays at double speed (twice as many interpolated tiles to build per second).
+        if std::env::var_os("WEATHER_RS_PLAYBACK_2X").is_some() {
+            let _ = app.update(Msg::Map(MapMsg::CyclePlaybackSpeed));
+        }
         // The loop starts by itself when the map opens; press Play only if something paused it.
         if !app.map.radar_playing() {
             let _ = app.update(Msg::Map(MapMsg::ToggleRadarPlay));
