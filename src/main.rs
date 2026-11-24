@@ -1,4 +1,5 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
+#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
 mod app;
 mod astro;
@@ -11,68 +12,54 @@ mod storage;
 mod style;
 
 use iced::{Size, window};
+#[cfg(target_os = "linux")]
 use std::env;
 
 #[cfg(target_os = "linux")]
 mod linux_display {
-    use std::ffi::{CString, c_char, c_int, c_void};
-    use std::path::PathBuf;
-    use std::time::Duration;
-
+    use std::{
+        ffi::{CString, c_char, c_int, c_void},
+        path::PathBuf,
+        time::Duration,
+    };
     type Open = unsafe extern "C" fn(*const c_char) -> *mut c_void;
-    type Query = unsafe extern "C" fn(
-        *mut c_void,
-        *const c_char,
-        *mut c_int,
-        *mut c_int,
-        *mut c_int,
-    ) -> c_int;
+    type Query = unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_int, *mut c_int, *mut c_int) -> c_int;
     type Close = unsafe extern "C" fn(*mut c_void) -> c_int;
-
     unsafe extern "C" {
-        fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
-        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
-        fn dlclose(handle: *mut c_void) -> c_int;
+        fn dlopen(f: *const c_char, fl: c_int) -> *mut c_void;
+        fn dlsym(h: *mut c_void, s: *const c_char) -> *mut c_void;
+        fn dlclose(h: *mut c_void) -> c_int;
     }
 
     pub fn wayland_live() -> bool {
-        let Some(d) = std::env::var_os("WAYLAND_DISPLAY") else {
-            return false;
-        };
-        let p = PathBuf::from(&d);
+        let Some(p) = std::env::var_os("WAYLAND_DISPLAY").map(PathBuf::from) else { return false };
         let sock = if p.is_absolute() {
             p
         } else {
-            let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") else {
-                return false;
-            };
-            PathBuf::from(dir).join(p)
+            let Some(d) = std::env::var_os("XDG_RUNTIME_DIR") else { return false };
+            PathBuf::from(d).join(p)
         };
         std::os::unix::net::UnixStream::connect(&sock).is_ok()
     }
 
     pub fn x11_has_dri3(display: &str) -> bool {
-        let Ok(dpy) = CString::new(display) else {
-            return false;
-        };
+        let Ok(dpy) = CString::new(display) else { return false };
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            // SAFETY: NUL-terminated static C symbols, null-checked before calls, display & lib closed.
             let _ = tx.send(unsafe { probe_x11_dri3(&dpy) });
         });
         rx.recv_timeout(Duration::from_millis(250)).unwrap_or(false)
     }
 
     unsafe fn probe_x11_dri3(dpy: &CString) -> bool {
-        // SAFETY: Caller guarantees dpy is a valid NUL-terminated X11 display string.
+        // SAFETY: dpy is NUL-terminated; static C symbols & lib pointer are null-checked before calls and closed.
         unsafe {
             let lib = dlopen(c"libX11.so.6".as_ptr(), 1);
             if lib.is_null() {
                 return false;
             }
-            let po = dlsym(lib, c"XOpenDisplay".as_ptr());
-            let pq = dlsym(lib, c"XQueryExtension".as_ptr());
-            let pc = dlsym(lib, c"XCloseDisplay".as_ptr());
+            let (po, pq, pc) =
+                (dlsym(lib, c"XOpenDisplay".as_ptr()), dlsym(lib, c"XQueryExtension".as_ptr()), dlsym(lib, c"XCloseDisplay".as_ptr()));
             let mut ok = false;
             if !po.is_null() && !pq.is_null() && !pc.is_null() {
                 let open = std::mem::transmute::<*mut c_void, Open>(po);
@@ -94,37 +81,24 @@ mod linux_display {
 fn configure_display() {
     #[cfg(target_os = "linux")]
     {
+        // SAFETY: single-threaded startup before Iced/winit or worker threads spawn.
         if env::var_os("NO_AT_BRIDGE").is_none() {
-            // SAFETY: single-threaded startup before Iced/winit or GTK preload threads spawn.
-            // Prevents offscreen GTK3 titlebar rendering from registering an unpumped AT-SPI bridge.
             unsafe { env::set_var("NO_AT_BRIDGE", "1") };
         }
-        if let Some(tok) = env::var("XDG_ACTIVATION_TOKEN")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                env::var("DESKTOP_STARTUP_ID")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-            })
-        {
+        if let Some(tok) = ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"].iter().find_map(|k| env::var(k).ok().filter(|s| !s.is_empty())) {
             sctk_adwaita::set_activation_token(tok);
-            // SAFETY: single-threaded startup before Iced/winit or GTK preload threads spawn.
-            // Prevents libgtk-3 from swallowing the token without mapping a GTK window.
             unsafe {
                 env::remove_var("XDG_ACTIVATION_TOKEN");
                 env::remove_var("DESKTOP_STARTUP_ID");
             }
         }
         if env::var_os("WAYLAND_DISPLAY").is_some() && !linux_display::wayland_live() {
-            // SAFETY: single-threaded startup before Iced/winit or worker threads spawn.
             unsafe { env::remove_var("WAYLAND_DISPLAY") };
         }
-        if env::var_os("WAYLAND_DISPLAY").is_none()
-            && env::var("DISPLAY").is_ok_and(|d| !d.is_empty() && !linux_display::x11_has_dri3(&d))
+        let need_gl = env::var_os("WAYLAND_DISPLAY").is_none()
             && env::var_os("WGPU_BACKEND").is_none()
-        {
-            // SAFETY: single-threaded startup before Iced/wgpu initializes.
+            && env::var("DISPLAY").is_ok_and(|d| !d.is_empty() && !linux_display::x11_has_dri3(&d));
+        if need_gl {
             unsafe {
                 env::set_var("WGPU_BACKEND", "gl");
                 if env::var_os("LIBGL_ALWAYS_SOFTWARE").is_none() {
@@ -135,75 +109,37 @@ fn configure_display() {
     }
 }
 
-fn build_app_icon() -> Option<window::Icon> {
-    const N: usize = 64;
-    let mut px = vec![0u8; N * N * 4];
-    let blend = |dst: &mut [f32; 3], src: [f32; 3], a: f32| {
-        for i in 0..3 {
-            dst[i] = dst[i] * (1.0 - a) + src[i] * a;
-        }
-    };
-    for y in 0..N {
-        let t = y as f32 / (N - 1) as f32;
-        for x in 0..N {
-            let (fx, fy) = (x as f32, y as f32);
-            let qx = ((fx - 31.5).abs() - 18.5).max(0.0);
-            let qy = ((fy - 31.5).abs() - 18.5).max(0.0);
-            let mask = (13.0 - qx.hypot(qy)).clamp(0.0, 1.0);
-            if mask <= 0.0 {
-                continue;
-            }
-            let mut c = [24.0 + 48.0 * t, 114.0 + 58.0 * t, 216.0 + 28.0 * t];
-            let s =
-                (1.0 - ((fx - 26.0).hypot(fy - 24.0) - 10.5).clamp(0.0, 1.5) / 1.5).clamp(0.0, 1.0);
-            if s > 0.0 {
-                blend(&mut c, [255.0, 214.0, 64.0], s);
-            }
-            let cl = [(26.0, 39.0, 9.5), (36.0, 36.0, 11.5), (45.0, 40.0, 8.5)]
-                .into_iter()
-                .map(|(cx, cy, r)| (r - (fx - cx).hypot(fy - cy)).clamp(0.0, 1.5) / 1.5)
-                .fold(0.0_f32, f32::max);
-            if cl > 0.0 {
-                blend(&mut c, [248.0, 252.0, 255.0], cl);
-            }
-            let i = (y * N + x) * 4;
-            px[i..i + 4].copy_from_slice(&[
-                c[0] as u8,
-                c[1] as u8,
-                c[2] as u8,
-                (mask * 255.0) as u8,
-            ]);
-        }
-    }
-    window::icon::from_rgba(px, N as u32, N as u32).ok()
-}
-
 fn main() -> iced::Result {
     configure_display();
     #[cfg(target_os = "linux")]
     sctk_adwaita::preload();
     style::preload_fonts();
     icons::preload_cloud_tex();
-    iced::application(
-        app::WeatherApp::boot,
-        app::WeatherApp::update,
-        app::WeatherApp::view,
-    )
-    .title(app::WeatherApp::title)
-    .theme(app::WeatherApp::theme)
-    .subscription(app::WeatherApp::subscription)
-    .default_font(style::fw(iced::font::Weight::Normal))
-    .window(window::Settings {
+    const ICON_SVG: &str = r##"<defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#1872D8"/><stop offset="1" stop-color="#48ACF4"/></linearGradient></defs><rect width="64" height="64" rx="14" fill="url(#g)"/><circle cx="26" cy="24" r="10.5" fill="#FFD640"/><circle cx="26" cy="39" r="9.5" fill="#F8FCFF"/><circle cx="36" cy="36" r="11.5" fill="#F8FCFF"/><circle cx="45" cy="40" r="8.5" fill="#F8FCFF"/>"##;
+    let icon = window::icon::from_rgba(icons::render_svg_rgba(ICON_SVG, 64, 64.0), 64, 64).ok();
+    let win = window::Settings {
         size: Size::new(1180.0, 760.0),
         min_size: Some(Size::new(720.0, 520.0)),
         exit_on_close_request: false,
-        icon: build_app_icon(),
+        icon,
         #[cfg(target_os = "linux")]
+        platform_specific: window::settings::PlatformSpecific { application_id: "weather-rs".into(), ..Default::default() },
+        #[cfg(target_os = "macos")]
         platform_specific: window::settings::PlatformSpecific {
-            application_id: "weather-rs".into(),
+            title_hidden: true,
+            titlebar_transparent: true,
+            fullsize_content_view: true,
+        },
+        #[cfg(target_os = "windows")]
+        platform_specific: window::settings::PlatformSpecific {
+            corner_preference: window::settings::platform::CornerPreference::Round,
             ..Default::default()
         },
         ..Default::default()
-    })
-    .run()
+    };
+    let app = iced::application(app::WeatherApp::boot, app::WeatherApp::update, app::WeatherApp::view)
+        .title(app::WeatherApp::title)
+        .theme(app::WeatherApp::theme)
+        .subscription(app::WeatherApp::subscription);
+    app.default_font(style::fw(iced::font::Weight::Normal)).window(win).run()
 }

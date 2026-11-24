@@ -1,2 +1,5 @@
 edition = "2024"
-max_width = 100
+max_width = 140
+use_small_heuristics = "Max"
+single_line_let_else_max_width = 140
+fn_params_layout = "Compressed"

@@ -1,42 +1,50 @@
 # weather-rs
 
-A fast, native cross-platform desktop weather and interactive radar map application written in pure Rust with [iced](https://iced.rs) and GPU-accelerated rendering (`wgpu`).
+`weather-rs` is a desktop weather application written in Rust.
+It uses `iced` and `wgpu` for GPU graphics, with a `tiny-skia` software fallback.
 
 ## Features
 
-- **Dynamic sky UI & responsive bento dashboard** — Adaptive sky palettes driven by live conditions and solar elevation, with full-width and split-map layouts.
-- **Multi-provider weather engine with automatic failover** — Combines Open-Meteo (`best_match`), live NOAA NWS station observations and severe weather alerts (US), MET Norway (`Locationforecast` & Nordic `Nowcast`), and CAMS Air Quality Index.
-- **Interactive 60fps weather map**:
-  - **Precipitation & radar timeline** — Seamless past + future playback combining RainViewer / IEM NEXRAD / GOES IR with NOAA HRRR (`REFP`/`REFD`) and LibreWXR forecast radar, with smooth cross-fading and background frame preloading.
-  - **Atmospheric overlays** — Animated wind streamlines, temperature, precipitation, wind speed, and sea-level pressure IDW heatmaps.
-  - **Point inspector & base styles** — Click anywhere on the map to inspect local atmospheric conditions; switch between Standard, Dark, Light, and Satellite basemaps.
-- **Rich forecast cards** — Minutely precipitation, 24-hour hourly strip, 10-day forecast with temperature range bars, UV index, AQI spectrum, wind compass, sunrise/sunset arc, moon phase & illumination, barometric pressure dial, humidity/dew point, visibility, and historical averages.
-- **Offline resilience & preferences** — Local disk caching for forecasts and map tiles, location search & saved locations, customizable units (°C/°F, km/h/mph/m/s/kn, mm/in, hPa/inHg/mmHg), 12h/24h clock, and theme presets.
-- **Linux desktop integration** — Live Wayland socket detection, X11 DRI3 probe with automatic software GL fallback, native GTK3 Wayland CSD titlebars, `weather-rs` `app_id`/`WM_CLASS`, and freedesktop `.desktop` entry using the GNOME Weather icon (`org.gnome.Weather`).
+- **Adaptive dashboard**: The interface adjusts sky colors to live weather and solar elevation. It supports full-width and split-map layouts.
+- **Multi-provider weather data**: The app reads forecasts from Open-Meteo (`best_match`) and MET Norway. It merges US station observations from NOAA NWS and global air quality data from CAMS.
+- **Severe weather alerts**: The app loads active alerts from NOAA NWS (US), BrightSky DWD (Germany), and MET Norway (Norway).
+- **Interactive weather map**:
+  - **Radar timeline**: Play past radar and 12-hour forecast frames from RainViewer, IEM NEXRAD, GOES IR, NOAA HRRR, and LibreWXR.
+  - **Atmospheric layers**: View animated wind particles and interpolated maps for temperature, precipitation, air quality, wind speed, and sea-level pressure.
+  - **Point inspector and map styles**: Click any point on the map to read local weather. Switch among five map styles: Standard Light, Dark Canvas, Satellite, Topographic, and OpenStreetMap.
+- **Forecast cards**: Cards show 60-minute precipitation, 24-hour and 10-day forecasts, UV index, AQI, wind, sun and moon cycles, pressure, humidity, visibility, and climate averages.
+- **Offline cache and settings**: The app saves forecasts and map tiles to disk. You can search locations, save cities, choose units, set a 12-hour or 24-hour clock, and select a theme.
+- **Linux desktop integration**: On Linux, the app detects Wayland sockets and X11 DRI3 support at startup. It draws Wayland titlebars with GTK3, sets `weather-rs` as the application ID, and installs a freedesktop launcher.
 
-## Building & Running
+## Build and run
 
-Requires a recent stable Rust toolchain (Edition 2024).
+Install a stable Rust toolchain that supports Edition 2024.
+Then run the release build:
 
 ```bash
 cargo run --release
 ```
 
-### Linux Desktop Installation
+### Linux desktop installation
 
-To build the release binary, install it to `~/.local/bin/weather-rs`, and register the application launcher entry (`~/.local/share/applications/weather-rs.desktop`, using the `org.gnome.Weather` icon):
+Run the install script to build the release binary and register the desktop launcher:
 
 ```bash
 ./packaging/install.sh
 ```
 
-To uninstall:
+The script copies the binary to `~/.local/bin/weather-rs`.
+It also writes `~/.local/share/applications/weather-rs.desktop` with the `org.gnome.Weather` icon.
+
+To remove the binary and the desktop entry, run:
 
 ```bash
 ./packaging/install.sh --uninstall
 ```
 
-## Testing & Quality Checks
+## Test and check code
+
+Run these commands to check code style, lints, and tests:
 
 ```bash
 cargo fmt --check
@@ -44,31 +52,32 @@ cargo clippy --all-targets -- -D warnings
 ICED_TEST_BACKEND=wgpu cargo test
 ```
 
-## Architecture & Vendored Patches
+## Source layout
 
-`src/` is organized into focused modules:
+- `src/main.rs` checks the Linux display backend, configures the window, and starts the app.
+- `src/app.rs` holds application state, runs background tasks, and builds the main layout, search, and preferences.
+- `src/cards.rs` draws forecast cards and metric widgets.
+- `src/map/` implements the tile engine (`tiles.rs`), weather overlays (`overlays.rs`), map controls (`hud.rs`), and input logic (`mod.rs`).
+- `src/providers.rs` fetches weather, geocoding, air quality, severe alerts, and radar manifests.
+- `src/model.rs`, `src/astro.rs`, `src/icons.rs`, `src/style.rs`, and `src/storage.rs` define data models, solar and lunar math, SVG icons, color palettes, and disk storage.
 
-- `main.rs` — Startup display probing (Wayland/X11 DRI3), window configuration, and `application_id`.
-- `app.rs` — `iced` application state, async task orchestration, split/full bento layout, search, and preferences.
-- `cards.rs` — Forecast and atmospheric metric cards.
-- `map/` — Mercator tile engine (`tiles.rs`), radar/IDW/wind overlay rendering (`overlays.rs`), map HUD/timeline (`hud.rs`), and interaction controller (`mod.rs`).
-- `providers.rs` — Multi-source weather, geocoding, air quality, NWS alerts, and radar manifest clients.
-- `model.rs`, `astro.rs`, `icons.rs`, `style.rs`, `storage.rs` — Domain types, solar/lunar ephemeris, vector icons/canvas widgets, palettes, and persistence.
+## Vendored patches
 
-Two upstream crates are temporarily patched in `vendor/` via `[patch.crates-io]`:
+`Cargo.toml` applies two local patches in `vendor/`:
 
-- `vendor/iced_tiny_skia` (`0.14.1`) — Fixes missing quad-shadow and per-image `Frame::with_clip` clipping in `tiny-skia` software fallback and optimizes damage diffing. See `vendor/iced_tiny_skia/README`.
-- `vendor/sctk-adwaita` (`0.10.1`) — Renders Wayland client-side decorations with the system GTK3 theme (`gtk-decoration-layout`, native headerbar colors, and titlebar actions) with built-in fallback. See `vendor/sctk-adwaita/README`.
+- `vendor/iced_tiny_skia` (`0.14.1`) adds quad shadows and per-image `Frame::with_clip` support to the software renderer. See `vendor/iced_tiny_skia/README`.
+- `vendor/sctk-adwaita` (`0.10.1`) draws Wayland titlebars with the system GTK3 theme and a built-in fallback. See `vendor/sctk-adwaita/README`.
 
-Both directories can be removed once upstream releases include these fixes.
+Remove both directories after upstream releases include these fixes.
 
-## Data Sources & Attribution
+## Data sources
 
-- Weather & air quality data: [Open-Meteo](https://open-meteo.com/), [NOAA National Weather Service](https://www.weather.gov/), [MET Norway](https://api.met.no/)
-- Forecast radar & satellite/radar imagery: [LibreWXR](https://librewxr.org/) (CC BY 4.0), [Iowa Environmental Mesonet (NEXRAD / HRRR)](https://mesonet.agron.iastate.edu/), [RainViewer](https://www.rainviewer.com/)
-- Map tiles: [CARTO](https://carto.com/), [Esri World Imagery](https://www.esri.com/), [OpenStreetMap](https://www.openstreetmap.org/copyright)
-- Bundled UI font: [Inter](assets/fonts/INTER-LICENSE.txt)
+- Weather and air quality: [Open-Meteo](https://open-meteo.com/), [NOAA National Weather Service](https://www.weather.gov/), [MET Norway](https://api.met.no/), and [BrightSky / DWD](https://brightsky.dev/).
+- Radar and satellite imagery: [LibreWXR](https://librewxr.org/) (CC BY 4.0), [Iowa Environmental Mesonet](https://mesonet.agron.iastate.edu/), and [RainViewer](https://www.rainviewer.com/).
+- Map tiles: [Esri ArcGIS Online](https://www.esri.com/) and [OpenStreetMap](https://www.openstreetmap.org/copyright).
+- UI font: [Inter](assets/fonts/INTER-LICENSE.txt).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+This project uses the MIT License.
+See [LICENSE](LICENSE) for details.
