@@ -453,8 +453,16 @@ pub struct Settings {
     #[serde(default)]
     pub theme_mode: ThemeMode,
     pub animate_weather: bool,
+    /// Forecast map: when `true`, the frames between hourly ECCC model outputs are motion-interpolated by the app
+    /// (smooth playback, labelled "Interpolated Forecast"); when `false`, only frames the models actually issued are
+    /// shown and the map steps from hour to hour.
+    #[serde(default = "default_true")]
+    pub interpolate_forecast: bool,
     pub saved_locations: Vec<Location>,
     pub selected_location_id: Option<String>,
+}
+const fn default_true() -> bool {
+    true
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -469,6 +477,7 @@ impl Default for Settings {
             provider: ProviderChoice::default(),
             theme_mode: ThemeMode::default(),
             animate_weather: true,
+            interpolate_forecast: true,
             saved_locations,
             selected_location_id,
         }

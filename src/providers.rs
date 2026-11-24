@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{
     LazyLock, Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 use ureq::Agent;
@@ -139,6 +139,13 @@ pub struct RainViewerFrame {
     pub is_nowcast: bool,
     pub source: RadarFrameSource,
 }
+/// Whether forecast-map frames between hourly ECCC model outputs are motion-interpolated (the user's
+/// "Forecast Map: Smooth / Model Frames" setting).
+static FORECAST_INTERPOLATION: AtomicBool = AtomicBool::new(true);
+/// Applies the forecast-map interpolation setting; call before (re)building the map's timeline namespaces.
+pub fn set_forecast_interpolation(on: bool) {
+    FORECAST_INTERPOLATION.store(on, Ordering::Relaxed);
+}
 /// Environment Canada (ECCC GeoMet WMS) multi-tier NWP precipitation rate models, ordered finest to coarsest:
 /// - `Hrdps`: 2.5 km Continental High-Resolution Deterministic Prediction System (Canada + US PNW/Northern US/NE Atlantic, `z=6`).
 /// - `Rdps`: 10 km Regional Deterministic Prediction System (all North America + 2,500 km offshore Pacific/Atlantic, `z=5`).
@@ -205,10 +212,18 @@ impl EcccModel {
 impl RainViewerFrame {
     /// ECCC GeoMet interpolation slot `(h0, q)` for this frame: the frame sits `q` quarter-hours after UTC hour `h0`
     /// (`q == 0` is the hourly model raster itself; `q` in `1..=3` is synthesized between `h0` and `h0 + 1h`).
+    /// With forecast interpolation switched off, every frame maps to the nearest hour the model actually issued.
     #[inline]
     pub fn eccc_slot(&self) -> (i64, u8) {
-        let h0 = self.time_unix.div_euclid(3600) * 3600;
-        let q = (self.time_unix - h0 + 450) / 900;
+        Self::eccc_slot_at(self.time_unix, FORECAST_INTERPOLATION.load(Ordering::Relaxed))
+    }
+    /// See [`Self::eccc_slot`]; `interpolate == false` snaps to the nearest issued hour (`q == 0`).
+    pub fn eccc_slot_at(time_unix: i64, interpolate: bool) -> (i64, u8) {
+        if !interpolate {
+            return ((time_unix + 1800).div_euclid(3600) * 3600, 0);
+        }
+        let h0 = time_unix.div_euclid(3600) * 3600;
+        let q = (time_unix - h0 + 450) / 900;
         if q >= 4 { (h0 + 3600, 0) } else { (h0, q as u8) }
     }
     /// Official Environment and Climate Change Canada (ECCC GeoMet WMS) real NWP precipitation rate tile URL

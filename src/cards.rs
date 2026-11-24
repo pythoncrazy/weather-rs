@@ -8,7 +8,7 @@ use crate::model::{
 };
 use crate::style::{
     SkyPalette, alert_card, flat_box, frosted_card, frosted_card_btn, fw, hairline, hud_pill, pbtn, rgb8, rgba8, sleek_scrollable, sp_h,
-    sp_w, t, tb, tbold, tm, txt,
+    sp_w, tb, tbold, tm, txt,
 };
 use chrono::{Datelike, NaiveDate};
 use iced::font::Weight;
@@ -202,7 +202,7 @@ impl WeatherApp {
         let hl = b.daily.get(di).map_or_else(String::new, |d| hi_lo_label(&self.settings, d));
         let mut c = column![
             hd,
-            t(self.settings.format_temp(b.current.temp_c), 84.0, p.text_primary),
+            txt(self.settings.format_temp(b.current.temp_c), 88.0, Weight::ExtraLight, p.text_primary),
             tm(b.current.condition.label(), 17.0, p.text_secondary),
             tb(hl, 14.5, p.text_primary)
         ];

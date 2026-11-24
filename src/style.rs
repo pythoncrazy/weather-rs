@@ -10,7 +10,9 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-const INTER_FONTS: [&[u8]; 4] = [
+const INTER_FONTS: [&[u8]; 5] = [
+    // ExtraLight is used only for the hero temperature, matching the thin numerals of Apple Weather.
+    include_bytes!("../assets/fonts/Inter-ExtraLight.woff"),
     include_bytes!("../assets/fonts/Inter-Regular.woff"),
     include_bytes!("../assets/fonts/Inter-Medium.woff"),
     include_bytes!("../assets/fonts/Inter-SemiBold.woff"),
@@ -25,7 +27,7 @@ pub fn preload_fonts() {
 pub fn ensure_fonts_loaded() {
     LOAD_FONTS.get_or_init(|| {
         let sfnts = std::thread::scope(|s| {
-            // Decode all 4 WOFF weights in parallel while initializing cosmic-text font_system concurrently!
+            // Decode all WOFF weights in parallel while initializing cosmic-text font_system concurrently!
             let hs: Vec<_> = INTER_FONTS.into_iter().map(|b| s.spawn(move || woff_to_sfnt(b))).collect();
             let _ = font_system();
             hs.into_iter().map(|h| h.join().expect("woff decode")).collect::<Vec<_>>()
@@ -95,9 +97,6 @@ pub const fn rgba8(r: u8, g: u8, b: u8, a: f32) -> Color {
 }
 pub fn txt<'a>(c: impl text::IntoFragment<'a>, sz: f32, w: Weight, col: Color) -> text::Text<'a> {
     text(c).size(sz).font(fw(w)).color(col)
-}
-pub fn t<'a>(c: impl text::IntoFragment<'a>, sz: f32, col: Color) -> text::Text<'a> {
-    txt(c, sz, Weight::Normal, col)
 }
 pub fn tm<'a>(c: impl text::IntoFragment<'a>, sz: f32, col: Color) -> text::Text<'a> {
     txt(c, sz, Weight::Medium, col)

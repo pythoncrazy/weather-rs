@@ -64,6 +64,7 @@ pub enum Pref {
     Precip(PrecipUnit),
     Use24h(bool),
     Animate(bool),
+    InterpolateForecast(bool),
     Provider(ProviderChoice),
 }
 
@@ -158,6 +159,7 @@ impl WeatherApp {
     pub fn boot() -> (Self, Task<Msg>) {
         let (mut settings, first_run) = load_settings();
         settings.deduplicate_locations();
+        crate::providers::set_forecast_interpolation(settings.interpolate_forecast);
         let bundles = settings
             .saved_locations
             .iter()
@@ -699,6 +701,11 @@ impl WeatherApp {
                     Pref::Precip(u) => self.settings.precip_unit = u,
                     Pref::Use24h(v) => self.settings.use_24h_time = v,
                     Pref::Animate(v) => self.settings.animate_weather = v,
+                    Pref::InterpolateForecast(v) => {
+                        self.settings.interpolate_forecast = v;
+                        crate::providers::set_forecast_interpolation(v);
+                        self.map.reapply_manifest();
+                    }
                     Pref::Provider(pr) => {
                         self.settings.provider = pr;
                         refresh = true;
@@ -1346,6 +1353,15 @@ impl WeatherApp {
                 sub_fg,
                 track_bg,
             ),
+            prow(
+                "Forecast Map",
+                vec![
+                    seg("Smooth", s.interpolate_forecast, Msg::Pref(Pref::InterpolateForecast(true))),
+                    seg("Model Frames", !s.interpolate_forecast, Msg::Pref(Pref::InterpolateForecast(false)))
+                ],
+                sub_fg,
+                track_bg,
+            ),
             hairline(div_col),
             txt("FORECAST PROVIDER", 10.0, Weight::Bold, if lt { rgba8(46, 62, 86, 0.68) } else { rgba8(200, 214, 236, 0.65) }),
             column(prv_c).spacing(5),
@@ -1918,7 +1934,7 @@ mod tests {
         let cloud_us = t0.elapsed().as_micros();
         ensure_fonts_loaded();
         println!("STARTUP / INIT:");
-        println!("  woff_decode_4fonts_us:     {woff_us:>7} us ({sfnt_bytes} B SFNT)");
+        println!("  woff_decode_fonts_us:      {woff_us:>7} us ({sfnt_bytes} B SFNT)");
         println!("  cloud_tex_gen_us:          {cloud_us:>7} us");
 
         // 2. Network latency & bytes transferred (live upstream!)
@@ -2128,6 +2144,10 @@ mod tests {
         let _ = app.update(Msg::Map(MapMsg::ExpandMap));
         let _ = app.update(Msg::Map(MapMsg::SelectOverlay(crate::map::WeatherOverlay::RadarTimeline)));
         let _ = app.update(Msg::Map(MapMsg::ToggleFullScreen));
+        // WEATHER_RS_STRIP_MODEL_FRAMES=1 captures the "Model Frames" setting (no app-interpolated ECCC frames).
+        if std::env::var_os("WEATHER_RS_STRIP_MODEL_FRAMES").is_some() {
+            let _ = app.update(Msg::Pref(Pref::InterpolateForecast(false)));
+        }
         h.pump_render(&mut app, 35, 100);
         let live_i = app.map.live_frame_idx();
         let frames = app.map.debug_manifest();

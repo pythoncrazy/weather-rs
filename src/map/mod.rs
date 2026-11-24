@@ -472,6 +472,15 @@ impl MapEngine {
         engine
     }
 
+    /// Rebuilds the timeline's tile namespaces from the current manifest (after the forecast-map interpolation
+    /// setting changed, the same frames map to different ECCC rasters).
+    pub fn reapply_manifest(&mut self) {
+        if let Some(m) = self.manifest.clone() {
+            self.set_manifest(m);
+            self.last_prewarmed_strip = None;
+        }
+    }
+
     fn set_manifest(&mut self, m: RainViewerManifest) {
         let (next_ids, next_sat): (Vec<[Option<u32>; 4]>, Vec<u32>) = if let Ok(mut pool) = self.pool.lock() {
             let fids = m
@@ -3899,6 +3908,10 @@ mod tests {
         assert_eq!(slot(1_700_002_800 + 2700), (1_700_002_800, 3));
         // Timestamps within 7.5 min of the next hour belong to that hour's own raster, never a 4th quarter.
         assert_eq!(slot(1_700_002_800 + 3300), (1_700_006_400, 0));
+        // With interpolation switched off, every frame shows the nearest hour the model actually issued.
+        let issued = |t: i64| RainViewerFrame::eccc_slot_at(t, false);
+        assert_eq!((issued(1_700_002_800 + 900), issued(1_700_002_800 + 1800)), ((1_700_002_800, 0), (1_700_006_400, 0)));
+        assert_eq!(issued(1_700_002_800 + 2700), (1_700_006_400, 0));
         let f =
             RainViewerFrame { time_unix: 1_700_002_800 + 1800, is_nowcast: true, source: RadarFrameSource::NoaaHrrr("x".into(), 30, true) };
         assert_eq!(f.eccc_tier_namespaces().unwrap()[1], "eccc_rdps_out_v7_1700002800_2");
