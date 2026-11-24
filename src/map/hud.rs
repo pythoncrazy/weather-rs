@@ -460,7 +460,7 @@ impl MapEngine {
                 title: String::new(),
                 lat: l.lat,
                 lon: l.lon,
-                val: t.map_or_else(|| "--".into(), |c| settings.format_temp(c)),
+                val: t.map_or_else(|| "—".into(), |c| settings.format_temp(c)),
                 sub: String::new(),
                 col: t.map_or_else(|| rgb8(46, 108, 186), temp_badge_color),
                 active: true,
@@ -527,11 +527,11 @@ impl MapEngine {
                 let (b, act) = (bundles.get(&l.id), active_id == Some(l.id.as_str()));
                 let (val, sub, col, wdeg) = match self.overlay {
                     WeatherOverlay::AirQuality => {
-                        b.and_then(|x| x.air_quality.as_ref()).map_or(("--".into(), String::new(), rgb8(90, 108, 134), None), |a| {
+                        b.and_then(|x| x.air_quality.as_ref()).map_or(("—".into(), String::new(), rgb8(90, 108, 134), None), |a| {
                             (a.us_aqi.to_string(), "AQI".into(), aqi_to_color(a.us_aqi), None)
                         })
                     }
-                    WeatherOverlay::WindFlow => b.map_or(("--".into(), String::new(), rgb8(232, 238, 246), None), |x| {
+                    WeatherOverlay::WindFlow => b.map_or(("—".into(), String::new(), rgb8(232, 238, 246), None), |x| {
                         let (_, wspd, wdir, _) = sample_bundle(x);
                         (
                             settings.wind_value_and_unit(wspd).0,
@@ -541,7 +541,7 @@ impl MapEngine {
                         )
                     }),
                     WeatherOverlay::Pressure => {
-                        b.and_then(|x| sample_bundle(x).3).map_or(("--".into(), String::new(), rgb8(84, 118, 168), None), |prs| {
+                        b.and_then(|x| sample_bundle(x).3).map_or(("—".into(), String::new(), rgb8(84, 118, 168), None), |prs| {
                             let pv = match settings.pressure_unit {
                                 crate::model::PressureUnit::HPa => format!("{:.0}", prs),
                                 crate::model::PressureUnit::InHg => format!("{:.2}", prs * 0.02953),
@@ -549,7 +549,7 @@ impl MapEngine {
                             (pv, String::new(), pressure_to_color(prs, 1.0), None)
                         })
                     }
-                    _ => b.map_or(("--".into(), String::new(), rgb8(68, 118, 186), None), |x| {
+                    _ => b.map_or(("—".into(), String::new(), rgb8(68, 118, 186), None), |x| {
                         let (tc, _, _, _) = sample_bundle(x);
                         (settings.format_temp(tc), String::new(), temp_badge_color(tc), None)
                     }),
@@ -947,7 +947,8 @@ impl MapEngine {
                 format!("{:.2}°, {:.2}° • {ltime}", b.location.lat, b.location.lon)
             };
             let feels = b.current.feels_like_c.map_or_else(|| "—".to_string(), |f| s.format_temp(f));
-            let hl = b.daily.first().map_or_else(
+            // A day the source only covers in part has no whole-day high / low to show.
+            let hl = b.daily.first().filter(|d| !d.partial).map_or_else(
                 || format!("Feels {feels}"),
                 |d| format!("H:{}  L:{}", s.format_temp(d.temp_max_c), s.format_temp(d.temp_min_c)),
             );

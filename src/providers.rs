@@ -92,6 +92,7 @@ const UA: &str = "weather-rs/0.2.0 (https://github.com/pythoncrazy/weather-rs)";
 pub struct GridWeatherPoint {
     pub lat: f64,
     pub lon: f64,
+    /// `[temperature °C, (unused), wind u m/s, wind v m/s, wind speed m/s, sea-level pressure hPa]`.
     pub v: [f32; 6],
     pub hourly: [(i64, [f32; 6]); 14],
     pub hourly_len: u8,
@@ -474,23 +475,6 @@ fn coords_csv(c: &[(f64, f64)]) -> (String, String) {
     (j(|&(la, _)| format!("{:.2}", la.clamp(-85.0, 85.0))), j(|&(_, lo)| format!("{:.2}", wrap_lon(lo))))
 }
 
-fn epa_pm25_aqi(pm25: f64) -> i32 {
-    if !pm25.is_finite() || pm25 <= 0.0 {
-        return 0;
-    }
-    let c = (pm25 * 10.0).floor() / 10.0;
-    const BP: [(f64, f64, f64, f64); 6] = [
-        (0.0, 9.0, 0.0, 50.0),
-        (9.1, 35.4, 51.0, 100.0),
-        (35.5, 55.4, 101.0, 150.0),
-        (55.5, 125.4, 151.0, 200.0),
-        (125.5, 225.4, 201.0, 300.0),
-        (225.5, 325.4, 301.0, 500.0),
-    ];
-    BP.iter()
-        .find(|&&(_, hi, _, _)| c <= hi)
-        .map_or(500, |&(lo, hi, ilo, ihi)| (((ihi - ilo) / (hi - lo)) * (c - lo).max(0.0) + ilo).round() as i32)
-}
 /// Converts an observed wind value to m/s; a value in an unrecognised unit is `None` rather than assumed to be m/s.
 fn nws_wind_to_mps(v: f64, u: &str) -> Option<f64> {
     if u.contains("km_h-1") {
@@ -1218,7 +1202,7 @@ impl WeatherClient {
             let (lats, lons) = coords_csv(coords);
             // Fetch hourly only (13h, starting at current UTC hour) — eliminates duplicate `current=` payload (~12% smaller)!
             let url = format!(
-                "https://api.open-meteo.com/v1/forecast?latitude={lats}&longitude={lons}&hourly=temperature_2m,precipitation,wind_speed_10m,wind_direction_10m,pressure_msl&forecast_hours=13&timeformat=unixtime&wind_speed_unit=ms"
+                "https://api.open-meteo.com/v1/forecast?latitude={lats}&longitude={lons}&hourly=temperature_2m,wind_speed_10m,wind_direction_10m,pressure_msl&forecast_hours=13&timeformat=unixtime&wind_speed_unit=ms"
             );
             if let Ok(val) = get_json_t(&self.0, &url, false, 3200) {
                 mark_open_meteo_ok();
@@ -1236,12 +1220,19 @@ impl WeatherClient {
                         let (mut hourly, mut hl) = ([(0_i64, [0.0_f32; 6]); 14], 0_usize);
                         let opt_f = |k: &str, i: usize| h.get(k).and_then(|a| a.get(i)).and_then(Value::as_f64).filter(|x| x.is_finite());
                         for (i, tv) in times.iter().take(14).enumerate() {
-                            let (Some(ts), Some(tc), Some(pr)) = (tv.as_i64(), opt_f("temperature_2m", i), opt_f("pressure_msl", i)) else {
+                            // A sample feeds the temperature, wind and pressure maps together: hours missing any of
+                            // those upstream are skipped rather than filled with a default.
+                            let (Some(ts), Some(tc), Some(pr), Some(hs), Some(hd)) = (
+                                tv.as_i64(),
+                                opt_f("temperature_2m", i),
+                                opt_f("pressure_msl", i),
+                                opt_f("wind_speed_10m", i),
+                                opt_f("wind_direction_10m", i),
+                            ) else {
                                 continue;
                             };
-                            let hs = opt_f("wind_speed_10m", i).unwrap_or(0.0);
-                            let (hu, hv) = wind_uv(hs, opt_f("wind_direction_10m", i).unwrap_or(0.0));
-                            hourly[hl] = (ts, [tc as f32, opt_f("precipitation", i).unwrap_or(0.0) as f32, hu, hv, hs as f32, pr as f32]);
+                            let (hu, hv) = wind_uv(hs, hd);
+                            hourly[hl] = (ts, [tc as f32, 0.0, hu, hv, hs as f32, pr as f32]);
                             hl += 1;
                         }
                         if hl == 0 {
@@ -1282,26 +1273,16 @@ impl WeatherClient {
                         for entry in arr.iter().take(14) {
                             let Some(ts) = rfc3339(entry, "/time") else { continue };
                             let det = entry.pointer("/data/instant/details")?;
-                            let (Some(tc), Some(pr)) = (
+                            let (Some(tc), Some(pr), Some(ws), Some(wd)) = (
                                 jf(det, "/air_temperature").filter(|x| x.is_finite()),
                                 jf(det, "/air_pressure_at_sea_level").filter(|x| x.is_finite()),
+                                jf(det, "/wind_speed").filter(|x| x.is_finite()),
+                                jf(det, "/wind_from_direction").filter(|x| x.is_finite()),
                             ) else {
                                 continue;
                             };
-                            let ws = jf(det, "/wind_speed").unwrap_or(0.0);
-                            let wd = jf(det, "/wind_from_direction").unwrap_or(0.0);
-                            let pmm = entry
-                                .pointer("/data/next_1_hours/details/precipitation_amount")
-                                .and_then(Value::as_f64)
-                                .or_else(|| {
-                                    entry
-                                        .pointer("/data/next_6_hours/details/precipitation_amount")
-                                        .and_then(Value::as_f64)
-                                        .map(|x| x / 6.0)
-                                })
-                                .unwrap_or(0.0) as f32;
                             let (hu, hv) = wind_uv(ws, wd);
-                            hourly[hl] = (ts, [tc as f32, pmm, hu, hv, ws as f32, pr as f32]);
+                            hourly[hl] = (ts, [tc as f32, 0.0, hu, hv, ws as f32, pr as f32]);
                             hl += 1;
                         }
                         if hl == 0 {
@@ -1326,15 +1307,15 @@ impl WeatherClient {
             return Vec::new();
         }
         let (lats, lons) = coords_csv(coords);
-        let url = format!("https://air-quality-api.open-meteo.com/v1/air-quality?latitude={lats}&longitude={lons}&current=us_aqi,pm2_5");
+        let url = format!("https://air-quality-api.open-meteo.com/v1/air-quality?latitude={lats}&longitude={lons}&current=us_aqi");
         let Ok(val) = get_json(&self.0, &url, false) else { return Vec::new() };
         val.as_array()
             .map_or_else(|| vec![&val], |a| a.iter().collect())
             .into_iter()
             .zip(coords)
             .filter_map(|(i, &(la, lo))| {
-                let aqi = jf(i, "/current/us_aqi")?.max(jf(i, "/current/pm2_5").map_or(0.0, |p| epa_pm25_aqi(p) as f64));
-                Some((la.clamp(-85.0, 85.0), wrap_lon(lo), aqi))
+                // The upstream US AQI, unmodified — the same number the air-quality card shows for a location.
+                Some((la.clamp(-85.0, 85.0), wrap_lon(lo), jf(i, "/current/us_aqi")?))
             })
             .collect()
     }
@@ -2257,10 +2238,8 @@ mod tests {
 
     #[test]
     fn accuracy_helpers_and_wifi_parsing() {
-        assert_eq!((epa_pm25_aqi(0.0), epa_pm25_aqi(9.0), epa_pm25_aqi(35.4), epa_pm25_aqi(500.0)), (0, 50, 100, 500));
         assert!(
-            (65..=72).contains(&epa_pm25_aqi(19.3))
-                && (nws_wind_to_mps(10.0, "wmoUnit:kt").unwrap() - 5.14444).abs() < 1e-3
+            (nws_wind_to_mps(10.0, "wmoUnit:kt").unwrap() - 5.14444).abs() < 1e-3
                 && (nws_wind_to_mps(36.0, "wmoUnit:km_h-1").unwrap() - 10.0).abs() < 1e-3
                 && nws_wind_to_mps(4.0, "wmoUnit:m_s-1") == Some(4.0)
                 && nws_wind_to_mps(4.0, "").is_none()
@@ -2556,7 +2535,6 @@ mod tests {
         let v = serde_json::json!({"timezone": "America/Los_Angeles", "current": {"time": "2026-11-24T01:00", "interval": 3600, "us_aqi": 73, "pm2_5": 30.6}});
         let aq = WeatherClient::parse_air_quality(&v).expect("aqi");
         assert_eq!((aq.us_aqi, aq.pm2_5), (73, Some(30.6)));
-        assert!(epa_pm25_aqi(30.6) > 73);
         let no_pm = WeatherClient::parse_air_quality(&serde_json::json!({"current": {"us_aqi": 59, "pm2_5": null}})).expect("aqi");
         assert_eq!((no_pm.us_aqi, no_pm.pm2_5), (59, None));
         assert!(WeatherClient::parse_air_quality(&serde_json::json!({"current": {"us_aqi": null, "pm2_5": 12.0}})).is_none());
