@@ -3864,6 +3864,46 @@ mod tests {
         }
     }
 
+    /// Magnified tiles must join without a step: each weather tile's border carries its neighbours' edge texels, so
+    /// linear filtering across the shared edge blends both tiles. Neighbours that are not loaded yet leave the edge
+    /// clamped, and the tile is stitched again once they arrive.
+    #[test]
+    fn weather_tiles_stitch_neighbour_edges_into_their_border() {
+        let (tx, _rx) = mpsc::channel();
+        let mut pool = SharedTilePool::new(WeatherClient::new(), tx, Arc::new(Notify::new()));
+        let nid = pool.intern("hrrr_test");
+        let solid = |r: u8| adv_image::Handle::from_rgba(64, 64, [r, 0, 0, 255].repeat(64 * 64));
+        let (k, right, below) = (TileKey(nid, 3, 2, 2), TileKey(nid, 3, 3, 2), TileKey(nid, 3, 2, 3));
+        pool.insert_image_for_test(k, Some(solid(10)));
+        pool.insert_image_for_test(right, Some(solid(200)));
+        pool.stitch(k, |_, _| true);
+        let px = |h: &adv_image::Handle, x: usize, y: usize| match h {
+            adv_image::Handle::Rgba { width, pixels, .. } => {
+                let i = (y * *width as usize + x) * 4;
+                [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+            }
+            _ => panic!("rgba"),
+        };
+        let h = pool.handle_for_test(k).expect("stitched");
+        assert_eq!(tiles::stitched_inner(&h), Some(64));
+        assert_eq!(px(&h, 65, 2), [200, 0, 0, 255], "right border holds the right neighbour's edge");
+        assert_eq!(px(&h, 2, 65), [10, 0, 0, 255], "bottom neighbour not loaded yet: own edge, as clamping gives");
+        assert_eq!(px(&h, 2, 2), [10, 0, 0, 255], "interior unchanged");
+        // The neighbour below turns out empty: the tile is stitched again with a transparent border there.
+        pool.insert_image_for_test(below, None);
+        pool.stitch(k, |_, _| true);
+        let h2 = pool.handle_for_test(k).expect("restitched");
+        assert_ne!(h2.id(), h.id());
+        assert_eq!(px(&h2, 2, 65), [10, 0, 0, 0]);
+        assert_eq!(px(&h2, 65, 2), [200, 0, 0, 255], "right border kept, read through the stitched copy");
+        // Nothing new: no rebuild.
+        pool.stitch(k, |_, _| true);
+        assert_eq!(pool.handle_for_test(k).expect("same").id(), h2.id());
+        // The right neighbour, stitched in turn, reads this tile's inner texels, not its border.
+        pool.stitch(right, |_, _| true);
+        assert_eq!(px(&pool.handle_for_test(right).expect("right"), 0, 2), [10, 0, 0, 255]);
+    }
+
     #[test]
     fn cancelled_active_weather_tile_invalidates_weather_rev() {
         let (tx, _rx) = mpsc::channel();

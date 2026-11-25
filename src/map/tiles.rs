@@ -4,7 +4,7 @@ use crate::providers::{EcccModel, WeatherClient};
 use crate::storage::{delete_cached_tile, is_shutting_down, load_cached_tile, save_cached_tile};
 use iced::advanced::image as adv_image;
 use iced::widget::canvas::Frame;
-use iced::{Rectangle, Size};
+use iced::{Point, Rectangle, Size};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::{
@@ -519,6 +519,9 @@ pub(super) struct SharedTilePool {
     gpu_pin_requested: FxHashSet<TileKey>,
     gpu_pins: FxHashMap<TileKey, iced_runtime::image::Allocation>,
     gpu_pin_lru: VecDeque<TileKey>,
+    /// Tiles whose handle has been replaced by a stitched copy (see [`SharedTilePool::stitch`]): which neighbours'
+    /// texels its border holds (`real`), which neighbours it treats as empty, and the stitched handle's id.
+    stitched: FxHashMap<TileKey, (u8, u8, adv_image::Id)>,
     /// Derived tile jobs parked until the source raster they are keyed by has been downloaded.
     waiting: FxHashMap<TileKey, Vec<TileJob>>,
     /// `(derived tile, source raster)` pairs whose build was re-run once because the raster had just arrived.
@@ -553,6 +556,7 @@ impl SharedTilePool {
             gpu_pin_requested: FxHashSet::default(),
             gpu_pins: FxHashMap::default(),
             gpu_pin_lru: VecDeque::new(),
+            stitched: FxHashMap::default(),
             waiting: FxHashMap::default(),
             source_retries: FxHashSet::default(),
             tx,
@@ -837,6 +841,14 @@ impl SharedTilePool {
         self.slots.insert(k, TileSlot::Ready(None, None, Instant::now(), AtomicBool::new(true)));
     }
     #[cfg(test)]
+    pub fn insert_image_for_test(&mut self, k: TileKey, h: Option<adv_image::Handle>) {
+        self.slots.insert(k, TileSlot::Ready(h, None, Instant::now(), AtomicBool::new(true)));
+    }
+    #[cfg(test)]
+    pub fn handle_for_test(&self, k: TileKey) -> Option<adv_image::Handle> {
+        self.get_ready_id(k.0, (k.1, k.2, k.3)).cloned().flatten()
+    }
+    #[cfg(test)]
     pub fn insert_thumb_for_test(&mut self, k: TileKey, thumb: AlphaThumb) {
         self.slots.insert(k, TileSlot::Ready(None, Some(thumb), Instant::now(), AtomicBool::new(true)));
     }
@@ -865,6 +877,64 @@ impl SharedTilePool {
                 Some((h, *t))
             }
             TileSlot::Failed(_) => None,
+        }
+    }
+    /// Gives tile `k` a one-texel border holding its neighbours' edge texels, as soon as those neighbours are loaded.
+    ///
+    /// A tile drawn magnified with linear filtering is otherwise clamped at its edge: the last half texel goes flat
+    /// and the next tile starts with a hard step, which shows as lines along tile edges and squares where four tiles
+    /// meet. With the border in place, [`draw_tile_image`] draws the tile one texel larger and clips it back to the
+    /// tile, so filtering across the edge blends the two tiles exactly as one large texture would.
+    ///
+    /// `include(x, y)` says whether a neighbour at the same zoom is drawn at all; one that is not counts as empty.
+    /// The tile is stitched again when a neighbour it has not incorporated yet becomes available.
+    pub fn stitch(&mut self, k: TileKey, include: impl Fn(u32, u32) -> bool) {
+        let TileKey(ns, z, x, y) = k;
+        let n = 1_i64 << z;
+        let Some(TileSlot::Ready(Some(h), ..)) = self.slots.get(&k) else { return };
+        let Some(own) = TilePixels::of(h) else { return };
+        let (real0, empty0) = self.stitched.get(&k).filter(|e| e.2 == h.id()).map_or((0, 0), |e| (e.0, e.1));
+        let mut nbrs: [Nbr<'_>; 8] = [Nbr::Clamp; 8];
+        let (mut real, mut empty) = (0_u8, 0_u8);
+        for (i, &(dx, dy)) in STITCH_NBRS.iter().enumerate() {
+            let ny = y as i64 + dy;
+            if !(0..n).contains(&ny) {
+                continue;
+            }
+            let (nx, ny) = ((x as i64 + dx).rem_euclid(n) as u32, ny as u32);
+            if !include(nx, ny) {
+                (nbrs[i], empty) = (Nbr::Empty, empty | 1 << i);
+                continue;
+            }
+            match self.slots.get(&TileKey(ns, z, nx, ny)) {
+                Some(TileSlot::Ready(Some(nh), ..)) => match TilePixels::of(nh).filter(|p| p.inner == own.inner) {
+                    Some(p) => (nbrs[i], real) = (Nbr::Real(p), real | 1 << i),
+                    None => continue,
+                },
+                Some(TileSlot::Ready(None, ..)) => (nbrs[i], empty) = (Nbr::Empty, empty | 1 << i),
+                _ => {}
+            }
+        }
+        // Nothing new to bake in (a border of clamped own texels is what the raw tile already draws as).
+        if real & !real0 == 0 && empty & !(empty0 | real0) == 0 {
+            return;
+        }
+        let stitched = stitch_tile(own, &nbrs);
+        let id = stitched.id();
+        if let Some(TileSlot::Ready(slot, ..)) = self.slots.get_mut(&k) {
+            *slot = Some(stitched);
+        }
+        self.stitched.insert(k, (real, empty, id));
+        if self.stitched.len() > 8192 {
+            let slots = &self.slots;
+            self.stitched.retain(|k, _| slots.contains_key(k));
+        }
+        // The old handle's GPU pin no longer matches what is drawn; the stitched handle is pinned after its first draw.
+        if self.gpu_pins.remove(&k).is_some() {
+            self.gpu_pin_lru.retain(|o| *o != k);
+        }
+        if self.gpu_pin_requested.remove(&k) {
+            self.pending_gpu_pins.retain(|(o, _)| *o != k);
         }
     }
     pub fn bump_epoch(&mut self) {
@@ -2458,6 +2528,108 @@ fn smooth_goes_clouds(rgba: &mut [u8], w: usize, h: usize) {
     });
 }
 
+/// Neighbour offsets `(dx, dy)` of a tile, in the bit order of [`SharedTilePool::stitch`]'s masks.
+const STITCH_NBRS: [(i64, i64); 8] = [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)];
+
+/// Decoded texels of a square tile handle, raw (`inner` texels wide) or stitched (`inner + 2`, with a border).
+#[derive(Clone, Copy)]
+struct TilePixels<'a> {
+    inner: usize,
+    border: usize,
+    px: &'a [u8],
+}
+impl<'a> TilePixels<'a> {
+    fn of(h: &'a adv_image::Handle) -> Option<Self> {
+        let adv_image::Handle::Rgba { width, height, pixels, .. } = h else { return None };
+        let (w, border) = (*width as usize, stitched_inner(h).map_or(0, |_| 1));
+        (*width == *height && pixels.len() == w * w * 4).then(|| Self { inner: w - 2 * border, border, px: pixels })
+    }
+    /// Texel at tile coordinates `(x, y)`, `0..inner`.
+    #[inline]
+    fn at(&self, x: usize, y: usize) -> [u8; 4] {
+        let i = ((y + self.border) * (self.inner + 2 * self.border) + x + self.border) * 4;
+        [self.px[i], self.px[i + 1], self.px[i + 2], self.px[i + 3]]
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Nbr<'a> {
+    /// Not loaded yet (or beyond a pole): repeat the tile's own edge texel, as clamped sampling would.
+    Clamp,
+    /// Known to hold no data: transparent, keeping the edge texel's colour so filtering does not darken it.
+    Empty,
+    Real(TilePixels<'a>),
+}
+
+/// Raw tiles are a power of two wide (at least 64 texels); a stitched tile is two texels wider. Returns the stitched
+/// tile's inner width.
+#[inline]
+pub(super) fn stitched_inner(h: &adv_image::Handle) -> Option<u32> {
+    match h {
+        adv_image::Handle::Rgba { width, height, .. } if width == height && *width >= 66 && (width - 2).is_power_of_two() => {
+            Some(width - 2)
+        }
+        _ => None,
+    }
+}
+
+/// Builds the stitched copy of `own`: its texels, framed by a one-texel border taken from its eight neighbours.
+fn stitch_tile(own: TilePixels<'_>, nbrs: &[Nbr<'_>; 8]) -> adv_image::Handle {
+    let (n, g) = (own.inner, own.inner + 2);
+    let mut out = vec![0_u8; g * g * 4];
+    for y in 0..n {
+        let src = ((y + own.border) * (n + 2 * own.border) + own.border) * 4;
+        let dst = ((y + 1) * g + 1) * 4;
+        out[dst..dst + n * 4].copy_from_slice(&own.px[src..src + n * 4]);
+    }
+    let (ni, last) = (n as i64, n as i64 - 1);
+    for (i, &(dx, dy)) in STITCH_NBRS.iter().enumerate() {
+        // Border cells facing this neighbour, in tile coordinates (-1 or n on the facing side).
+        let xs: Vec<i64> = if dx == 0 { (0..ni).collect() } else { vec![if dx < 0 { -1 } else { ni }] };
+        let ys: Vec<i64> = if dy == 0 { (0..ni).collect() } else { vec![if dy < 0 { -1 } else { ni }] };
+        for &cy in &ys {
+            for &cx in &xs {
+                let edge = own.at(cx.clamp(0, last) as usize, cy.clamp(0, last) as usize);
+                let v = match nbrs[i] {
+                    Nbr::Clamp => edge,
+                    Nbr::Empty => [edge[0], edge[1], edge[2], 0],
+                    Nbr::Real(p) => p.at((cx - dx * ni) as usize, (cy - dy * ni) as usize),
+                };
+                let o = ((cy + 1) as usize * g + (cx + 1) as usize) * 4;
+                out[o..o + 4].copy_from_slice(&v);
+            }
+        }
+    }
+    adv_image::Handle::from_rgba(g as u32, g as u32, out)
+}
+
+/// Draws a pool tile into its rectangle `r`, clipped to `clip`; `viewport` is the whole canvas, which needs no clip of
+/// its own. A stitched tile is drawn one texel larger and clipped back to `r`, so its border blends with the
+/// neighbouring tiles at the shared edge (see [`SharedTilePool::stitch`]).
+pub(super) fn draw_tile_image(f: &mut Frame, r: Rectangle, h: adv_image::Handle, alpha: f32, clip: Rectangle, viewport: Rectangle) {
+    if alpha <= 0.01 {
+        return;
+    }
+    let img = |h| adv_image::Image::new(h).filter_method(adv_image::FilterMethod::Linear).opacity(alpha);
+    match stitched_inner(&h) {
+        Some(inner) => {
+            let (tx, ty) = (r.width / inner as f32, r.height / inner as f32);
+            let e = Rectangle { x: r.x - tx, y: r.y - ty, width: r.width + 2.0 * tx, height: r.height + 2.0 * ty };
+            if let Some(c) = clip.intersection(&r) {
+                f.with_clip(c, |s| s.draw_image(e, img(h)));
+            }
+        }
+        None if clip == viewport || (clip.contains(r.position()) && clip.contains(Point::new(r.x + r.width, r.y + r.height))) => {
+            f.draw_image(r, img(h))
+        }
+        None => {
+            if let Some(c) = clip.intersection(&r) {
+                f.with_clip(c, |s| s.draw_image(r, img(h)));
+            }
+        }
+    }
+}
+
 /// Zero-allocation boundary-push edge bleed with fast word-skip for empty rows and bounds-check-free interior pass.
 pub(super) fn bleed_transparent_edges(rgba: &mut [u8], w: u32, h: u32) {
     let (w, h) = (w as usize, h as usize);
@@ -2661,11 +2833,7 @@ pub(super) fn draw_tile_layer_filtered(
         let pad = if bleed { 0.35_f32 } else { 0.0 };
         Rectangle { x: x0 - pad, y: y0 - pad, width: (x1 - x0 + pad * 2.0).max(1.0), height: (y1 - y0 + pad * 2.0).max(1.0) }
     };
-    let dimg = |f: &mut Frame, r: Rectangle, h: adv_image::Handle, alpha: f32| {
-        if alpha > 0.01 {
-            f.draw_image(r, adv_image::Image::new(h).filter_method(adv_image::FilterMethod::Linear).opacity(alpha));
-        }
-    };
+    let dimg = |f: &mut Frame, r: Rectangle, h: adv_image::Handle, alpha: f32| draw_tile_image(f, r, h, alpha, vp_rect, vp_rect);
     let fade_of = |t: Instant| {
         if !l.fade {
             return 1.0;
@@ -2723,6 +2891,7 @@ pub(super) fn draw_tile_layer_filtered(
     };
     // For text label overlays, avoid mixing clipped stretched ancestor text beside crisp loaded tiles (zero sliced letters!).
     let is_labels = l.ns.ends_with("_labels");
+    let stitch = !l.opaque_base && !is_labels;
     let any_tz_ready = is_labels
         && (min_y..=max_y).any(|ty| (min_x..=max_x).any(|tx| pool.get_ready_id(ns_id, (tz, tx.rem_euclid(n) as u32, ty as u32)).is_some()));
     // Pass 1 (opaque basemaps): draw ancestor OR crisp zoom-out child tiles underneath any missing or fading tile!
@@ -2745,6 +2914,10 @@ pub(super) fn draw_tile_layer_filtered(
                     let (wx, wy) = (tx.rem_euclid(n) as u32, ty as u32);
                     if !filter(tz, wx, wy) {
                         continue;
+                    }
+                    // Weather tiles get their neighbours' edge texels baked in, so magnified tiles join seamlessly.
+                    if !pass && stitch && trect((tx, ty), px, false).intersects(&vp_rect) {
+                        pool.stitch(TileKey(ns_id, tz, wx, wy), |x, y| filter(tz, x, y));
                     }
                     let slot = pool.get_ready_timed(ns_id, (tz, wx, wy));
                     let fully_opaque = slot.is_some_and(|(h, t)| h.is_none() || fade_of(t) >= 0.995);
@@ -2808,7 +2981,7 @@ pub(super) fn draw_tile_layer_filtered(
                                 if !pool.is_gpu_pin_requested(pk) {
                                     to_pin.push((pk, ah.clone()));
                                 }
-                                frame.with_clip(clip, |sub| dimg(sub, r, ah, l.opacity * (1.0 - f)));
+                                draw_tile_image(frame, r, ah, l.opacity * (1.0 - f), clip, vp_rect);
                             }
                             let pk = TileKey(ns_id, tz, wx, wy);
                             if !pool.is_gpu_pin_requested(pk) {
@@ -2864,7 +3037,7 @@ pub(super) fn draw_tile_layer_filtered(
                                                 if !pool.is_gpu_pin_requested(pk) {
                                                     to_pin.push((pk, ah.clone()));
                                                 }
-                                                frame.with_clip(clip, |sub| dimg(sub, ar, ah.clone(), l.opacity));
+                                                draw_tile_image(frame, ar, ah.clone(), l.opacity, clip, vp_rect);
                                             }
                                         }
                                     }
@@ -2886,7 +3059,7 @@ pub(super) fn draw_tile_layer_filtered(
                                     if !pool.is_gpu_pin_requested(pk) {
                                         to_pin.push((pk, ah.clone()));
                                     }
-                                    frame.with_clip(clip, |sub| dimg(sub, r, ah, alpha));
+                                    draw_tile_image(frame, r, ah, alpha, clip, vp_rect);
                                 } else if !is_labels
                                     && let Some((fid, th)) = l.temporal_fallbacks.iter().flatten().find_map(|&fid| {
                                         pool.get_ready_id(fid, (tz, wx, wy)).and_then(Option::as_ref).map(|h| (fid, h.clone()))
