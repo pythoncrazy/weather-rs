@@ -1853,7 +1853,7 @@ impl WeatherClient {
     fn fetch_open_meteo(&self, location: &Location, metno: bool) -> Result<WeatherBundle, String> {
         let m = if metno { "&models=metno_seamless" } else { "" };
         let url = format!(
-            "https://api.open-meteo.com/v1/forecast?latitude={:.4}&longitude={:.4}&timezone=auto&timeformat=unixtime&wind_speed_unit=ms{m}&current=temperature_2m,relative_humidity_2m,dew_point_2m,apparent_temperature,is_day,precipitation,weather_code,pressure_msl,wind_speed_10m,wind_direction_10m,wind_gusts_10m,visibility,uv_index&minutely_15=precipitation&forecast_minutely_15=8&hourly=temperature_2m,precipitation_probability,precipitation,weather_code,pressure_msl,wind_speed_10m,wind_direction_10m,uv_index&past_hours=1&forecast_hours=26&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_sum,precipitation_probability_max,wind_speed_10m_max&forecast_days=10",
+            "https://api.open-meteo.com/v1/forecast?latitude={:.4}&longitude={:.4}&timezone=auto&timeformat=unixtime&wind_speed_unit=ms{m}&current=temperature_2m,relative_humidity_2m,dew_point_2m,apparent_temperature,is_day,precipitation,weather_code,pressure_msl,wind_speed_10m,wind_direction_10m,wind_gusts_10m,visibility,uv_index&minutely_15=precipitation&forecast_minutely_15=8&hourly=temperature_2m,precipitation_probability,precipitation,weather_code,pressure_msl,wind_speed_10m,wind_direction_10m,uv_index&past_hours=24&forecast_hours=26&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_sum,precipitation_probability_max,wind_speed_10m_max&forecast_days=10",
             location.lat, location.lon
         );
         let root = get_json(&self.0, &url, false)?;
@@ -1874,8 +1874,23 @@ impl WeatherClient {
         let ws = fin(cur, "/wind_speed_10m").ok_or("Missing Open-Meteo current wind speed")?;
         let condition = wmo(fin(cur, "/weather_code")).ok_or("Missing Open-Meteo current weather code")?;
         let mut hourly = Vec::new();
+        // Open-Meteo's hourly precipitation is the total of the hour ending at its timestamp, so the 24 values stamped
+        // within the 24 hours up to the current hour are the last 24 hours, and the next 24 values the next 24 hours.
+        // A window is reported only when all 24 of its values are there.
+        let (mut precip_last_24h_mm, mut precip_next_24h_mm) = (None, None);
         if let Some(h) = root.get("hourly") {
             let opt_f = |k: &str, i: usize| h.get(k).and_then(|a| a.get(i)).and_then(Value::as_f64).filter(|x| x.is_finite());
+            let now_hour = now_ts.div_euclid(3600) * 3600;
+            let window = |from: i64, to: i64| {
+                let vals: Vec<f64> = ja(h, "/time")
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, tv)| parse_ts(tv).is_some_and(|ts| ts > from && ts <= to))
+                    .filter_map(|(i, _)| opt_f("precipitation", i).filter(|mm| *mm >= 0.0))
+                    .collect();
+                (vals.len() == 24).then(|| vals.iter().sum::<f64>())
+            };
+            (precip_last_24h_mm, precip_next_24h_mm) = (window(now_hour - 86_400, now_hour), window(now_hour, now_hour + 86_400));
             for (i, tv) in ja(h, "/time").iter().enumerate() {
                 let Some(ts) = parse_ts(tv).filter(|&ts| ts >= now_ts - 3600 && hourly.len() < 36) else { continue };
                 let (Some(temp_c), Some(condition), Some(precip_mm), Some(wind_speed_mps), Some(wind_dir_deg)) = (
@@ -1981,6 +1996,8 @@ impl WeatherClient {
             lean: false,
             elevation_m: fin(root, "/elevation"),
             uv_clear_sky: false,
+            precip_last_24h_mm,
+            precip_next_24h_mm,
             schema: BUNDLE_SCHEMA,
         })
     }
@@ -2223,6 +2240,9 @@ impl WeatherClient {
             lean: false,
             elevation_m: fin(root, "/geometry/coordinates/2"),
             uv_clear_sky: true,
+            // MET Norway's forecast feed carries no past hours.
+            precip_last_24h_mm: None,
+            precip_next_24h_mm: None,
             schema: BUNDLE_SCHEMA,
         })
     }

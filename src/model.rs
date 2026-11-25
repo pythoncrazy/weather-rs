@@ -278,6 +278,12 @@ pub struct WeatherBundle {
     /// UV values in this bundle are MET Norway's clear-sky UV index rather than a cloud-adjusted UV index.
     #[serde(default)]
     pub uv_clear_sky: bool,
+    /// Precipitation the forecast provider reports for the 24 whole hours before the current hour and for the 24
+    /// hours after it, in mm. `None` unless the provider returned all 24 hourly values of that window.
+    #[serde(default)]
+    pub precip_last_24h_mm: Option<f64>,
+    #[serde(default)]
+    pub precip_next_24h_mm: Option<f64>,
     /// `BUNDLE_SCHEMA` of the build that wrote the bundle; older cached bundles may hold defaulted values and are discarded.
     #[serde(default)]
     pub schema: u8,
@@ -647,6 +653,8 @@ pub(crate) fn test_bundle(fetched: i64) -> WeatherBundle {
         lean: false,
         elevation_m: Some(60.0),
         uv_clear_sky: false,
+        precip_last_24h_mm: None,
+        precip_next_24h_mm: None,
         schema: BUNDLE_SCHEMA,
     }
 }

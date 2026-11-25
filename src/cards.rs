@@ -600,6 +600,23 @@ impl WeatherApp {
     }
 
     pub(crate) fn view_precip_summary_card(&self, b: &WeatherBundle, p: SkyPalette, w: f32, h: f32, di: usize) -> El<'static> {
+        // For today, like Apple Weather: what fell in the last 24 hours and what is expected in the next 24 — when the
+        // provider reports the past hours. Otherwise (another day selected, or no past data) the day's own totals.
+        if let (0, Some(last)) = (di, b.precip_last_24h_mm) {
+            let next = match b.precip_next_24h_mm {
+                Some(mm) if mm > 0.0 => format!("{} expected in next 24h.", self.settings.format_precip(mm)),
+                Some(_) => "None expected in next 24h.".into(),
+                None => String::new(),
+            };
+            let col = column![
+                hdr(p, UiIcon::Droplet, "PRECIPITATION"),
+                tb(self.settings.format_precip(last), 26.0, p.text_primary),
+                tb("in last 24h", 12.0, p.text_primary),
+                sp_h(Fill),
+                text(next).size(10.5).line_height(1.18).color(p.text_secondary)
+            ];
+            return bento_click(p, col.spacing(2).height(Fill), (w, h), 12, Msg::OpenDetail(DetailMetric::Precipitation));
+        }
         let d0 = b.daily.get(di);
         let today = d0.and_then(|d| d.precip_sum_mm).map_or_else(|| DASH.into(), |mm| self.settings.format_precip(mm));
         // Only tomorrow's own total is stated; nothing is said about the days after it.
