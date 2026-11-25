@@ -68,6 +68,10 @@ What changed:
 
 - **HRRR tiles stop at zoom 6** (was 7). HRRR is a 3 km grid. A zoom-6 tile already draws each model cell at least 2 pixels wide, and a zoom-7 tile from IEM repeats the same cells at 4 pixels each (checked by comparing one zoom-6 tile with its four zoom-7 children). Views zoomed past 7.35 now need a quarter of the tiles: the New York scenario (1920×1080, zoom 7.5) went from 1104 IEM requests and 368 kB to 368 requests and 128 kB.
 
+- **No lines or squares at tile edges.** Rain tiles are drawn up to 3× their native size. Each tile used to be filtered on its own, so the last half texel at its edge went flat and the next tile started with a step: a line along every tile edge and a flat square where four tiles meet. Each weather tile now gets a one-texel border copied from its neighbours once they are loaded, and is drawn one texel larger and clipped back to its own rectangle, so filtering crosses the edge as if the map were one texture. Radar playback still renders a full frame in 4.7 ms, and the 2560×1440, 2× stress check still ran with no wait.
+
+- **HRRR to ECCC hand-off.** IEM publishes HRRR only inside 126°W–50°N (its world file). Within 2° of that edge HRRR fades out and ECCC fades in. Where the two models disagree, this band shows both at partial strength. That is real model data, not a rendering fault.
+
 - **A model tier is fetched only where the viewport itself needs it.** The 12% pan margin around the viewport is gone. In the Berkeley scenario it pulled in one extra HRDPS raster for each of 13 forecast hours.
 
 Cold-cache load for the same Berkeley scenario as above, with 55 frames instead of 35: 554 requests, 5.6 MB, 0 failed, every frame ready after 5.9 s, 1.8 s wait after pressing Play immediately. The extra requests are IEM HRRR tiles (414 requests, 1.2 MB, about 3 kB each) for the 20 additional model frames. Bytes per timeline frame fell from 154 kB to 102 kB. ECCC rasters are already requested as WebP.
@@ -80,13 +84,14 @@ Frame times vary between runs with whatever else the desktop is drawing. The val
 
 | Metric | Value |
 | --- | --- |
-| Weather, cold | 668 ms, first paint after 71 ms, 4 requests, 4.4 kB on the wire |
+| Weather, cold | 668 ms, first paint after 71 ms, 4 requests, 4.4 kB on the wire. Rerun 2026-11-25 after adding the past 24 hours: 695 ms, 4 requests, 5.7 kB (another location and day, so part of the difference is the data). |
+| Forecast request, past 24 h of hourly data | +271 B on the wire (1,338 B → 1,609 B). Open-Meteo has no per-variable past window, so this is the smallest request that gives the Precipitation card its "in last 24h" total. |
 | Weather, warm | 31 ms, 1 request, 1.3 kB on the wire |
 | Sidebar, 3 cities | 27 ms, 1 request, 0.8 kB on the wire |
 | Radar manifest | 192 ms, 2 requests, 2.3 kB |
 | Map grid, 20 points | 36 ms, 1 request, 3.4 kB on the wire |
 | Bento view, full frame | 3.3 ms |
-| Radar playback, full frame | 4.6 ms (4.1 ms before the loop drew two interpolation frames at once) |
+| Radar playback, full frame | 4.6 ms (4.1 ms before the loop drew two interpolation frames at once); 4.7 ms with stitched tile borders |
 | Map pan, full frame | 4.0 ms |
 | Scalar field build | 0.39 ms |
 | Isobar build | 0.11 ms |
